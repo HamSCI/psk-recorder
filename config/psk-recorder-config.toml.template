@@ -30,7 +30,7 @@ keep_wav    = false
 # `decoder_kind` in `psk.spots`); switch via the per-decoder path
 # overrides below.
 decoder_kind        = "jt9"
-decoder_jt9         = "/usr/bin/jt9"
+decoder_jt9         = "/opt/psk-recorder/bin/decoders/jt9"
 decoder_decode_ft8  = "/usr/local/bin/decode_ft8"
 
 # jt9 decode depth (1–3).  3 is "deep decode" — best results, ~3×

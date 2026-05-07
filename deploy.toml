@@ -1,6 +1,6 @@
 [package]
 name             = "psk-recorder"
-version          = "0.3.0"
+version          = "0.3.1"
 contract_version = "0.6"
 license          = "MIT"
 
@@ -49,6 +49,16 @@ dst  = "/var/log/psk-recorder"
 owner = "pskrec:pskrec"
 mode  = "0755"
 
+# Bundled jt9 binaries (per-arch).  scripts/install.sh adds the
+# arch-specific symlink to `jt9` after this copy lands; the symlink
+# step is not yet expressible as a sigmond install kind, so operators
+# using `smd install psk-recorder` should run the install.sh manually
+# (or wait for the smd-install symlink-with-arch enhancement).
+[[install.steps]]
+kind = "copy"
+src  = "bin/decoders"
+dst  = "/opt/psk-recorder/bin/decoders"
+
 [systemd]
 units = ["psk-recorder@.service"]
 
@@ -67,9 +77,22 @@ schema_version   = 2     # 002_add_jt9_columns.sql adds snr_db,
 required_min_ch  = "23.8"
 
 [deps]
+# jt9 (default FT4/FT8 decoder) is bundled per-arch under
+# bin/decoders/jt9-{x86,arm64,arm32}-v27 and installed by scripts/install.sh
+# to /opt/psk-recorder/bin/decoders/.  We deliberately do NOT pull in the
+# `wsjtx` package — it brings ~150 MB of Qt5Gui + sample sounds we don't
+# need.  Only the minimum runtime shared libs jt9 dlopens are required:
 [[deps.apt]]
-name = "wsjtx"
-note = "provides /usr/bin/jt9 — the default FT4/FT8 decoder (v0.3+)"
+name = "libqt5core5a"
+note = "Qt5 core runtime — jt9's only Qt dep (no GUI libs needed)"
+
+[[deps.apt]]
+name = "libfftw3-single3"
+note = "FFTW single-precision (libfftw3f) — jt9's FFT backend"
+
+[[deps.apt]]
+name = "libgfortran5"
+note = "Fortran runtime — jt9 is built in Fortran"
 
 [[deps.git]]
 name       = "ka9q-radio"

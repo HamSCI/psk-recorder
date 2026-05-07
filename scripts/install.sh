@@ -115,6 +115,47 @@ for dir in "$SPOOL_DIR" "$LOG_DIR"; do
     chown "$SERVICE_USER:$SERVICE_GROUP" "$dir"
 done
 
+# --- Phase 4.5: bundled jt9 decoder binaries ---
+# Ship per-arch binaries under /opt/psk-recorder/bin/decoders/ (project-
+# scoped, never in /usr/local/sbin).  Avoids pulling in the full WSJT-X
+# GUI package — only the few runtime shared libs it needs.  After
+# installing all arches, symlink the active host's arch to a stable
+# `jt9` filename so the config can reference one path on every box.
+INSTALL_DEC_DIR="/opt/psk-recorder/bin/decoders"
+ui_info "Installing bundled jt9 binaries to $INSTALL_DEC_DIR"
+mkdir -p "$INSTALL_DEC_DIR"
+install -o root -g root -m 755 "$REPO_ROOT/bin/decoders/jt9-x86-v27"   "$INSTALL_DEC_DIR/"
+install -o root -g root -m 755 "$REPO_ROOT/bin/decoders/jt9-arm64-v27" "$INSTALL_DEC_DIR/"
+install -o root -g root -m 755 "$REPO_ROOT/bin/decoders/jt9-arm32-v26" "$INSTALL_DEC_DIR/"
+
+case "$(uname -m)" in
+    x86_64)        arch_jt9="jt9-x86-v27" ;;
+    aarch64|arm64) arch_jt9="jt9-arm64-v27" ;;
+    armv7l|armhf)  arch_jt9="jt9-arm32-v26" ;;
+    *)             arch_jt9="" ;;
+esac
+if [[ -n "$arch_jt9" ]]; then
+    ln -sfn "$INSTALL_DEC_DIR/$arch_jt9" "$INSTALL_DEC_DIR/jt9"
+    ui_info "  symlinked $INSTALL_DEC_DIR/jt9 → $arch_jt9"
+else
+    ui_warn "unknown architecture $(uname -m); $INSTALL_DEC_DIR/jt9 not symlinked"
+    ui_warn "set paths.decoder_jt9 explicitly in /etc/psk-recorder/psk-recorder-config.toml"
+fi
+
+# Verify jt9's runtime deps are present.  We don't pull `wsjtx` (which
+# would drag in Qt5Gui + sample sounds + ~150 MB of GUI parts); only
+# the minimum shared libs jt9 dlopens are required.
+missing_libs=()
+for lib in libQt5Core.so.5 libfftw3f.so.3 libgfortran.so.5; do
+    if ! ldconfig -p | grep -q "$lib"; then
+        missing_libs+=("$lib")
+    fi
+done
+if (( ${#missing_libs[@]} > 0 )); then
+    ui_warn "jt9 runtime libs missing: ${missing_libs[*]}"
+    ui_warn "Install with: sudo apt install libqt5core5a libfftw3-single3 libgfortran5"
+fi
+
 # --- Phase 5: systemd ---
 ui_info "Installing systemd unit template"
 install -o root -g root -m 644 \

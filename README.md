@@ -33,8 +33,12 @@ radiod.
 ## Quickstart
 
 External binaries must be present first:
-- `jt9` from [WSJT-X][wsjtx] (`apt install wsjtx`) → `/usr/bin/jt9` —
-  the default decoder.
+- **`jt9`** — bundled per-arch under `bin/decoders/jt9-{x86,arm64,arm32}-v27`
+  in this repo.  `scripts/install.sh` copies the lot to
+  `/opt/psk-recorder/bin/decoders/` and arch-symlinks the active host's
+  binary to `jt9`.  Avoids pulling in the full `wsjtx` GUI package
+  (~150 MB).  Runtime libs: `libqt5core5a`, `libfftw3-single3`,
+  `libgfortran5` — listed in [`deploy.toml`][deploytoml] as apt deps.
 - `decode_ft8` from [ka9q/ft8_lib][ft8_lib] → `/usr/local/bin/decode_ft8` —
   optional fallback when `decoder_kind = "decode_ft8"` in config.
 - `pskreporter-sender` from [pjsg/ftlib-pskreporter][ftlib] → `/usr/local/bin/pskreporter-sender`
@@ -97,4 +101,5 @@ MIT. See [LICENSE](LICENSE). Author: Michael Hauan, AC0G.
 [ft8_lib]: https://github.com/ka9q/ft8_lib
 [ftlib]: https://github.com/pjsg/ftlib-pskreporter
 [wsjtx]: https://wsjt.sourceforge.io/wsjtx.html
+[deploytoml]: deploy.toml
 [contract]: https://github.com/mijahauan/sigmond/blob/main/docs/CLIENT-CONTRACT.md
