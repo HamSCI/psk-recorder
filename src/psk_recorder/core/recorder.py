@@ -293,6 +293,14 @@ class PskRecorder:
             ver = "0.1.0"
         proc_version = f"{ver}+{short}" if short else ver
 
+        # Per-radiod compound-callsign hash table.  Lives under the
+        # spool dir (state, not log) and is shared across both modes
+        # because the same compound calls show up on FT8 and FT4.
+        spool_root = Path(self._paths.get(
+            "spool_dir", "/var/lib/psk-recorder",
+        )) / self._radiod_id
+        callhash_path = spool_root / "callhash.json"
+
         for mode in ("ft8", "ft4"):
             if not get_freqs(self._radiod, mode):
                 continue
@@ -305,6 +313,7 @@ class PskRecorder:
                     host_call=callsign,
                     host_grid=grid,
                     processing_version=proc_version,
+                    callhash_path=callhash_path,
                 )
                 tailer.start()
                 self._ch_tailers.append(tailer)

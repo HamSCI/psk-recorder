@@ -35,10 +35,20 @@ logger = logging.getLogger(__name__)
 
 # ── Line parser ─────────────────────────────────────────────────────────────
 
-# `<call>[/<suffix>]` — 1–3 alnum prefix, 1 digit, 1–4 alnum suffix
-# (lossy, but it's only used for best-effort parse of the freeform
-# message; the raw text is always preserved).
-_CALL_RE = re.compile(r"^[A-Z0-9]{1,3}[0-9][A-Z0-9]{0,4}(?:/[A-Z0-9]{1,4})?$")
+# Standard callsigns + WSJT-X compound forms:
+#   * standard ITU call:                        K1ABC, AC0G, JA1AAA
+#   * suffix-form compound:                     K1ABC/QRP, K1ABC/MM
+#   * prefix-form compound (region/portable):   VE3/K1ABC, G/K1ABC, KH6/AC0G
+# The regex is intentionally lossy — it's a best-effort filter for
+# the freeform message field; the raw `message` text is always
+# preserved by the caller.
+_CALL_RE = re.compile(
+    r"^"
+    r"(?:[A-Z0-9]{1,3}/)?"               # optional prefix (e.g. "VE3/", "G/")
+    r"[A-Z0-9]{1,3}[0-9][A-Z0-9]{0,4}"    # standard call body (XX[X][D][YY[Y][Y]])
+    r"(?:/[A-Z0-9]{1,4})?"                # optional suffix (e.g. "/QRP", "/MM")
+    r"$"
+)
 # Maidenhead 6-char form has uppercase field+square but lowercase
 # subsquare (per IARU convention).  Tolerate either case for robustness.
 _GRID_RE = re.compile(r"^[A-R]{2}[0-9]{2}(?:[A-Xa-x]{2})?$")
@@ -245,9 +255,12 @@ def _parse_message(message: str) -> dict:
         # tag like "DX", "EU", "POTA" that isn't a callsign.  Scan
         # past non-call tokens until we hit the first call-shaped one
         # (the sender), then look for a grid in the remaining tokens.
+        # Bracketed compound calls (`<K1ABC/QRP>`) are stripped before
+        # the regex match so they land as the tx_call.
         for i, tok in enumerate(tokens[1:], start=1):
-            if _CALL_RE.match(tok):
-                out["tx_call"] = tok
+            candidate = _strip_call_brackets(tok)
+            if candidate is not None and _CALL_RE.match(candidate):
+                out["tx_call"] = candidate
                 for later in tokens[i + 1:]:
                     if _GRID_RE.match(later):
                         out["grid"] = later
@@ -255,10 +268,17 @@ def _parse_message(message: str) -> dict:
                 break
     else:
         # <rx_call> <tx_call> [grid|report|RR73|73]
-        if _CALL_RE.match(tokens[0]):
-            out["rx_call"] = tokens[0]
-        if len(tokens) >= 2 and _CALL_RE.match(tokens[1]):
-            out["tx_call"] = tokens[1]
+        # Compound callsigns may appear bracketed (`<K1ABC/QRP>`) — that's
+        # what jt9 / wsprd substitute when they resolved a hash from
+        # their session table.  Strip the brackets before matching so
+        # the call lands in the row instead of being dropped.
+        rx_candidate = _strip_call_brackets(tokens[0])
+        if rx_candidate is not None and _CALL_RE.match(rx_candidate):
+            out["rx_call"] = rx_candidate
+        if len(tokens) >= 2:
+            tx_candidate = _strip_call_brackets(tokens[1])
+            if tx_candidate is not None and _CALL_RE.match(tx_candidate):
+                out["tx_call"] = tx_candidate
         if len(tokens) >= 3:
             tail = tokens[2]
             if _GRID_RE.match(tail):
@@ -273,6 +293,23 @@ def _parse_message(message: str) -> dict:
     return out
 
 
+def _strip_call_brackets(token: str) -> Optional[str]:
+    """Strip surrounding ``<>`` from a token if it matches the WSJT-X
+    bracketed-call shape.
+
+    Returns the stripped call, or the original token if no brackets.
+    Returns ``None`` for the literal "<...>" placeholder (unresolved
+    hash, no recoverable callsign).
+    """
+    if not token:
+        return token
+    if token == "<...>":
+        return None
+    if token.startswith("<") and token.endswith(">") and len(token) > 2:
+        return token[1:-1]
+    return token
+
+
 # ── Tailer ──────────────────────────────────────────────────────────────────
 
 class ChTailer:
@@ -285,6 +322,7 @@ class ChTailer:
 
     POLL_INTERVAL_SEC = 1.0       # how often to read new lines
     FLUSH_INTERVAL_SEC = 15.0     # max age of an unflushed batch
+    CALLHASH_SAVE_INTERVAL_SEC = 300.0  # persist callhash table at most every 5 min
 
     def __init__(
         self,
@@ -297,6 +335,7 @@ class ChTailer:
         processing_version: str = "",
         batch_rows: int = 200,
         writer_factory=None,
+        callhash_path: Optional[Path] = None,
     ) -> None:
         self._log_path = Path(log_path)
         self._mode = mode
@@ -307,6 +346,16 @@ class ChTailer:
         self._batch_rows = batch_rows
         self._writer_factory = writer_factory or _default_writer_factory
         self._writer = None
+
+        # WSJT-X compound-callsign hash table.  Per-radiod (shared
+        # across modes — same compound calls show up on FT8 and FT4).
+        # When callhash_path is provided, the table is persisted across
+        # daemon restarts so the cumulative resolution grows over
+        # time.  Lazy-imported so the tailer remains importable on
+        # hosts that don't have sigmond installed.
+        self._callhash_path = callhash_path
+        self._callhash = self._make_callhash_table(callhash_path)
+        self._last_callhash_save = 0.0
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._last_pos = 0
@@ -353,6 +402,14 @@ class ChTailer:
                 self._writer.close()
             except Exception:
                 pass
+        # Final callhash persistence so any observations since the
+        # last periodic save aren't lost.
+        if self._callhash is not None and self._callhash_path is not None:
+            try:
+                self._callhash.save()
+            except Exception as exc:
+                logger.warning("ch_tailer %s: final callhash save failed: %s",
+                               self._mode, exc)
 
     @property
     def is_active(self) -> bool:
@@ -405,6 +462,18 @@ class ChTailer:
             self._last_flush = time.monotonic()
 
     def _consume(self, text: str) -> None:
+        # Feed the whole chunk to the callhash table first so any
+        # `<call>` announcements (compound or resolved) are captured
+        # in our cumulative cache before per-line parsing.  This is
+        # cheap (a single regex scan) and makes the table grow without
+        # caring about line boundaries.
+        if self._callhash is not None:
+            try:
+                self._callhash.observe(text)
+            except Exception as exc:
+                logger.warning("ch_tailer %s: callhash observe failed: %s",
+                               self._mode, exc)
+
         rows: list[dict] = []
         for line in text.splitlines():
             row = parse_decoder_line(line, mode=self._mode)
@@ -422,6 +491,41 @@ class ChTailer:
             except Exception as e:
                 logger.warning("ch_tailer %s: insert failed (%d rows): %s",
                                self._mode, len(rows), e)
+
+        # Periodic callhash persistence.  CALLHASH_SAVE_INTERVAL_SEC is
+        # generous (5 min) to amortise the JSON write across many
+        # observations.  No-op when nothing changed since the last save.
+        if (
+            self._callhash is not None
+            and self._callhash_path is not None
+            and (time.monotonic() - self._last_callhash_save)
+                > self.CALLHASH_SAVE_INTERVAL_SEC
+        ):
+            try:
+                self._callhash.save()
+            except Exception as exc:
+                logger.warning("ch_tailer %s: callhash save failed: %s",
+                               self._mode, exc)
+            self._last_callhash_save = time.monotonic()
+
+    def _make_callhash_table(self, path: Optional[Path]):
+        """Construct (or load) the per-radiod CallHashTable.
+
+        Returns None when ``sigmond.callhash`` isn't importable —
+        keeps psk-recorder runnable on hosts without sigmond installed.
+        """
+        try:
+            from sigmond.callhash import CallHashTable  # type: ignore[import-not-found]
+        except ImportError as exc:
+            logger.debug(
+                "ch_tailer %s: sigmond.callhash unavailable (%s); "
+                "compound-callsign hash resolution disabled",
+                self._mode, exc,
+            )
+            return None
+        if path is None:
+            return CallHashTable()
+        return CallHashTable.load_or_new(path)
 
 
 def _default_writer_factory(batch_rows: int):
