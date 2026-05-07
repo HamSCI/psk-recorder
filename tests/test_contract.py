@@ -88,7 +88,24 @@ class InventoryV03Tests(unittest.TestCase):
         self.assertEqual(self.data["client"], "psk-recorder")
 
     def test_contract_version(self):
-        self.assertEqual(self.data["contract_version"], "0.4")
+        self.assertEqual(self.data["contract_version"], "0.6")
+
+    def test_data_sinks_present_v0_6(self):
+        """CONTRACT v0.6 §17.3: every instance has a data_sinks array."""
+        inst = self.data["instances"][0]
+        self.assertIn("data_sinks", inst)
+        sinks = inst["data_sinks"]
+        kinds = {s["kind"] for s in sinks}
+        # File sinks always declared (spool + log dir).
+        self.assertIn("file", kinds)
+        # CH sink only appears when SIGMOND_CLICKHOUSE_URL is set;
+        # tests run without it, so absence is the expected default.
+        self.assertNotIn("clickhouse", kinds)
+        for sink in sinks:
+            self.assertIn("kind", sink)
+            self.assertIn("target", sink)
+            self.assertIn("retention_days", sink)
+            self.assertIn("mb_per_day", sink)
 
     def test_has_config_path(self):
         self.assertIn("config_path", self.data)

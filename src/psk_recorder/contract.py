@@ -1,4 +1,4 @@
-"""Client-contract v0.3 inventory and validate JSON builders."""
+"""Client-contract v0.6 inventory and validate JSON builders."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from psk_recorder.version import GIT_INFO
 
 logger = logging.getLogger(__name__)
 
-CONTRACT_VERSION = "0.4"
+CONTRACT_VERSION = "0.6"
 
 
 def build_inventory(config: dict, config_path: Path) -> dict:
@@ -61,6 +61,38 @@ def build_inventory(config: dict, config_path: Path) -> dict:
         if ft4_freqs:
             modes.append("ft4")
 
+        spool_path = f"{paths.get('spool_dir', '/var/lib/psk-recorder')}/{radiod_id}"
+
+        # CONTRACT v0.6 §17 — output sinks per instance.  File sinks are
+        # always declared; the CH sink is added only when sigmond has
+        # published SIGMOND_CLICKHOUSE_URL (a CH-disabled host stays
+        # file-only with no extra moving parts).
+        data_sinks: list[dict[str, Any]] = [
+            {
+                "kind":           "file",
+                "target":         spool_path,
+                "schema_ref":     None,
+                "retention_days": 0,
+                "mb_per_day":     0,
+            },
+            {
+                "kind":           "file",
+                "target":         log_dir,
+                "schema_ref":     None,
+                "retention_days": 365,
+                "mb_per_day":     5,
+            },
+        ]
+        if os.environ.get("SIGMOND_CLICKHOUSE_URL", "").strip():
+            data_sinks.append({
+                "kind":           "clickhouse",
+                "target":         "psk.spots",
+                "schema_ref":     "psk:1",
+                "retention_days": 14,
+                "mb_per_day":     8,
+                "health":         "ok",
+            })
+
         instance = {
             "instance": radiod_id,
             "radiod_id": radiod_id,
@@ -70,18 +102,7 @@ def build_inventory(config: dict, config_path: Path) -> dict:
             "ka9q_channels": len(ft8_freqs) + len(ft4_freqs),
             "frequencies_hz": all_freqs,
             "modes": modes,
-            "disk_writes": [
-                {
-                    "path": f"{paths.get('spool_dir', '/var/lib/psk-recorder')}/{radiod_id}",
-                    "mb_per_day": 0,
-                    "retention_days": 0,
-                },
-                {
-                    "path": log_dir,
-                    "mb_per_day": 5,
-                    "retention_days": 365,
-                },
-            ],
+            "data_sinks": data_sinks,
             "uses_timing_calibration": False,
             "provides_timing_calibration": False,
             "chain_delay_ns_applied": chain_delay,

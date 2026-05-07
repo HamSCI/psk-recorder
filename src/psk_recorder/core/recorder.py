@@ -23,6 +23,7 @@ from psk_recorder.config import (
     resolve_radiod_status,
 )
 from psk_recorder.core.stream import ChannelSink
+from psk_recorder.core.ch_tailer import ChTailer
 from psk_recorder.core.uploader import PskReporterUploader
 
 logger = logging.getLogger(__name__)
@@ -41,6 +42,7 @@ class PskRecorder:
         self._sinks: list[ChannelSink] = []
         self._multi_streams: list = []
         self._uploaders: list[PskReporterUploader] = []
+        self._ch_tailers: list[ChTailer] = []
         self._log_fds: dict[str, object] = {}
         self._running = False
 
@@ -54,6 +56,7 @@ class PskRecorder:
             self._provision_channels()
             self._start_streams()
             self._start_uploaders()
+            self._start_ch_tailers()
             self._start_stats_thread()
             self._notify_ready()
             self._main_loop()
@@ -240,6 +243,52 @@ class PskRecorder:
             uploader.start()
             self._uploaders.append(uploader)
 
+    def _start_ch_tailers(self) -> None:
+        """Start one ChTailer per (radiod, mode) — CONTRACT v0.6 §17.
+
+        Each tailer watches the same `<radiod_id>-<mode>.log` file
+        pskreporter-sender tails, parses new lines, and inserts rows
+        into `psk.spots`.  No-op when SIGMOND_CLICKHOUSE_URL is unset.
+        Failure to import / start is non-fatal: the existing PSKReporter
+        upload path is unaffected.
+        """
+        log_dir = Path(self._paths.get("log_dir", "/var/log/psk-recorder"))
+        callsign = self._station.get("callsign", "")
+        grid = self._station.get("grid_square", "")
+
+        try:
+            from psk_recorder.version import GIT_INFO
+            short = (GIT_INFO or {}).get("short", "")
+        except Exception:
+            short = ""
+        try:
+            from importlib.metadata import version as pkg_version
+            ver = pkg_version("psk-recorder")
+        except Exception:
+            ver = "0.1.0"
+        proc_version = f"{ver}+{short}" if short else ver
+
+        for mode in ("ft8", "ft4"):
+            if not get_freqs(self._radiod, mode):
+                continue
+            log_path = log_dir / f"{self._radiod_id}-{mode}.log"
+            try:
+                tailer = ChTailer(
+                    log_path=log_path,
+                    mode=mode,
+                    radiod_id=self._radiod_id,
+                    host_call=callsign,
+                    host_grid=grid,
+                    processing_version=proc_version,
+                )
+                tailer.start()
+                self._ch_tailers.append(tailer)
+            except Exception:
+                logger.exception(
+                    "ch_tailer %s startup failed; PSKReporter path unaffected",
+                    mode,
+                )
+
     def _notify_ready(self) -> None:
         """Send sd_notify READY=1 if running under systemd."""
         try:
@@ -359,6 +408,11 @@ class PskRecorder:
         logger.info("Shutting down...")
         for uploader in self._uploaders:
             uploader.stop()
+        for tailer in self._ch_tailers:
+            try:
+                tailer.stop()
+            except Exception:
+                logger.exception("Error stopping ch_tailer")
         for multi in self._multi_streams:
             try:
                 multi.stop()

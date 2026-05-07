@@ -1,7 +1,7 @@
 [package]
 name             = "psk-recorder"
 version          = "0.1.0"
-contract_version = "0.4"
+contract_version = "0.6"
 license          = "MIT"
 
 # Configuration interview (CONTRACT-v0.5 §14).  Sigmond invokes
@@ -51,6 +51,18 @@ mode  = "0755"
 
 [systemd]
 units = ["psk-recorder@.service"]
+
+# CONTRACT v0.6 §17 — local ClickHouse sink for `psk.spots`.  Schema
+# files live in this repo (greenfield, not vendored).  When sigmond
+# publishes SIGMOND_CLICKHOUSE_URL, an in-process tailer thread parses
+# new lines from `<radiod_id>-{ft8,ft4}.log` and inserts rows into
+# psk.spots in parallel with pskreporter-sender's existing PSKReporter
+# upload path.  CH-disabled hosts stay file-only with no extra parts.
+[clickhouse]
+database         = "psk"
+schema_dir       = "clickhouse/schema/psk"
+schema_version   = 1
+required_min_ch  = "23.8"
 
 [deps]
 [[deps.git]]
