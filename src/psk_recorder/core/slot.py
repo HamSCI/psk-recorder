@@ -3,6 +3,22 @@
 One SlotWorker per channel. Runs as a daemon thread, polling the ring
 buffer every 500 ms for completed slots.
 
+Two decoder backends are supported (selected by ``decoder_kind``):
+
+  * ``"jt9"`` — WSJT-X's canonical FT4/FT8 decoder.  Default.  Reports
+    calibrated dB SNR, time-offset, frequency-offset, decoded message
+    text, and a spectral-width metric.  Writes to ``<-a tmpdir>/
+    decoded.txt`` per invocation; we read the file post-exit and
+    append WSJT-X canonical lines to the per-mode log.
+  * ``"decode_ft8"`` — fallback to ka9q/ft8_lib's decoder.  Streams
+    its line-format output directly to stdout (we attach the log
+    fd).  Reports an internal "score" (not a calibrated dB SNR).
+    Used when jt9 is unavailable or as an explicit operator opt-out.
+
+Both backends append to the same ``<radiod>-<mode>.log`` file in
+their native formats; ``ch_tailer.parse_decoder_line`` auto-detects
+which by structure.
+
 FT8 cadence: 15 s (slots at :00, :15, :30, :45)
 FT4 cadence: 7.5 s (slots at :00, :07.5, :15, :22.5, :30, :37.5, :45, :52.5)
 """
@@ -12,7 +28,9 @@ from __future__ import annotations
 import logging
 import math
 import os
+import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -24,6 +42,11 @@ from psk_recorder.core.wav import write_wav
 logger = logging.getLogger(__name__)
 
 SETTLE_SEC = 1.5
+
+# decoder_kind values accepted by SlotWorker.
+DECODER_JT9 = "jt9"
+DECODER_FT8_LIB = "decode_ft8"
+VALID_DECODER_KINDS = (DECODER_JT9, DECODER_FT8_LIB)
 
 
 class SlotWorker:
@@ -39,7 +62,14 @@ class SlotWorker:
         log_fd,
         decoder_path: str,
         keep_wav: bool = False,
+        decoder_kind: str = DECODER_JT9,
+        decoder_depth: int = 3,
     ):
+        if decoder_kind not in VALID_DECODER_KINDS:
+            raise ValueError(
+                f"decoder_kind must be one of {VALID_DECODER_KINDS}; "
+                f"got {decoder_kind!r}"
+            )
         self._ring = ring
         self._mode = mode
         self._frequency_hz = frequency_hz
@@ -47,11 +77,19 @@ class SlotWorker:
         self._spool_dir = spool_dir
         self._log_fd = log_fd
         self._decoder_path = decoder_path
+        self._decoder_kind = decoder_kind
+        self._decoder_depth = decoder_depth
         self._keep_wav = keep_wav
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._next_slot_start: Optional[float] = None
-        self._pending_procs: list[tuple[subprocess.Popen, Path]] = []
+        # Each entry: (proc, wav_path, tmpdir_or_None, slot_start_utc).
+        # tmpdir is set only for jt9 (per-slot --data-path); we read its
+        # decoded.txt and rmtree it after the process exits.  slot_start
+        # is the UTC epoch the slot started at (jt9 emits HHMM only;
+        # we prefix the date when we materialise canonical lines).
+        self._pending_procs: list[tuple[subprocess.Popen, Path,
+                                        Optional[Path], float]] = []
         # Counters read by the recorder's stats thread. int ops are atomic
         # under CPython GIL; no lock needed for the single-reader case.
         self.decodes_ok = 0
@@ -151,6 +189,19 @@ class SlotWorker:
         return wav_path
 
     def _fork_decoder(self, wav_path: Path) -> None:
+        slot_start = self._next_slot_start or time.time()
+        if self._decoder_kind == DECODER_JT9:
+            self._fork_decoder_jt9(wav_path, slot_start)
+        else:
+            self._fork_decoder_ft8_lib(wav_path, slot_start)
+
+    def _fork_decoder_ft8_lib(self, wav_path: Path, slot_start: float) -> None:
+        """ka9q/ft8_lib decode_ft8 — streams output directly to log_fd.
+
+        CLI: ``decode_ft8 -f <freq_mhz> [-4 for FT4] <wav_path>``.
+        Output format (per ft8_lib decode_ft8.c:363):
+            YYYY/MM/DD HH:MM:SS  SCORE  DT  FREQ_HZ  ~  MESSAGE
+        """
         freq_mhz = self._frequency_hz / 1e6
         cmd = [self._decoder_path, "-f", f"{freq_mhz:.6f}"]
         if self._mode == "ft4":
@@ -163,42 +214,145 @@ class SlotWorker:
                 stdout=self._log_fd,
                 stderr=subprocess.PIPE,
             )
-            self._pending_procs.append((proc, wav_path))
+            self._pending_procs.append((proc, wav_path, None, slot_start))
             logger.debug(
                 "%s %d Hz: decode_ft8 pid=%d on %s",
                 self._mode.upper(), self._frequency_hz, proc.pid, wav_path.name,
             )
         except OSError as exc:
-            logger.error("Failed to launch decoder: %s", exc)
+            logger.error("Failed to launch decode_ft8: %s", exc)
+            if not self._keep_wav:
+                wav_path.unlink(missing_ok=True)
+
+    def _fork_decoder_jt9(self, wav_path: Path, slot_start: float) -> None:
+        """WSJT-X jt9 — writes decoded.txt to a per-slot --data-path tmpdir.
+
+        CLI: ``jt9 [-8|-7] -d <depth> -a <tmpdir> <wav_path>``.
+        Each invocation needs its own data-path so concurrent slots
+        don't clobber each other's decoded.txt.
+        """
+        try:
+            tmpdir = Path(tempfile.mkdtemp(
+                prefix=f"jt9-{self._mode}-",
+                dir=str(self._spool_dir),
+            ))
+        except OSError as exc:
+            logger.error("Failed to mkdtemp for jt9: %s", exc)
+            if not self._keep_wav:
+                wav_path.unlink(missing_ok=True)
+            return
+
+        mode_flag = "-7" if self._mode == "ft4" else "-8"
+        cmd = [
+            self._decoder_path,
+            mode_flag,
+            "-d", str(self._decoder_depth),
+            "-a", str(tmpdir),
+            str(wav_path),
+        ]
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            self._pending_procs.append((proc, wav_path, tmpdir, slot_start))
+            logger.debug(
+                "%s %d Hz: jt9 pid=%d on %s (data-path=%s)",
+                self._mode.upper(), self._frequency_hz,
+                proc.pid, wav_path.name, tmpdir.name,
+            )
+        except OSError as exc:
+            logger.error("Failed to launch jt9: %s", exc)
+            shutil.rmtree(tmpdir, ignore_errors=True)
             if not self._keep_wav:
                 wav_path.unlink(missing_ok=True)
 
     def _reap_finished(self) -> None:
         still_pending = []
-        for proc, wav_path in self._pending_procs:
+        for proc, wav_path, tmpdir, slot_start in self._pending_procs:
             ret = proc.poll()
             if ret is None:
-                still_pending.append((proc, wav_path))
+                still_pending.append((proc, wav_path, tmpdir, slot_start))
                 continue
             if ret == 0:
                 self.decodes_ok += 1
+                if self._decoder_kind == DECODER_JT9 and tmpdir is not None:
+                    self._materialise_jt9_output(tmpdir, slot_start)
             else:
                 self.decodes_fail += 1
                 stderr = proc.stderr.read().decode(errors="replace").strip()[:200]
+                kind_name = "jt9" if self._decoder_kind == DECODER_JT9 else "decode_ft8"
                 logger.warning(
-                    "decode_ft8 exit %d for %s: %s", ret, wav_path.name, stderr,
+                    "%s exit %d for %s: %s",
+                    kind_name, ret, wav_path.name, stderr,
                 )
+            if tmpdir is not None:
+                shutil.rmtree(tmpdir, ignore_errors=True)
             if not self._keep_wav:
                 wav_path.unlink(missing_ok=True)
         self._pending_procs = still_pending
 
     def _reap_all(self, wait: bool = False) -> None:
-        for proc, wav_path in self._pending_procs:
+        for proc, wav_path, tmpdir, slot_start in self._pending_procs:
             if wait:
                 try:
                     proc.wait(timeout=5.0)
+                    if (proc.returncode == 0
+                            and self._decoder_kind == DECODER_JT9
+                            and tmpdir is not None):
+                        self._materialise_jt9_output(tmpdir, slot_start)
                 except subprocess.TimeoutExpired:
                     proc.kill()
+            if tmpdir is not None:
+                shutil.rmtree(tmpdir, ignore_errors=True)
             if not self._keep_wav:
                 wav_path.unlink(missing_ok=True)
         self._pending_procs.clear()
+
+    def _materialise_jt9_output(self, tmpdir: Path, slot_start: float) -> None:
+        """Read jt9's decoded.txt and append WSJT-X-canonical lines to the
+        per-mode log file.
+
+        jt9's per-line format (after ``-a tmpdir`` invocation) is:
+
+            HHMM  SNR  DT  FREQ_HZ  `  MESSAGE  [SPECTRAL_WIDTH]
+
+        We prefix each line with ``YYMMDD `` derived from the slot's
+        UTC start time so the canonical log lines self-identify their
+        date — matching the WSJT-X ALL.TXT convention:
+
+            YYMMDD_HHMM  SNR  DT  FREQ_HZ  MODE  `  MESSAGE  [WIDTH]
+
+        Returns silently if decoded.txt is missing / unreadable / empty
+        — that's the normal "no decodes this slot" case for a quiet
+        band.  ``ch_tailer.parse_jt9_line`` is the canonical reader of
+        these lines.
+        """
+        decoded = tmpdir / "decoded.txt"
+        try:
+            text = decoded.read_text()
+        except (FileNotFoundError, OSError):
+            return
+        if not text.strip():
+            return
+
+        date_prefix = time.strftime("%y%m%d", time.gmtime(slot_start))
+        mode_token = self._mode.upper()
+        try:
+            for line in text.splitlines():
+                if not line.strip():
+                    continue
+                # Insert the date and the mode token so ChTailer can
+                # auto-detect format and tag the row's mode without
+                # re-deriving it from the WAV path.
+                self._log_fd.write(
+                    f"{date_prefix} {line.rstrip()} {mode_token}\n"
+                )
+            self._log_fd.flush()
+        except OSError as exc:
+            logger.warning(
+                "%s: failed appending jt9 output to log: %s",
+                self._mode.upper(), exc,
+            )

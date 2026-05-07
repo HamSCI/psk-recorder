@@ -64,6 +64,8 @@ class ChannelSink:
         decoder_path: str,
         keep_wav: bool = False,
         authority_reader: Optional[AuthorityReader] = None,
+        decoder_kind: str = "jt9",
+        decoder_depth: int = 3,
     ):
         self._mode = mode
         self._frequency_hz = frequency_hz
@@ -86,6 +88,8 @@ class ChannelSink:
             spool_dir=spool_dir / mode,
             log_fd=log_fd,
             decoder_path=decoder_path,
+            decoder_kind=decoder_kind,
+            decoder_depth=decoder_depth,
             keep_wav=keep_wav,
         )
 

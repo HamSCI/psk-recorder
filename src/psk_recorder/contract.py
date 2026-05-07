@@ -87,7 +87,7 @@ def build_inventory(config: dict, config_path: Path) -> dict:
             data_sinks.append({
                 "kind":           "clickhouse",
                 "target":         "psk.spots",
-                "schema_ref":     "psk:1",
+                "schema_ref":     "psk:2",
                 "retention_days": 14,
                 "mb_per_day":     8,
                 "health":         "ok",

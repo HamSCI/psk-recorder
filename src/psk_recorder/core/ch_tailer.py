@@ -44,6 +44,34 @@ _CALL_RE = re.compile(r"^[A-Z0-9]{1,3}[0-9][A-Z0-9]{0,4}(?:/[A-Z0-9]{1,4})?$")
 _GRID_RE = re.compile(r"^[A-R]{2}[0-9]{2}(?:[A-Xa-x]{2})?$")
 _REPORT_RE = re.compile(r"^R?([+-]?\d+)$")
 
+# Format-detection regexes for the dual-decoder router.
+_DECODE_FT8_PREFIX = re.compile(r"^\d{4}/\d{2}/\d{2}\s")     # YYYY/MM/DD …
+_JT9_PREFIX        = re.compile(r"^\d{6}\s\d{4}\s")          # YYMMDD HHMM …
+
+
+def parse_decoder_line(line: str, *, mode: Optional[str] = None) -> Optional[dict]:
+    """Auto-detect decoder format and parse.
+
+    The per-mode log file (`<radiod_id>-<mode>.log`) may carry lines
+    from either ``decode_ft8`` (legacy fallback) or ``jt9`` (current
+    default; canonical WSJT-X-ish format with date prefix added by
+    SlotWorker).  We look at the leading byte run to pick a parser.
+
+    Returns ``None`` on unrecognised structure (header line, blank,
+    junk).  Caller should skip silently.
+    """
+    stripped = line.strip()
+    if not stripped:
+        return None
+    if _JT9_PREFIX.match(stripped):
+        return parse_jt9_line(stripped, mode=mode)
+    if _DECODE_FT8_PREFIX.match(stripped):
+        # decode_ft8 emits its own mode-agnostic format; if we don't
+        # know the mode (router called without a hint), we leave it
+        # blank — caller may set it from the log file path.
+        return parse_decode_ft8_line(stripped, mode=mode or "")
+    return None
+
 
 def parse_decode_ft8_line(line: str, *, mode: str) -> Optional[dict]:
     """Parse one decode_ft8 stdout line into a psk.spots row.
@@ -70,17 +98,126 @@ def parse_decode_ft8_line(line: str, *, mode: str) -> Optional[dict]:
     message = message.strip()
     parsed = _parse_message(message)
     return {
-        "time":          ts,
-        "mode":          mode,
-        "score":         score,
-        "dt":            dt,
-        "frequency":     int(freq),
-        "frequency_mhz": freq / 1_000_000.0,
-        "message":       message,
-        "tx_call":       parsed.get("tx_call", ""),
-        "rx_call":       parsed.get("rx_call", ""),
-        "grid":          parsed.get("grid", ""),
-        "report":        parsed.get("report"),
+        "time":               ts,
+        "mode":               mode,
+        "decoder_kind":       "decode_ft8",
+        "score":              score,
+        "snr_db":             None,        # ft8_lib's `score` ≠ calibrated dB
+        "spectral_width_hz":  None,        # not surfaced by decode_ft8
+        "dt":                 dt,
+        "frequency":          int(freq),
+        "frequency_mhz":      freq / 1_000_000.0,
+        "message":            message,
+        "tx_call":            parsed.get("tx_call", ""),
+        "rx_call":            parsed.get("rx_call", ""),
+        "grid":               parsed.get("grid", ""),
+        "report":             parsed.get("report"),
+    }
+
+
+def parse_jt9_line(line: str, *, mode: Optional[str] = None) -> Optional[dict]:
+    """Parse one WSJT-X-canonical jt9 line into a psk.spots row.
+
+    Format emitted by ``slot.SlotWorker._materialise_jt9_output`` —
+    jt9's per-line ``decoded.txt`` output prefixed with the slot's UTC
+    date and suffixed with the mode token::
+
+        YYMMDD HHMM SNR DT FREQ_HZ ` MESSAGE [SPECTRAL_WIDTH_HZ] MODE
+
+    Where::
+
+        YYMMDD              decimal date (UTC, 6 digits)
+        HHMM                slot start time (4 digits, UTC)
+        SNR                 calibrated dB SNR (signed integer)
+        DT                  time-offset within slot (signed float, seconds)
+        FREQ_HZ             baseband frequency offset (integer Hz)
+        `                   literal backtick separator
+        MESSAGE             one or more whitespace-separated tokens
+        SPECTRAL_WIDTH_HZ   optional decimal float (50 %-energy width)
+        MODE                "FT8" or "FT4" (uppercase, suffix added by slot.py)
+
+    Returns ``None`` on any parse failure.  ``mode`` parameter is
+    accepted for API symmetry but the line carries the authoritative
+    mode in its own MODE token; the parameter is used only as a
+    fallback if the suffix is somehow missing.
+    """
+    parts = line.strip().split()
+    # 7 = YYMMDD HHMM SNR DT FREQ ` MSG_ONE_TOKEN MODE — minimum
+    # plausible.  We accept the mode-suffix path; bare jt9 output (no
+    # suffix) lands in the older legacy branch below.
+    if len(parts) < 7:
+        return None
+    if parts[5] != "`":
+        return None
+
+    # Date + time → UTC datetime (HHMM has no seconds, so :00 implied).
+    try:
+        ts = datetime.strptime(parts[0] + parts[1], "%y%m%d%H%M")
+    except ValueError:
+        return None
+    try:
+        snr_db = int(parts[2])
+        dt = float(parts[3])
+        freq_offset_hz = int(parts[4])
+    except (ValueError, IndexError):
+        return None
+
+    # Last token: mode tag (slot.py suffix).  Penultimate: spectral_width
+    # if it parses as a float.  Everything from idx 6 to whatever is
+    # left becomes the message.
+    last = parts[-1]
+    detected_mode = ""
+    if last.upper() in ("FT8", "FT4"):
+        detected_mode = last.lower()
+        message_end = len(parts) - 1
+    else:
+        message_end = len(parts)
+
+    spectral_width: Optional[float] = None
+    if message_end > 6:
+        # Try parsing the new "last" (post-mode-strip) as spectral width.
+        # Constrain to plausible widths: small positive value in Hz (typical
+        # FT8 chirp width is ~0.005-0.05 Hz; cap at 10 Hz as a generous
+        # upper bound).  Negative numbers are signal reports (e.g. "-15"),
+        # not widths — they belong in the message.
+        candidate = parts[message_end - 1]
+        try:
+            cval = float(candidate)
+            if 0 < cval < 10.0:
+                spectral_width = cval
+                message_end -= 1
+        except ValueError:
+            pass
+
+    message_tokens = parts[6:message_end]
+    if not message_tokens:
+        return None
+    message = " ".join(message_tokens)
+    parsed = _parse_message(message)
+
+    return {
+        "time":               ts,
+        "mode":               detected_mode or (mode or ""),
+        "decoder_kind":       "jt9",
+        # `score` (Int16, not nullable in schema) is decode_ft8's
+        # internal metric; jt9 doesn't emit one.  Use 0 as the
+        # "absent" sentinel — consumers should prefer `snr_db` when
+        # `decoder_kind = 'jt9'`.
+        "score":              0,
+        "snr_db":             snr_db,
+        "spectral_width_hz":  spectral_width,
+        "dt":                 dt,
+        # jt9's freq is a baseband offset in Hz; preserve it as-is in
+        # the canonical "frequency" column.  An operator analysing
+        # absolute RF needs to add the per-channel dial freq from the
+        # config, which lives in the radiod block, not in this line.
+        "frequency":          freq_offset_hz,
+        "frequency_mhz":      freq_offset_hz / 1_000_000.0,
+        "message":            message,
+        "tx_call":            parsed.get("tx_call", ""),
+        "rx_call":            parsed.get("rx_call", ""),
+        "grid":               parsed.get("grid", ""),
+        "report":             parsed.get("report"),
     }
 
 
@@ -270,7 +407,7 @@ class ChTailer:
     def _consume(self, text: str) -> None:
         rows: list[dict] = []
         for line in text.splitlines():
-            row = parse_decode_ft8_line(line, mode=self._mode)
+            row = parse_decoder_line(line, mode=self._mode)
             if row is None:
                 continue
             row["host_call"] = self._host_call

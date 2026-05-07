@@ -117,8 +117,31 @@ class PskRecorder:
         log_dir = Path(self._paths.get(
             "log_dir", "/var/log/psk-recorder"
         ))
-        decoder = self._paths.get("decoder", "/usr/local/bin/decode_ft8")
+        # CONTRACT v0.6 — `decoder_kind` selects between WSJT-X jt9
+        # (default, calibrated dB SNR + spectral width) and ka9q/
+        # ft8_lib's decode_ft8 (fallback, internal "score" only).  The
+        # paths are looked up per-kind: `paths.decoder_jt9` falls back
+        # to `paths.decoder` for old configs that pre-date the swap.
+        # See SlotWorker for output-format details.
+        decoder_kind = str(self._paths.get("decoder_kind", "jt9")).lower()
+        if decoder_kind == "jt9":
+            decoder = self._paths.get(
+                "decoder_jt9", self._paths.get(
+                    "decoder", "/usr/local/bin/jt9",
+                ),
+            )
+        else:
+            decoder = self._paths.get(
+                "decoder_decode_ft8", self._paths.get(
+                    "decoder", "/usr/local/bin/decode_ft8",
+                ),
+            )
+        decoder_depth = int(self._paths.get("decoder_depth", 3))
         keep_wav = self._paths.get("keep_wav", False)
+        logger.info(
+            "decoder_kind=%s path=%s depth=%d",
+            decoder_kind, decoder, decoder_depth,
+        )
 
         multi_by_group: dict[tuple, object] = {}
 
@@ -152,6 +175,8 @@ class PskRecorder:
                     spool_dir=spool_root,
                     log_fd=self._log_fds[mode],
                     decoder_path=decoder,
+                    decoder_kind=decoder_kind,
+                    decoder_depth=decoder_depth,
                     keep_wav=keep_wav,
                 )
                 self._add_sink_to_multi(sink, multi_by_group)

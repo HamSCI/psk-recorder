@@ -1,6 +1,6 @@
 [package]
 name             = "psk-recorder"
-version          = "0.1.0"
+version          = "0.3.0"
 contract_version = "0.6"
 license          = "MIT"
 
@@ -61,14 +61,20 @@ units = ["psk-recorder@.service"]
 [clickhouse]
 database         = "psk"
 schema_dir       = "clickhouse/schema/psk"
-schema_version   = 1
+# schema_version   = 1   — initial create_database + create_spots
+schema_version   = 2     # 002_add_jt9_columns.sql adds snr_db,
+                         # spectral_width_hz, decoder_kind
 required_min_ch  = "23.8"
 
 [deps]
+[[deps.apt]]
+name = "wsjtx"
+note = "provides /usr/bin/jt9 — the default FT4/FT8 decoder (v0.3+)"
+
 [[deps.git]]
 name       = "ka9q-radio"
 url        = "https://github.com/ka9q/ka9q-radio.git"
-note       = "provides decode_ft8 binary"
+note       = "provides decode_ft8 binary (decoder_kind=decode_ft8 fallback)"
 
 [[deps.git]]
 name       = "ftlib-pskreporter"
