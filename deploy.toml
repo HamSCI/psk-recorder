@@ -95,14 +95,19 @@ name = "libgfortran5"
 note = "Fortran runtime — jt9 is built in Fortran"
 
 [[deps.git]]
-name       = "ka9q-radio"
-url        = "https://github.com/ka9q/ka9q-radio.git"
-note       = "provides decode_ft8 binary (decoder_kind=decode_ft8 fallback)"
+name       = "ft8_lib"
+url        = "https://github.com/ka9q/ft8_lib.git"
+note       = "provides /usr/local/bin/decode_ft8 (decoder_kind=decode_ft8 fallback)"
 
 [[deps.git]]
 name       = "ftlib-pskreporter"
 url        = "https://github.com/pjsg/ftlib-pskreporter.git"
-note       = "provides pskreporter binary"
+note       = "provides /usr/local/bin/pskreporter-sender (pip-installable)"
+
+# decode_ft8 / pskreporter-sender used to be cloned by wsprdaemon-client's
+# deps.conf — that's a v3 legacy.  In v4 these binaries belong to
+# psk-recorder's install pipeline alone; wsprdaemon-client decodes only
+# WSPR (W2/F2/F5/F15/F30) and never invokes them.
 
 [[deps.pypi]]
 name    = "ka9q-python"
