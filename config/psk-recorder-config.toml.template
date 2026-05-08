@@ -60,7 +60,12 @@ freqs_hz    = [
 sample_rate = 12000
 preset      = "usb"
 encoding    = "s16be"
+# 160m FT4 is intentionally absent: WSJT-X's standard FT4 frequency
+# table doesn't include it (the band is too narrow for FT4's keying),
+# and putting 1_840_000 here makes FT4's channel collide with FT8's
+# at the same frequency — same (preset, rate, encoding) tuple → same
+# SSRC → ka9q-python silently drops one of the two streams.
 freqs_hz    = [
-  1_840_000,  3_575_000,  7_047_500, 10_140_000, 14_080_000,
+                3_575_000,  7_047_500, 10_140_000, 14_080_000,
   18_104_000, 21_140_000, 24_919_000, 28_180_000, 50_318_000,
 ]
