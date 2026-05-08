@@ -7,6 +7,15 @@ resolution-markers = [
 ]
 
 [[package]]
+name = "callhash"
+version = "1.0.0"
+source = { directory = "../callhash" }
+
+[package.metadata]
+requires-dist = [{ name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0.0" }]
+provides-extras = ["dev"]
+
+[[package]]
 name = "colorama"
 version = "0.4.6"
 source = { registry = "https://pypi.org/simple" }
@@ -38,15 +47,15 @@ wheels = [
 
 [[package]]
 name = "ka9q-python"
-version = "3.9.0"
+version = "3.13.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/8d/b1/e88383ae86e928a15e0a823998f51b2cc641cb112cec00a8b4a53970b327/ka9q_python-3.9.0.tar.gz", hash = "sha256:affcd7b02e2d01371447ebeb83f8516594e1b6f249561c18dd588602ee2b7ce3", size = 395188, upload-time = "2026-04-14T20:59:41.436Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/16/46/37fcc135022903d38608ee6767e293ad8eb4db83ea2342a499b08c1e8cb4/ka9q_python-3.13.0.tar.gz", hash = "sha256:2b00c14965fe68b5a1def38e3a1707fb7ba129b583175f44d198609b8362842d", size = 243053, upload-time = "2026-05-08T13:54:19.972Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/50/39/081fb47bd4a4385f1de3c4a844d6918a540e60845e1c30cb76d951c3c461/ka9q_python-3.9.0-py3-none-any.whl", hash = "sha256:c218875de59af3b3c74091822fa49a70276acc08559e573f3ff11ffb79736e5c", size = 91423, upload-time = "2026-04-14T20:59:40.045Z" },
+    { url = "https://files.pythonhosted.org/packages/4c/08/bf803959188f65f7298f7a8e978be7b2ccd72b017aca94fc91859f3d106d/ka9q_python-3.13.0-py3-none-any.whl", hash = "sha256:dd88c5763204821d7f1e4f2a59cac6fa463a92c4bfce82f30018d28b3e6fbb27", size = 100226, upload-time = "2026-05-08T13:54:18.634Z" },
 ]
 
 [[package]]
@@ -216,9 +225,10 @@ wheels = [
 
 [[package]]
 name = "psk-recorder"
-version = "0.1.0"
+version = "0.4.0"
 source = { editable = "." }
 dependencies = [
+    { name = "callhash" },
     { name = "ka9q-python" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
@@ -232,7 +242,8 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "ka9q-python", specifier = ">=3.8.0" },
+    { name = "callhash", directory = "../callhash" },
+    { name = "ka9q-python", specifier = ">=3.13.0" },
     { name = "numpy", specifier = ">=1.24.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
     { name = "tomli", marker = "python_full_version < '3.11'", specifier = ">=2.0" },
