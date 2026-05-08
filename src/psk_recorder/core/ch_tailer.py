@@ -511,14 +511,14 @@ class ChTailer:
     def _make_callhash_table(self, path: Optional[Path]):
         """Construct (or load) the per-radiod CallHashTable.
 
-        Returns None when ``sigmond.callhash`` isn't importable —
-        keeps psk-recorder runnable on hosts without sigmond installed.
+        Returns None when ``callhash`` isn't importable — keeps
+        psk-recorder runnable on hosts without the callhash library.
         """
         try:
-            from sigmond.callhash import CallHashTable  # type: ignore[import-not-found]
+            from callhash import CallHashTable  # type: ignore[import-not-found]
         except ImportError as exc:
             logger.debug(
-                "ch_tailer %s: sigmond.callhash unavailable (%s); "
+                "ch_tailer %s: callhash library unavailable (%s); "
                 "compound-callsign hash resolution disabled",
                 self._mode, exc,
             )

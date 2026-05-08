@@ -13,6 +13,7 @@ authors = [
 ]
 dependencies = [
     "ka9q-python>=3.8.0",
+    "callhash>=1.0.0",
     "numpy>=1.24.0",
     "tomli>=2.0; python_version < '3.11'",
 ]
@@ -30,3 +31,6 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.uv.sources]
+callhash = { path = "../callhash" }

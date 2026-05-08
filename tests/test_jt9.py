@@ -381,7 +381,7 @@ class TestChTailerCallhash:
         assert "VE3/W1XYZ" in data["calls"]
 
     def test_callhash_table_loads_existing_state_at_start(self, tmp_path):
-        from sigmond.callhash import CallHashTable
+        from callhash import CallHashTable
         callhash_path = tmp_path / "callhash.json"
         # Seed the table first.
         seed = CallHashTable.load_or_new(callhash_path)
