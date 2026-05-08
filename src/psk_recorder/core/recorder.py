@@ -41,10 +41,22 @@ class PskRecorder:
 
         self._sinks: list[ChannelSink] = []
         self._multi_streams: list = []
+        # (MultiStream, ssrc) pairs — populated as channels are provisioned,
+        # used by the keep-alive thread to refresh radiod's LIFETIME timer.
+        self._lifetime_entries: list[tuple[object, int]] = []
         self._uploaders: list[PskReporterUploader] = []
         self._ch_tailers: list[ChTailer] = []
         self._log_fds: dict[str, object] = {}
         self._running = False
+
+        # radiod LIFETIME tag (ka9q-python ≥3.13.0).  0 = no LIFETIME tag
+        # sent + no keep-alive; >0 = self-destruct after N frames, refreshed
+        # at frames/4 cadence while we're alive.  See DEFAULTS in config.py.
+        proc = config.get("processing", {})
+        self._radiod_lifetime_frames: int = int(
+            proc.get("radiod_lifetime_frames", 0)
+        )
+        self._lifetime_thread: Optional[threading.Thread] = None
 
     def run(self) -> None:
         """Main entry: provision channels, start streams, block until signal."""
@@ -58,6 +70,7 @@ class PskRecorder:
             self._start_uploaders()
             self._start_ch_tailers()
             self._start_stats_thread()
+            self._start_lifetime_keepalive()
             self._notify_ready()
             self._main_loop()
         except Exception:
@@ -202,11 +215,20 @@ class PskRecorder:
         """
         from ka9q import MultiStream
 
+        # `lifetime=None` when configured to 0 — distinguishes "no LIFETIME
+        # tag at all" (radiod template default applies) from "finite N
+        # frames" (self-destruct timer enabled).
+        lifetime_arg: Optional[int] = (
+            self._radiod_lifetime_frames
+            if self._radiod_lifetime_frames > 0 else None
+        )
+
         info = self._control.ensure_channel(
             frequency_hz=float(sink.frequency_hz),
             preset=sink.preset,
             sample_rate=sink.sample_rate,
             encoding=sink.encoding,
+            lifetime=lifetime_arg,
         )
         key = (info.multicast_address, info.port)
         multi = multi_by_group.get(key)
@@ -214,7 +236,7 @@ class PskRecorder:
             multi = MultiStream(control=self._control)
             multi_by_group[key] = multi
 
-        multi.add_channel(
+        ch_info = multi.add_channel(
             frequency_hz=float(sink.frequency_hz),
             preset=sink.preset,
             sample_rate=sink.sample_rate,
@@ -222,7 +244,10 @@ class PskRecorder:
             on_samples=sink.on_samples,
             on_stream_dropped=sink.on_stream_dropped,
             on_stream_restored=sink.on_stream_restored,
+            lifetime=lifetime_arg,
         )
+        if lifetime_arg is not None:
+            self._lifetime_entries.append((multi, ch_info.ssrc))
 
     def _start_streams(self) -> None:
         for sink in self._sinks:
@@ -346,6 +371,49 @@ class PskRecorder:
             target=self._stats_loop, daemon=True, name="stats",
         )
         self._stats_thread.start()
+
+    def _start_lifetime_keepalive(self) -> None:
+        """Refresh radiod's LIFETIME on every active SSRC at frames/4 cadence.
+
+        No-op when radiod_lifetime_frames is 0 or no channels opted in.
+        Failure to refresh (network blip, radiod restart) must not crash
+        the recorder — log and continue; MultiStream's drop/restore path
+        will re-apply the slot's lifetime when reception resumes.
+        """
+        if not self._lifetime_entries:
+            return
+        # Refresh every quarter of the lifetime — gives 4× safety margin
+        # against radiod self-destruct if a single refresh is missed.
+        # Floor at 1 s so absurd configs don't busy-loop.
+        interval = max(self._radiod_lifetime_frames / 50.0 / 4.0, 1.0)
+        logger.info(
+            "lifetime keepalive: %d channels, %d frames, refresh every %.1fs",
+            len(self._lifetime_entries),
+            self._radiod_lifetime_frames,
+            interval,
+        )
+        self._lifetime_thread = threading.Thread(
+            target=self._lifetime_loop,
+            args=(interval,),
+            daemon=True,
+            name="lifetime",
+        )
+        self._lifetime_thread.start()
+
+    def _lifetime_loop(self, interval_sec: float) -> None:
+        while self._running:
+            time.sleep(interval_sec)
+            if not self._running:
+                break
+            for multi, ssrc in self._lifetime_entries:
+                try:
+                    multi.set_channel_lifetime(
+                        ssrc, self._radiod_lifetime_frames
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "lifetime keepalive failed (ssrc=%s): %s", ssrc, exc,
+                    )
 
     def _stats_loop(self) -> None:
         """Every 60 s, log a summary of decode + spot activity per mode.

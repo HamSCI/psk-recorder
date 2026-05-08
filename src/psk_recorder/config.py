@@ -22,6 +22,18 @@ DEFAULTS: dict[str, Any] = {
         "pskreporter": "/usr/local/bin/pskreporter-sender",
         "keep_wav": False,
     },
+    "processing": {
+        # radiod LIFETIME tag (ka9q-python ≥3.13.0, ka9q-radio ≥0f8b622).
+        # Channels self-destruct after this many radiod main-loop frames
+        # (~50 Hz at the default 20 ms blocktime, so 6000 ≈ 2 min).  The
+        # recorder refreshes lifetime every (frames / 4) seconds while
+        # running, so a crashed/killed recorder leaves no residual
+        # channels on radiod within ~2 min.
+        # 0 = infinite (no LIFETIME tag, no keep-alive — radiod owns the
+        # channel for its full template default).  Use only when you
+        # truly want a channel to outlive the recorder.
+        "radiod_lifetime_frames": 6000,
+    },
 }
 
 FT8_CADENCE_SEC = 15.0
@@ -45,6 +57,17 @@ def load_config(path: Path | None = None) -> dict:
     raw.setdefault("paths", {})
     for key, val in DEFAULTS["paths"].items():
         raw["paths"].setdefault(key, val)
+
+    raw.setdefault("processing", {})
+    for key, val in DEFAULTS["processing"].items():
+        raw["processing"].setdefault(key, val)
+
+    lifetime = raw["processing"]["radiod_lifetime_frames"]
+    if not isinstance(lifetime, int) or lifetime < 0:
+        raise ValueError(
+            f"processing.radiod_lifetime_frames must be a non-negative int "
+            f"(frames; ~50 Hz at default blocktime); got {lifetime!r}"
+        )
 
     return raw
 
