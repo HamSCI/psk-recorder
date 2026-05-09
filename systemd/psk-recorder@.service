@@ -42,7 +42,12 @@ StandardError=inherit
 SyslogIdentifier=psk-recorder@%i
 
 Nice=5
-MemoryMax=512M
+# 19+ concurrent jt9 children at ~60 MB RSS each saturates 512M.  jt9
+# is a Fortran binary that mmaps its own working buffers per slot;
+# this scales linearly with channel count and decoding depth.  2 GB
+# leaves comfortable headroom for the standard FT8 × 10 + FT4 × 9
+# layout plus the psk-recorder Python process itself.
+MemoryMax=2G
 MemorySwapMax=0
 
 NoNewPrivileges=true
