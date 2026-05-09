@@ -252,10 +252,16 @@ class SlotWorker:
         ]
 
         try:
+            # cwd=tmpdir: jt9's Fortran runtime writes ./timer.out (and
+            # other scratch files) relative to the process CWD.  Without
+            # this it inherits the systemd WorkingDirectory (/opt/psk-
+            # recorder, root-owned), pskrec can't write there, and the
+            # Fortran runtime aborts before producing decoded.txt.
             proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
+                cwd=str(tmpdir),
             )
             self._pending_procs.append((proc, wav_path, tmpdir, slot_start))
             logger.debug(
