@@ -136,7 +136,7 @@ class PskRecorder:
         # paths are looked up per-kind: `paths.decoder_jt9` falls back
         # to `paths.decoder` for old configs that pre-date the swap.
         # See SlotWorker for output-format details.
-        decoder_kind = str(self._paths.get("decoder_kind", "jt9")).lower()
+        decoder_kind = str(self._paths.get("decoder_kind", "decode_ft8")).lower()
         if decoder_kind == "jt9":
             decoder = self._paths.get(
                 "decoder_jt9", self._paths.get(

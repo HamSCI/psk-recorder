@@ -62,7 +62,7 @@ class SlotWorker:
         log_fd,
         decoder_path: str,
         keep_wav: bool = False,
-        decoder_kind: str = DECODER_JT9,
+        decoder_kind: str = DECODER_FT8_LIB,
         decoder_depth: int = 3,
     ):
         if decoder_kind not in VALID_DECODER_KINDS:

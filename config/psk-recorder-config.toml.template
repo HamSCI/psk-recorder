@@ -14,22 +14,27 @@ log_dir     = "/var/log/psk-recorder"
 pskreporter = "/usr/local/bin/pskreporter-sender"
 keep_wav    = false
 
-# Decoder selection (added in v0.3).  Two backends are supported:
+# Decoder selection.  Two backends are supported:
 #
-#   "jt9"        — WSJT-X's canonical FT4/FT8 decoder.  Default.
-#                  Reports calibrated dB SNR, time-offset,
-#                  frequency-offset, decoded message text, and a
-#                  spectral-width metric.  Provided by Debian's
-#                  `wsjtx` package (apt install wsjtx).
+#   "decode_ft8" — ka9q/ft8_lib's decoder.  *Default.*  Streams to
+#                  stdout, reports an ft8_lib-internal "score" rather
+#                  than a calibrated dB SNR.  ~0.05 s of CPU per slot
+#                  per band, ~4 MB RSS — for the standard 19-channel
+#                  layout this is essentially invisible at idle.
 #
-#   "decode_ft8" — ka9q/ft8_lib's decoder.  Fallback only.  Streams
-#                  to stdout, reports an internal "score" instead of
-#                  a calibrated dB SNR.
+#   "jt9"        — WSJT-X's canonical FT4/FT8 decoder.  Reports
+#                  calibrated dB SNR, time-offset, frequency-offset,
+#                  decoded message text, and a spectral-width metric.
+#                  Substantially heavier: ~1-2 s CPU and ~60 MB RSS
+#                  per slot per band — a 19-channel cycle peaks at
+#                  ~12 cores busy for ~3 s and triggers swap on hosts
+#                  with <8 GB RAM.  Worth the cost when you need
+#                  calibrated SNR or maximum weak-signal depth.
+#                  Provided by Debian's `wsjtx` package.
 #
-# Both decoders coexist in the schema (rows tag themselves via
-# `decoder_kind` in `psk.spots`); switch via the per-decoder path
-# overrides below.
-decoder_kind        = "jt9"
+# Both decoders coexist in the schema — rows self-identify via
+# `decoder_kind` in `psk.spots`.  Switch by changing the value below.
+decoder_kind        = "decode_ft8"
 decoder_jt9         = "/opt/psk-recorder/bin/decoders/jt9"
 decoder_decode_ft8  = "/usr/local/bin/decode_ft8"
 
