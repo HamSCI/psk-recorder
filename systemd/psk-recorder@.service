@@ -28,7 +28,11 @@ ExecStart=/opt/psk-recorder/venv/bin/python3 -m psk_recorder.cli daemon \
     --config /etc/psk-recorder/psk-recorder-config.toml \
     --radiod-id %i
 
-TimeoutStartSec=60
+# 180s covers a typical 19-channel (FT8 × 10 bands + FT4 × 9 bands) startup
+# plus headroom: each channel triggers a setpolicy round-trip with radiod,
+# the initial multicast discovery sleeps 1s, and a fresh start after a
+# stop adds ~10s of teardown.  60s was racy on a busy host.
+TimeoutStartSec=180
 
 Restart=always
 RestartSec=5
