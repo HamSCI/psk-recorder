@@ -56,9 +56,10 @@ _REPORT_RE = re.compile(r"^R?([+-]?\d+)$")
 
 # Format-detection regexes for the dual-decoder router.
 _DECODE_FT8_PREFIX = re.compile(r"^\d{4}/\d{2}/\d{2}\s")     # YYYY/MM/DD …
-# YYMMDD HHMMSS … — slot.py emits jt9's native HHMMSS time tag (6 digits)
-# rather than the 4-digit HHMM that an older psk-recorder format used.
-_JT9_PREFIX        = re.compile(r"^\d{6}\s\d{6}\s")          # YYMMDD HHMMSS …
+# YYMMDD HHMMSS BAND_FREQ_HZ … — slot.py prepends the slot's date,
+# 6-digit HHMMSS, and the band's tuned frequency in Hz so the parser
+# can compute absolute receive frequency = BAND_FREQ_HZ + jt9 offset.
+_JT9_PREFIX        = re.compile(r"^\d{6}\s\d{6}\s\d+\s")     # YYMMDD HHMMSS BAND_HZ …
 
 
 def parse_decoder_line(line: str, *, mode: Optional[str] = None) -> Optional[dict]:
@@ -130,16 +131,16 @@ def parse_decode_ft8_line(line: str, *, mode: str) -> Optional[dict]:
 def parse_jt9_line(line: str, *, mode: Optional[str] = None) -> Optional[dict]:
     """Parse one native jt9 line into a psk.spots row.
 
-    Format emitted by ``slot.SlotWorker._materialise_jt9_output`` — jt9 v27
-    ``decoded.txt`` output with the slot's UTC date prepended and the
-    placeholder ``HHMMSS`` replaced by the slot's actual receive time::
+    Format emitted by ``slot.SlotWorker._materialise_jt9_output``::
 
-        YYMMDD HHMMSS SYNC SNR DT FREQ_OFFSET_HZ MARKER MESSAGE... MODE
+        YYMMDD HHMMSS BAND_FREQ_HZ SYNC SNR DT FREQ_OFFSET_HZ MARKER MESSAGE... MODE
 
     Where::
 
         YYMMDD              decimal date (UTC, 6 digits)
         HHMMSS              slot start time (UTC, 6 digits)
+        BAND_FREQ_HZ        the radiod channel's tuned frequency (integer Hz);
+                            absolute receive freq = BAND_FREQ_HZ + FREQ_OFFSET_HZ
         SYNC                sync confidence (0..~100; jt9-internal score)
         SNR                 calibrated dB SNR (signed integer)
         DT                  time-offset within slot (signed float, seconds)
@@ -149,22 +150,21 @@ def parse_jt9_line(line: str, *, mode: Optional[str] = None) -> Optional[dict]:
         MESSAGE             one or more whitespace-separated tokens
         MODE                "FT8" or "FT4" — emitted by jt9 itself
 
-    Field mapping into ``psk.spots`` (native pass-through):
+    Field mapping into ``psk.spots``:
 
-        SYNC   → score        (Int16; jt9's per-decode confidence)
-        SNR    → snr_db       (Float32)
-        DT     → dt           (Float32)
-        FREQ   → frequency    (Int64, baseband offset Hz)
-        MSG    → message      (raw String)
-        MODE   → mode
+        SYNC                  → score        (Int16; jt9 sync confidence)
+        SNR                   → snr_db       (Float32; calibrated dB)
+        DT                    → dt           (Float32)
+        BAND_FREQ + OFFSET    → frequency    (Int64; absolute Hz)
+        MSG                   → message      (raw String)
+        MODE                  → mode
 
-    Returns ``None`` on any parse failure.  ``mode`` parameter is the
-    fallback when the trailing MODE token is somehow missing.
+    Returns ``None`` on any parse failure.
     """
     parts = line.strip().split()
-    # 9 = YYMMDD HHMMSS SYNC SNR DT FREQ MARKER MSG_ONE_TOKEN MODE — the
-    # minimum plausible row with a single-token message.
-    if len(parts) < 9:
+    # 10 = YYMMDD HHMMSS BAND SYNC SNR DT FREQ MARKER MSG_ONE_TOKEN MODE
+    # — minimum plausible row with a single-token message.
+    if len(parts) < 10:
         return None
 
     # Date + time → UTC datetime (slot HHMMSS has full second resolution).
@@ -173,16 +173,19 @@ def parse_jt9_line(line: str, *, mode: Optional[str] = None) -> Optional[dict]:
     except ValueError:
         return None
     try:
-        sync_score = int(parts[2])
-        snr_db = int(parts[3])
-        dt = float(parts[4])
+        band_freq_hz = int(parts[2])
+        sync_score = int(parts[3])
+        snr_db = int(parts[4])
+        dt = float(parts[5])
         # jt9 emits frequency offset with trailing ``.`` ("1397.").
-        freq_offset_hz = int(float(parts[5]))
+        freq_offset_hz = int(float(parts[6]))
     except (ValueError, IndexError):
         return None
 
-    # parts[6] is the MARKER ('0' / '?' / '~') — skip; not in schema.
-    # Last token is the MODE tag; everything from parts[7] up to (but
+    abs_freq_hz = band_freq_hz + freq_offset_hz
+
+    # parts[7] is the MARKER ('0' / '?' / '~') — skip; not in schema.
+    # Last token is the MODE tag; everything from parts[8] up to (but
     # not including) MODE is the message.
     last = parts[-1]
     if last.upper() in ("FT8", "FT4"):
@@ -194,7 +197,7 @@ def parse_jt9_line(line: str, *, mode: Optional[str] = None) -> Optional[dict]:
         detected_mode = ""
         message_end = len(parts)
 
-    message_tokens = parts[7:message_end]
+    message_tokens = parts[8:message_end]
     if not message_tokens:
         return None
     message = " ".join(message_tokens)
@@ -204,23 +207,15 @@ def parse_jt9_line(line: str, *, mode: Optional[str] = None) -> Optional[dict]:
         "time":               ts,
         "mode":               detected_mode or (mode or ""),
         "decoder_kind":       "jt9",
-        # jt9's SYNC field — sync confidence the decoder reports per
-        # packet.  Stored in the existing `score` Int16 column; for
-        # jt9 rows this is the canonical "decoder confidence" metric,
-        # for legacy decode_ft8 rows the same column holds ft8_lib's
-        # score.  Consumers can disambiguate via `decoder_kind`.
         "score":              sync_score,
         "snr_db":             snr_db,
-        # jt9 v27's decoded.txt does not surface a per-decode spectral
-        # width — column reserved for future use / other decoders.
         "spectral_width_hz":  None,
         "dt":                 dt,
-        # jt9's freq is a baseband offset in Hz; preserve it as-is in
-        # the canonical "frequency" column.  An operator analysing
-        # absolute RF needs to add the per-channel dial freq from the
-        # config, which lives in the radiod block, not in this line.
-        "frequency":          freq_offset_hz,
-        "frequency_mhz":      freq_offset_hz / 1_000_000.0,
+        # frequency is ABSOLUTE Hz (band + offset) — matches the
+        # original 001_create_spots.sql schema intent and is what
+        # PSK Reporter / wsprnet need.
+        "frequency":          abs_freq_hz,
+        "frequency_mhz":      abs_freq_hz / 1_000_000.0,
         "message":            message,
         "tx_call":            parsed.get("tx_call", ""),
         "rx_call":            parsed.get("rx_call", ""),

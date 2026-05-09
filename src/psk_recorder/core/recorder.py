@@ -269,33 +269,27 @@ class PskRecorder:
                 logger.exception("Failed to start MultiStream")
 
     def _start_uploaders(self) -> None:
-        pskreporter = self._paths.get(
-            "pskreporter", "/usr/local/bin/pskreporter-sender"
-        )
+        # ClickHouse-backed uploader: a single thread polls psk.spots
+        # for new rows and feeds them into the pskreporter UDP client.
+        # Replaces the legacy per-mode pskreporter-sender subprocesses
+        # (which couldn't parse our native-jt9 log format).
         callsign = self._station.get("callsign", "")
         grid = self._station.get("grid_square", "")
-
         if not callsign:
             logger.warning("No callsign configured — pskreporter will not start")
             return
-
-        log_dir = Path(self._paths.get("log_dir", "/var/log/psk-recorder"))
+        antenna = self._station.get("antenna", "")
         use_tcp = bool(self._paths.get("pskreporter_tcp", False))
 
-        for mode in ("ft8", "ft4"):
-            if not get_freqs(self._radiod, mode):
-                continue
-            log_path = log_dir / f"{self._radiod_id}-{mode}.log"
-            uploader = PskReporterUploader(
-                pskreporter_path=pskreporter,
-                log_path=log_path,
-                callsign=callsign,
-                grid_square=grid,
-                mode=mode,
-                use_tcp=use_tcp,
-            )
-            uploader.start()
-            self._uploaders.append(uploader)
+        uploader = PskReporterUploader(
+            callsign=callsign,
+            grid_square=grid,
+            antenna=antenna,
+            radiod_id=self._radiod_id,
+            use_tcp=use_tcp,
+        )
+        uploader.start()
+        self._uploaders.append(uploader)
 
     def _start_ch_tailers(self) -> None:
         """Start one ChTailer per (radiod, mode) — CONTRACT v0.6 §17.

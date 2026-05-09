@@ -320,6 +320,10 @@ class SlotWorker:
     def _materialise_jt9_output(self, tmpdir: Path, slot_start: float) -> None:
         """Read jt9's decoded.txt and append native jt9 lines to the per-mode log.
 
+        Output line shape (psk-recorder canonical, "native pass-through"):
+
+            YYMMDD HHMMSS BAND_FREQ_HZ <jt9 native columns...>
+
         jt9 v27 ``decoded.txt`` format (one line per decoded packet):
 
             HHMMSS  SYNC  SNR  DT  FREQ_OFFSET_HZ  MARKER  MESSAGE  MODE
@@ -342,10 +346,13 @@ class SlotWorker:
             MESSAGE        one or more whitespace-separated tokens.
             MODE           "FT8" or "FT4" — emitted by jt9 itself, preserved.
 
-        We prepend the slot's UTC ``YYMMDD`` so the line self-identifies
-        its date.  We do **not** append the mode token (jt9 already includes
-        it) and do **not** otherwise reformat — the fields flow native into
-        ``psk.spots`` via ``ch_tailer.parse_jt9_line``.
+        We prepend the slot's UTC ``YYMMDD HHMMSS BAND_FREQ_HZ`` so the
+        line self-identifies its date AND the band's tuned frequency
+        (downstream parsers compute absolute receive frequency as
+        ``BAND_FREQ_HZ + jt9_FREQ_OFFSET_HZ``).  We do **not** append the
+        mode token (jt9 already includes it) and do **not** otherwise
+        reformat — the fields flow native into ``psk.spots`` via
+        ``ch_tailer.parse_jt9_line``.
 
         Returns silently if decoded.txt is missing / unreadable / empty —
         that's the normal "no decodes this slot" case for a quiet band.
@@ -360,21 +367,21 @@ class SlotWorker:
 
         date_prefix = time.strftime("%y%m%d", time.gmtime(slot_start))
         slot_hhmmss = time.strftime("%H%M%S", time.gmtime(slot_start))
+        band_freq_hz = self._frequency_hz
         try:
             for line in text.splitlines():
                 if not line.strip():
                     continue
                 # jt9 emits "000000" as HHMMSS when invoked with -a on
-                # a single wav file (no realtime stream context).  Splice
-                # in the actual slot UTC HHMMSS so ChTailer can recover
-                # the receive time.  Preserve the rest of the line verbatim.
+                # a single wav file (no realtime stream context).  Drop
+                # whatever placeholder it has and substitute the slot's
+                # actual UTC HHMMSS.  Then prepend BAND_FREQ_HZ so the
+                # downstream parser can compute absolute receive freq.
                 tokens = line.split(None, 1)
-                if tokens and tokens[0] == "000000":
-                    rest = tokens[1] if len(tokens) > 1 else ""
-                    line_out = f"{slot_hhmmss} {rest}"
-                else:
-                    line_out = line
-                self._log_fd.write(f"{date_prefix} {line_out.rstrip()}\n")
+                rest = tokens[1] if len(tokens) > 1 else ""
+                self._log_fd.write(
+                    f"{date_prefix} {slot_hhmmss} {band_freq_hz} {rest.rstrip()}\n"
+                )
             self._log_fd.flush()
         except OSError as exc:
             logger.warning(
