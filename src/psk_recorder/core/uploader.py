@@ -218,6 +218,8 @@ class PskReporterUploader:
             return
 
         latest_time = self._last_seen_time
+        ft8_n = 0
+        ft4_n = 0
         for spot_time, freq_hz, mode, snr_db, tx_call, grid in rows:
             # clickhouse-connect returns tz-aware DateTimes for UTC
             # columns; our watermark is kept naive (matches the
@@ -241,6 +243,10 @@ class PskReporterUploader:
                     locator=grid or "",
                 )
                 self._uploaded_count += 1
+                if mode == "ft8":
+                    ft8_n += 1
+                elif mode == "ft4":
+                    ft4_n += 1
             except Exception as e:
                 logger.warning(
                     "psk-uploader-ch: spot() rejected row "
@@ -251,7 +257,11 @@ class PskReporterUploader:
             if spot_naive > latest_time:
                 latest_time = spot_naive
         self._last_seen_time = latest_time
-        logger.debug(
-            "psk-uploader-ch: queued %d spots (total queued %d, watermark %s)",
-            len(rows), self._uploaded_count, self._last_seen_time,
+        # INFO so `smd psk-watch` can pick this up without DEBUG noise.
+        # The pskreporter library's own "uploading N spots" message
+        # comes when the batch flushes (every PSKREPORTER_INTERVAL s);
+        # this line is the per-poll feed rate going INTO that batch.
+        logger.info(
+            "psk-uploader-ch: queued ft8=%d ft4=%d (total %d)",
+            ft8_n, ft4_n, self._uploaded_count,
         )
