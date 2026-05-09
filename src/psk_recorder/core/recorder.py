@@ -279,7 +279,9 @@ class PskRecorder:
             logger.warning("No callsign configured — pskreporter will not start")
             return
         antenna = self._station.get("antenna", "")
-        use_tcp = bool(self._paths.get("pskreporter_tcp", False))
+        # Default to TCP (delivery-confirmed, no silent drops under load).
+        # Operators on constrained links can opt out via config.
+        use_tcp = bool(self._paths.get("pskreporter_tcp", True))
 
         uploader = PskReporterUploader(
             callsign=callsign,

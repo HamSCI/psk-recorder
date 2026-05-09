@@ -54,8 +54,14 @@ class PskReporterUploader:
         grid_square: str,
         antenna: str = "",
         radiod_id: str = "",
-        use_tcp: bool = False,
+        use_tcp: bool = True,
     ):
+        # TCP is the default: PSK Reporter accepts both UDP (lossy, fits
+        # in a single datagram) and TCP (delivery-confirmed, larger
+        # packets up to 25 KiB).  TCP is the right choice on a
+        # high-volume FT8/FT4 receiver — UDP can drop spots silently
+        # under load and provides no feedback that the server got them.
+        # Operators on bandwidth-constrained links can pass use_tcp=False.
         self._callsign = callsign
         self._grid_square = grid_square
         self._antenna = antenna
