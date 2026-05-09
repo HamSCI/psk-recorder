@@ -14,7 +14,12 @@
 CREATE TABLE IF NOT EXISTS psk.spots
 (
     -- common header (CONTRACT v0.6 §17 design convention)
-    time               DateTime               CODEC(Delta(4), ZSTD(1)),
+    -- DateTime('UTC'): pin the column's timezone so stored Unix seconds
+    -- are always interpreted in UTC regardless of the ClickHouse
+    -- server's `timezone()` setting.  ChTailer writes tz-aware UTC
+    -- datetimes; this prevents server-side reinterpretation when the
+    -- server is configured for a local zone (e.g. America/Chicago).
+    time               DateTime('UTC')        CODEC(Delta(4), ZSTD(1)),
     mode               LowCardinality(String) CODEC(LZ4),       -- 'ft4' | 'ft8'
     host_call          LowCardinality(String) CODEC(LZ4),
     host_grid          LowCardinality(String) CODEC(LZ4),
@@ -35,7 +40,9 @@ CREATE TABLE IF NOT EXISTS psk.spots
     grid               LowCardinality(String) CODEC(LZ4),
     report             Nullable(Int16)        CODEC(T64, ZSTD(1)),
 
-    ingested_at        DateTime DEFAULT now() CODEC(Delta(4), ZSTD(1))
+    -- ingested_at: pinned UTC for the same reason; `now()` returns
+    -- a value in the server's tz, so the column type forces UTC.
+    ingested_at        DateTime('UTC') DEFAULT now() CODEC(Delta(4), ZSTD(1))
 )
 ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMM(time)

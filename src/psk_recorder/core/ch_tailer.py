@@ -26,7 +26,7 @@ import os
 import re
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -101,7 +101,12 @@ def parse_decode_ft8_line(line: str, *, mode: str) -> Optional[dict]:
     if len(parts) < 5:
         return None
     try:
-        ts = datetime.strptime(parts[0] + " " + parts[1], "%Y/%m/%d %H:%M:%S")
+        # decode_ft8 emits timestamps in UTC; tag the parsed datetime
+        # tz-aware so clickhouse-connect serializes correctly even when
+        # the ClickHouse server's tz is something other than UTC.
+        ts = datetime.strptime(
+            parts[0] + " " + parts[1], "%Y/%m/%d %H:%M:%S"
+        ).replace(tzinfo=timezone.utc)
         score = int(parts[2])
         dt = float(parts[3])
         freq = float(parts[4].replace(",", "").replace(" ", ""))
@@ -168,8 +173,12 @@ def parse_jt9_line(line: str, *, mode: Optional[str] = None) -> Optional[dict]:
         return None
 
     # Date + time → UTC datetime (slot HHMMSS has full second resolution).
+    # slot.py emits these in UTC; tag tz-aware so clickhouse-connect
+    # doesn't reinterpret in the server's timezone.
     try:
-        ts = datetime.strptime(parts[0] + parts[1], "%y%m%d%H%M%S")
+        ts = datetime.strptime(
+            parts[0] + parts[1], "%y%m%d%H%M%S"
+        ).replace(tzinfo=timezone.utc)
     except ValueError:
         return None
     try:
