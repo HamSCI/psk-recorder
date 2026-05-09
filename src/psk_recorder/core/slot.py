@@ -318,23 +318,37 @@ class SlotWorker:
         self._pending_procs.clear()
 
     def _materialise_jt9_output(self, tmpdir: Path, slot_start: float) -> None:
-        """Read jt9's decoded.txt and append WSJT-X-canonical lines to the
-        per-mode log file.
+        """Read jt9's decoded.txt and append native jt9 lines to the per-mode log.
 
-        jt9's per-line format (after ``-a tmpdir`` invocation) is:
+        jt9 v27 ``decoded.txt`` format (one line per decoded packet):
 
-            HHMM  SNR  DT  FREQ_HZ  `  MESSAGE  [SPECTRAL_WIDTH]
+            HHMMSS  SYNC  SNR  DT  FREQ_OFFSET_HZ  MARKER  MESSAGE  MODE
 
-        We prefix each line with ``YYMMDD `` derived from the slot's
-        UTC start time so the canonical log lines self-identify their
-        date — matching the WSJT-X ALL.TXT convention:
+        Where:
 
-            YYMMDD_HHMM  SNR  DT  FREQ_HZ  MODE  `  MESSAGE  [WIDTH]
+            HHMMSS         time tag — *placeholder ``000000``* when jt9 is
+                           invoked with ``-a tmpdir`` on a single wav file
+                           (no realtime context).  We replace it with the
+                           slot's actual UTC HHMMSS so ChTailer can recover
+                           the real receive time.
+            SYNC           sync confidence (0..~100, integer) — captured as
+                           psk.spots.score.
+            SNR            calibrated dB SNR (signed integer) — psk.spots.snr_db.
+            DT             time-offset within slot (signed float, seconds).
+            FREQ_OFFSET_HZ baseband frequency offset (float with trailing ``.``).
+            MARKER         a single token ('0', '?', '~') flagging packet
+                           quality / hash-resolution status.  Not currently
+                           stored — present so the column count is stable.
+            MESSAGE        one or more whitespace-separated tokens.
+            MODE           "FT8" or "FT4" — emitted by jt9 itself, preserved.
 
-        Returns silently if decoded.txt is missing / unreadable / empty
-        — that's the normal "no decodes this slot" case for a quiet
-        band.  ``ch_tailer.parse_jt9_line`` is the canonical reader of
-        these lines.
+        We prepend the slot's UTC ``YYMMDD`` so the line self-identifies
+        its date.  We do **not** append the mode token (jt9 already includes
+        it) and do **not** otherwise reformat — the fields flow native into
+        ``psk.spots`` via ``ch_tailer.parse_jt9_line``.
+
+        Returns silently if decoded.txt is missing / unreadable / empty —
+        that's the normal "no decodes this slot" case for a quiet band.
         """
         decoded = tmpdir / "decoded.txt"
         try:
@@ -345,17 +359,22 @@ class SlotWorker:
             return
 
         date_prefix = time.strftime("%y%m%d", time.gmtime(slot_start))
-        mode_token = self._mode.upper()
+        slot_hhmmss = time.strftime("%H%M%S", time.gmtime(slot_start))
         try:
             for line in text.splitlines():
                 if not line.strip():
                     continue
-                # Insert the date and the mode token so ChTailer can
-                # auto-detect format and tag the row's mode without
-                # re-deriving it from the WAV path.
-                self._log_fd.write(
-                    f"{date_prefix} {line.rstrip()} {mode_token}\n"
-                )
+                # jt9 emits "000000" as HHMMSS when invoked with -a on
+                # a single wav file (no realtime stream context).  Splice
+                # in the actual slot UTC HHMMSS so ChTailer can recover
+                # the receive time.  Preserve the rest of the line verbatim.
+                tokens = line.split(None, 1)
+                if tokens and tokens[0] == "000000":
+                    rest = tokens[1] if len(tokens) > 1 else ""
+                    line_out = f"{slot_hhmmss} {rest}"
+                else:
+                    line_out = line
+                self._log_fd.write(f"{date_prefix} {line_out.rstrip()}\n")
             self._log_fd.flush()
         except OSError as exc:
             logger.warning(

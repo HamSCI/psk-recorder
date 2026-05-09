@@ -56,7 +56,9 @@ _REPORT_RE = re.compile(r"^R?([+-]?\d+)$")
 
 # Format-detection regexes for the dual-decoder router.
 _DECODE_FT8_PREFIX = re.compile(r"^\d{4}/\d{2}/\d{2}\s")     # YYYY/MM/DD …
-_JT9_PREFIX        = re.compile(r"^\d{6}\s\d{4}\s")          # YYMMDD HHMM …
+# YYMMDD HHMMSS … — slot.py emits jt9's native HHMMSS time tag (6 digits)
+# rather than the 4-digit HHMM that an older psk-recorder format used.
+_JT9_PREFIX        = re.compile(r"^\d{6}\s\d{6}\s")          # YYMMDD HHMMSS …
 
 
 def parse_decoder_line(line: str, *, mode: Optional[str] = None) -> Optional[dict]:
@@ -126,80 +128,73 @@ def parse_decode_ft8_line(line: str, *, mode: str) -> Optional[dict]:
 
 
 def parse_jt9_line(line: str, *, mode: Optional[str] = None) -> Optional[dict]:
-    """Parse one WSJT-X-canonical jt9 line into a psk.spots row.
+    """Parse one native jt9 line into a psk.spots row.
 
-    Format emitted by ``slot.SlotWorker._materialise_jt9_output`` —
-    jt9's per-line ``decoded.txt`` output prefixed with the slot's UTC
-    date and suffixed with the mode token::
+    Format emitted by ``slot.SlotWorker._materialise_jt9_output`` — jt9 v27
+    ``decoded.txt`` output with the slot's UTC date prepended and the
+    placeholder ``HHMMSS`` replaced by the slot's actual receive time::
 
-        YYMMDD HHMM SNR DT FREQ_HZ ` MESSAGE [SPECTRAL_WIDTH_HZ] MODE
+        YYMMDD HHMMSS SYNC SNR DT FREQ_OFFSET_HZ MARKER MESSAGE... MODE
 
     Where::
 
         YYMMDD              decimal date (UTC, 6 digits)
-        HHMM                slot start time (4 digits, UTC)
+        HHMMSS              slot start time (UTC, 6 digits)
+        SYNC                sync confidence (0..~100; jt9-internal score)
         SNR                 calibrated dB SNR (signed integer)
         DT                  time-offset within slot (signed float, seconds)
-        FREQ_HZ             baseband frequency offset (integer Hz)
-        `                   literal backtick separator
+        FREQ_OFFSET_HZ      baseband frequency offset (float, trailing ``.``)
+        MARKER              packet-quality / hash-resolution flag
+                            ('0', '?', '~') — not stored
         MESSAGE             one or more whitespace-separated tokens
-        SPECTRAL_WIDTH_HZ   optional decimal float (50 %-energy width)
-        MODE                "FT8" or "FT4" (uppercase, suffix added by slot.py)
+        MODE                "FT8" or "FT4" — emitted by jt9 itself
 
-    Returns ``None`` on any parse failure.  ``mode`` parameter is
-    accepted for API symmetry but the line carries the authoritative
-    mode in its own MODE token; the parameter is used only as a
-    fallback if the suffix is somehow missing.
+    Field mapping into ``psk.spots`` (native pass-through):
+
+        SYNC   → score        (Int16; jt9's per-decode confidence)
+        SNR    → snr_db       (Float32)
+        DT     → dt           (Float32)
+        FREQ   → frequency    (Int64, baseband offset Hz)
+        MSG    → message      (raw String)
+        MODE   → mode
+
+    Returns ``None`` on any parse failure.  ``mode`` parameter is the
+    fallback when the trailing MODE token is somehow missing.
     """
     parts = line.strip().split()
-    # 7 = YYMMDD HHMM SNR DT FREQ ` MSG_ONE_TOKEN MODE — minimum
-    # plausible.  We accept the mode-suffix path; bare jt9 output (no
-    # suffix) lands in the older legacy branch below.
-    if len(parts) < 7:
-        return None
-    if parts[5] != "`":
+    # 9 = YYMMDD HHMMSS SYNC SNR DT FREQ MARKER MSG_ONE_TOKEN MODE — the
+    # minimum plausible row with a single-token message.
+    if len(parts) < 9:
         return None
 
-    # Date + time → UTC datetime (HHMM has no seconds, so :00 implied).
+    # Date + time → UTC datetime (slot HHMMSS has full second resolution).
     try:
-        ts = datetime.strptime(parts[0] + parts[1], "%y%m%d%H%M")
+        ts = datetime.strptime(parts[0] + parts[1], "%y%m%d%H%M%S")
     except ValueError:
         return None
     try:
-        snr_db = int(parts[2])
-        dt = float(parts[3])
-        freq_offset_hz = int(parts[4])
+        sync_score = int(parts[2])
+        snr_db = int(parts[3])
+        dt = float(parts[4])
+        # jt9 emits frequency offset with trailing ``.`` ("1397.").
+        freq_offset_hz = int(float(parts[5]))
     except (ValueError, IndexError):
         return None
 
-    # Last token: mode tag (slot.py suffix).  Penultimate: spectral_width
-    # if it parses as a float.  Everything from idx 6 to whatever is
-    # left becomes the message.
+    # parts[6] is the MARKER ('0' / '?' / '~') — skip; not in schema.
+    # Last token is the MODE tag; everything from parts[7] up to (but
+    # not including) MODE is the message.
     last = parts[-1]
-    detected_mode = ""
     if last.upper() in ("FT8", "FT4"):
         detected_mode = last.lower()
         message_end = len(parts) - 1
     else:
+        # Mode token missing — use caller's hint if any; treat full tail
+        # as message text.
+        detected_mode = ""
         message_end = len(parts)
 
-    spectral_width: Optional[float] = None
-    if message_end > 6:
-        # Try parsing the new "last" (post-mode-strip) as spectral width.
-        # Constrain to plausible widths: small positive value in Hz (typical
-        # FT8 chirp width is ~0.005-0.05 Hz; cap at 10 Hz as a generous
-        # upper bound).  Negative numbers are signal reports (e.g. "-15"),
-        # not widths — they belong in the message.
-        candidate = parts[message_end - 1]
-        try:
-            cval = float(candidate)
-            if 0 < cval < 10.0:
-                spectral_width = cval
-                message_end -= 1
-        except ValueError:
-            pass
-
-    message_tokens = parts[6:message_end]
+    message_tokens = parts[7:message_end]
     if not message_tokens:
         return None
     message = " ".join(message_tokens)
@@ -209,13 +204,16 @@ def parse_jt9_line(line: str, *, mode: Optional[str] = None) -> Optional[dict]:
         "time":               ts,
         "mode":               detected_mode or (mode or ""),
         "decoder_kind":       "jt9",
-        # `score` (Int16, not nullable in schema) is decode_ft8's
-        # internal metric; jt9 doesn't emit one.  Use 0 as the
-        # "absent" sentinel — consumers should prefer `snr_db` when
-        # `decoder_kind = 'jt9'`.
-        "score":              0,
+        # jt9's SYNC field — sync confidence the decoder reports per
+        # packet.  Stored in the existing `score` Int16 column; for
+        # jt9 rows this is the canonical "decoder confidence" metric,
+        # for legacy decode_ft8 rows the same column holds ft8_lib's
+        # score.  Consumers can disambiguate via `decoder_kind`.
+        "score":              sync_score,
         "snr_db":             snr_db,
-        "spectral_width_hz":  spectral_width,
+        # jt9 v27's decoded.txt does not surface a per-decode spectral
+        # width — column reserved for future use / other decoders.
+        "spectral_width_hz":  None,
         "dt":                 dt,
         # jt9's freq is a baseband offset in Hz; preserve it as-is in
         # the canonical "frequency" column.  An operator analysing
