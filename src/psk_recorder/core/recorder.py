@@ -172,7 +172,11 @@ class PskRecorder:
             log_path = log_dir / f"{self._radiod_id}-{mode}.log"
             if mode not in self._log_fds:
                 log_path.parent.mkdir(parents=True, exist_ok=True)
-                self._log_fds[mode] = open(log_path, "ab")
+                # Text mode (not binary) — _materialise_jt9_output and other
+                # writers feed Python str through this fd.  Opening in "ab"
+                # raised TypeError("a bytes-like object is required, not
+                # 'str'") and silently dropped every decode on the floor.
+                self._log_fds[mode] = open(log_path, "a", encoding="utf-8")
 
             for freq_hz in freqs:
                 logger.info(
