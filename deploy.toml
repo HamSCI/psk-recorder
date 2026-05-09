@@ -74,9 +74,12 @@ schema_dir       = "clickhouse/schema/psk"
 # schema_version   = 1   — initial create_database + create_spots
 # schema_version   = 2     # 002_add_jt9_columns.sql adds snr_db,
 #                          # spectral_width_hz, decoder_kind
-schema_version   = 3     # 003_pin_utc.sql pins time + ingested_at to
-                         # DateTime('UTC') so naive writes can't
-                         # silently land in the server's local tz
+# schema_version   = 3   — 003_pin_utc.sql pins time + ingested_at
+#                         to DateTime('UTC') so naive writes can't
+#                         silently land in the server's local tz
+schema_version   = 4     # 004_no_dedup.sql swaps the table engine
+                         # from ReplacingMergeTree to plain MergeTree
+                         # so every raw decode event is preserved
 required_min_ch  = "23.8"
 
 [deps]

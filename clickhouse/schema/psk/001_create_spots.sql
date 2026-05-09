@@ -6,10 +6,10 @@
 -- report parsing is best-effort (the message is freeform; we keep
 -- the raw text and surface common forms when we can recognize them).
 --
--- ORDER BY tuple is the natural query / dedup key:
--- "spots received by this station, this mode, this band, around this
--- time, with this message" — the message disambiguates spots that
--- collide on (host, mode, freq, time).
+-- ORDER BY tuple is the natural query key (NOT a dedup key — engine
+-- is plain MergeTree to preserve every raw decode event).  The tuple
+-- still optimizes "spots received by this station, this mode, this
+-- band, around this time" which is the dominant query shape.
 
 CREATE TABLE IF NOT EXISTS psk.spots
 (
@@ -44,7 +44,14 @@ CREATE TABLE IF NOT EXISTS psk.spots
     -- a value in the server's tz, so the column type forces UTC.
     ingested_at        DateTime('UTC') DEFAULT now() CODEC(Delta(4), ZSTD(1))
 )
-ENGINE = ReplacingMergeTree()
+-- Plain MergeTree: NEVER collapse rows.  Operators want every raw
+-- decode event preserved exactly as ChTailer received it — including
+-- duplicates from log re-reads, restarts, or any other re-ingest path
+-- — so downstream analysis (decode-rate forensics, stream-quality
+-- audits, replay) sees the unfiltered event stream.  PSK Reporter's
+-- own `(callsign, freq±10kHz, time±1200s)` upload-time dedup happens
+-- in the pskreporter library AFTER psk.spots and is unaffected.
+ENGINE = MergeTree()
 PARTITION BY toYYYYMM(time)
 ORDER BY (host_call, mode, frequency, time, message)
 SETTINGS index_granularity = 32768;
