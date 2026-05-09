@@ -142,7 +142,11 @@ class PskReporterUploader:
             )
             return
 
-        self._last_seen_time = datetime.now(timezone.utc).replace(tzinfo=None)
+        # Keep the watermark tz-aware UTC.  clickhouse-connect serializes
+        # naive datetimes using the SERVER's configured timezone (which
+        # may be America/Chicago on this host), causing the WHERE-clause
+        # comparison to land 5 h in the future and return zero rows.
+        self._last_seen_time = datetime.now(timezone.utc)
         self._stop.clear()
         self._thread = threading.Thread(
             target=self._run, daemon=True, name="psk-uploader-ch",
@@ -221,17 +225,16 @@ class PskReporterUploader:
         ft8_n = 0
         ft4_n = 0
         for spot_time, freq_hz, mode, snr_db, tx_call, grid in rows:
-            # clickhouse-connect returns tz-aware DateTimes for UTC
-            # columns; our watermark is kept naive (matches the
-            # parameter form clickhouse-connect's query() expects in
-            # WHERE).  Normalize both sides to naive UTC before any
-            # comparison or epoch conversion.
-            if spot_time.tzinfo is not None:
-                spot_aware = spot_time.astimezone(timezone.utc)
-                spot_naive = spot_aware.replace(tzinfo=None)
-            else:
+            # Normalize spot_time to tz-aware UTC.  clickhouse-connect
+            # may return naive datetimes (server-tz-relative) or
+            # tz-aware ones depending on column metadata; standardize.
+            if spot_time.tzinfo is None:
+                # Naive datetimes from clickhouse-connect represent the
+                # value in the *server's* timezone.  Reinterpret as
+                # UTC so we don't shift by the server-local offset.
                 spot_aware = spot_time.replace(tzinfo=timezone.utc)
-                spot_naive = spot_time
+            else:
+                spot_aware = spot_time.astimezone(timezone.utc)
             try:
                 self._reporter.spot(
                     callsign=tx_call,
@@ -254,8 +257,8 @@ class PskReporterUploader:
                     tx_call, freq_hz, mode, e,
                 )
                 continue
-            if spot_naive > latest_time:
-                latest_time = spot_naive
+            if spot_aware > latest_time:
+                latest_time = spot_aware
         self._last_seen_time = latest_time
         # INFO so `smd psk-watch` can pick this up without DEBUG noise.
         # The pskreporter library's own "uploading N spots" message
