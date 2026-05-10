@@ -216,6 +216,16 @@ class HsPskReporterUploader:
                         ("tx_call", "!=", ""),
                         ("mode", "IN", ["ft8", "ft4"]),
                     ],
+                    # First-pump-after-fresh-watermark anchor: start at
+                    # wallclock-now, not epoch.  Without this, an empty
+                    # watermark.db (first deploy, lost state, switched
+                    # uploaders) re-ships every historical row in
+                    # psk.spots, which the legacy uploader has likely
+                    # already shipped — PSKReporter shows duplicates.
+                    # Once a watermark exists, restarts resume from it
+                    # and start_at is ignored (per ClickHouseSource's
+                    # contract).
+                    start_at="now",
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
