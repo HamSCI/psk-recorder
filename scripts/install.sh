@@ -188,12 +188,20 @@ for unit in ft8-record.service ft4-record.service; do
         systemctl disable --now "$unit"
     fi
 done
-for pattern in 'ft8-decode@*.service' 'ft4-decode@*.service' \
+# Both the singleton form (ft8-decode.service, written by ka9q-radio's
+# package install) and the instance form (ft8-decode@*.service, used in
+# some multi-band deployments) need to be disabled — the legacy decoders
+# write /var/log/ft{8,4}.log which the legacy `pskreporter@ft8/ft4` path
+# tails and uploads, duplicating every spot psk-recorder already ships
+# from psk.spots.  Match list-unit-files (catches inactive-but-enabled
+# units) as well as list-units (running ones).
+for pattern in 'ft8-decode.service' 'ft4-decode.service' \
+               'ft8-decode@*.service' 'ft4-decode@*.service' \
                'pskreporter@ft8.service' 'pskreporter@ft4.service'; do
-    for unit in $(systemctl list-units --plain --no-legend "$pattern" 2>/dev/null | awk '{print $1}'); do
-        if [[ -n "$unit" ]]; then
-            ui_warn "Disabling native ka9q-radio unit: $unit (psk-recorder replaces it)"
-            systemctl disable --now "$unit"
+    for unit in $(systemctl list-unit-files --no-legend "$pattern" 2>/dev/null | awk '{print $1}'); do
+        if [[ -n "$unit" ]] && systemctl is-enabled "$unit" >/dev/null 2>&1; then
+            ui_warn "Disabling legacy unit: $unit (psk-recorder replaces it)"
+            systemctl disable --now "$unit" || true
         fi
     done
 done
