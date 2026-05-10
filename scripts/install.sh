@@ -92,22 +92,28 @@ ui_info "Installing psk-recorder (editable) into venv"
 "$VENV_DIR/bin/pip" install --upgrade pip setuptools wheel >/dev/null
 "$VENV_DIR/bin/pip" install -e "$REPO_SOURCE" >/dev/null
 
-# Overlay our vendored pskreporter.py onto the version pip-installed
-# from the upstream `pjsg/ftlib-pskreporter` package.  Adds two
-# env-var knobs we need (PSKREPORTER_INTERVAL + PSKREPORTER_NO_DEDUP)
-# which upstream hasn't merged yet.  See vendor/pskreporter.py for
-# the full diff vs upstream.  Idempotent: each install overwrites
-# the venv's copy with our patched version.
+# Install our vendored pskreporter.py directly into the venv's
+# site-packages.  We don't depend on the upstream `pjsg/ftlib-
+# pskreporter` package because (1) the vendored copy is stdlib-only
+# (no docopt/etc. needed — we only use the library, not the
+# pskreporter-sender CLI), and (2) we carry two env-var knobs
+# (PSKREPORTER_INTERVAL + PSKREPORTER_NO_DEDUP) that upstream hasn't
+# merged.  See vendor/pskreporter.py for the full diff vs upstream.
+# Idempotent.
 VENDOR_PSKREPORTER="$REPO_SOURCE/vendor/pskreporter.py"
-if [[ -f "$VENDOR_PSKREPORTER" ]]; then
-    PYVER=$("$VENV_DIR/bin/python3" -c 'import sys; print(f"python{sys.version_info.major}.{sys.version_info.minor}")')
-    INSTALLED_PSKREPORTER="$VENV_DIR/lib/$PYVER/site-packages/pskreporter.py"
-    if [[ -f "$INSTALLED_PSKREPORTER" ]]; then
-        cp "$VENDOR_PSKREPORTER" "$INSTALLED_PSKREPORTER"
-        ui_info "Overlaid sigmond patches onto $INSTALLED_PSKREPORTER"
-    else
-        ui_warn "$INSTALLED_PSKREPORTER not present — pskreporter package not installed?"
-    fi
+if [[ ! -f "$VENDOR_PSKREPORTER" ]]; then
+    ui_error "$VENDOR_PSKREPORTER missing — repo is incomplete"
+    exit 1
+fi
+PYVER=$("$VENV_DIR/bin/python3" -c 'import sys; print(f"python{sys.version_info.major}.{sys.version_info.minor}")')
+SITE_PKGS="$VENV_DIR/lib/$PYVER/site-packages"
+install -m 644 "$VENDOR_PSKREPORTER" "$SITE_PKGS/pskreporter.py"
+ui_info "Installed vendored pskreporter -> $SITE_PKGS/pskreporter.py"
+
+# Verify the daemon can import it as the service user.
+if ! sudo -u "$SERVICE_USER" "$VENV_DIR/bin/python3" -c 'import pskreporter' 2>/dev/null; then
+    ui_error "Post-install: $SERVICE_USER cannot import pskreporter"
+    exit 1
 fi
 
 # Post-install verify
