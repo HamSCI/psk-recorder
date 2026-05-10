@@ -152,9 +152,18 @@ class PskRecorder:
             )
         decoder_depth = int(self._paths.get("decoder_depth", 3))
         keep_wav = self._paths.get("keep_wav", False)
+        # Phase 5c.3: tee per-slot decoder output into <wav>.spots.txt
+        # files when the hs-uploader is on AND we have no ClickHouse.
+        # That's the file-fallback mode the shim's FileTreeSource picks
+        # up.  Skipping the write when CH is reachable (or when the
+        # legacy uploader is in use) keeps the spool dir clean.
+        spool_spots = bool(
+            os.environ.get("PSK_USE_HS_UPLOADER")
+            and not os.environ.get("SIGMOND_CLICKHOUSE_URL")
+        )
         logger.info(
-            "decoder_kind=%s path=%s depth=%d",
-            decoder_kind, decoder, decoder_depth,
+            "decoder_kind=%s path=%s depth=%d spool_spots=%s",
+            decoder_kind, decoder, decoder_depth, spool_spots,
         )
 
         multi_by_group: dict[tuple, object] = {}
@@ -196,6 +205,7 @@ class PskRecorder:
                     decoder_kind=decoder_kind,
                     decoder_depth=decoder_depth,
                     keep_wav=keep_wav,
+                    spool_spots=spool_spots,
                 )
                 self._add_sink_to_multi(sink, multi_by_group)
                 self._sinks.append(sink)
@@ -280,7 +290,8 @@ class PskRecorder:
         # library subprocess-style) and the hs-uploader-driven
         # `HsPskReporterUploader` (Pipeline + PskReporterTcp transport).
         # `PSK_USE_HS_UPLOADER=1` opts into the new path; default is
-        # legacy until Phase 5c.3 (file fallback) lands.
+        # legacy.  The hs path picks ClickHouseSource when CH is set,
+        # FileTreeSource over the per-slot spool otherwise (5c.3).
         callsign = self._station.get("callsign", "")
         grid = self._station.get("grid_square", "")
         if not callsign:
@@ -292,17 +303,29 @@ class PskRecorder:
         use_tcp = bool(self._paths.get("pskreporter_tcp", True))
 
         use_hs = bool(os.environ.get("PSK_USE_HS_UPLOADER"))
-        uploader_cls = HsPskReporterUploader if use_hs else PskReporterUploader
+        if use_hs:
+            spool_dir = Path(self._paths.get(
+                "spool_dir", "/var/lib/psk-recorder",
+            )) / self._radiod_id
+            uploader = HsPskReporterUploader(
+                callsign=callsign,
+                grid_square=grid,
+                antenna=antenna,
+                radiod_id=self._radiod_id,
+                use_tcp=use_tcp,
+                spool_dir=spool_dir,
+            )
+        else:
+            uploader = PskReporterUploader(
+                callsign=callsign,
+                grid_square=grid,
+                antenna=antenna,
+                radiod_id=self._radiod_id,
+                use_tcp=use_tcp,
+            )
         logger.info(
             "uploader: %s (PSK_USE_HS_UPLOADER=%s)",
-            uploader_cls.__name__, "1" if use_hs else "0",
-        )
-        uploader = uploader_cls(
-            callsign=callsign,
-            grid_square=grid,
-            antenna=antenna,
-            radiod_id=self._radiod_id,
-            use_tcp=use_tcp,
+            type(uploader).__name__, "1" if use_hs else "0",
         )
         uploader.start()
         self._uploaders.append(uploader)

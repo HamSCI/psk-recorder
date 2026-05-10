@@ -64,6 +64,7 @@ class SlotWorker:
         keep_wav: bool = False,
         decoder_kind: str = DECODER_FT8_LIB,
         decoder_depth: int = 3,
+        spool_spots: bool = False,
     ):
         if decoder_kind not in VALID_DECODER_KINDS:
             raise ValueError(
@@ -80,6 +81,7 @@ class SlotWorker:
         self._decoder_kind = decoder_kind
         self._decoder_depth = decoder_depth
         self._keep_wav = keep_wav
+        self._spool_spots = spool_spots
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._next_slot_start: Optional[float] = None
@@ -196,11 +198,17 @@ class SlotWorker:
             self._fork_decoder_ft8_lib(wav_path, slot_start)
 
     def _fork_decoder_ft8_lib(self, wav_path: Path, slot_start: float) -> None:
-        """ka9q/ft8_lib decode_ft8 — streams output directly to log_fd.
+        """ka9q/ft8_lib decode_ft8 — captures stdout for tee on reap.
 
         CLI: ``decode_ft8 -f <freq_mhz> [-4 for FT4] <wav_path>``.
         Output format (per ft8_lib decode_ft8.c:363):
             YYYY/MM/DD HH:MM:SS  SCORE  DT  FREQ_HZ  ~  MESSAGE
+
+        decode_ft8 emits its output as a single burst at decode end
+        (~3KB for a busy slot), well below PIPE_BUF — capturing via
+        PIPE doesn't block.  Reap reads stdout, writes to the per-mode
+        log, and (when ``spool_spots``) tees a per-slot ``.spots.txt``
+        file alongside the wav for the hs-uploader file fallback path.
         """
         freq_mhz = self._frequency_hz / 1e6
         cmd = [self._decoder_path, "-f", f"{freq_mhz:.6f}"]
@@ -211,7 +219,7 @@ class SlotWorker:
         try:
             proc = subprocess.Popen(
                 cmd,
-                stdout=self._log_fd,
+                stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
             self._pending_procs.append((proc, wav_path, None, slot_start))
@@ -286,6 +294,8 @@ class SlotWorker:
                 self.decodes_ok += 1
                 if self._decoder_kind == DECODER_JT9 and tmpdir is not None:
                     self._materialise_jt9_output(tmpdir, slot_start)
+                elif self._decoder_kind == DECODER_FT8_LIB:
+                    self._materialise_decode_ft8_output(proc, wav_path)
             else:
                 self.decodes_fail += 1
                 stderr = proc.stderr.read().decode(errors="replace").strip()[:200]
@@ -305,10 +315,12 @@ class SlotWorker:
             if wait:
                 try:
                     proc.wait(timeout=5.0)
-                    if (proc.returncode == 0
-                            and self._decoder_kind == DECODER_JT9
-                            and tmpdir is not None):
-                        self._materialise_jt9_output(tmpdir, slot_start)
+                    if proc.returncode == 0:
+                        if (self._decoder_kind == DECODER_JT9
+                                and tmpdir is not None):
+                            self._materialise_jt9_output(tmpdir, slot_start)
+                        elif self._decoder_kind == DECODER_FT8_LIB:
+                            self._materialise_decode_ft8_output(proc, wav_path)
                 except subprocess.TimeoutExpired:
                     proc.kill()
             if tmpdir is not None:
@@ -388,3 +400,54 @@ class SlotWorker:
                 "%s: failed appending jt9 output to log: %s",
                 self._mode.upper(), exc,
             )
+
+    def _materialise_decode_ft8_output(
+        self, proc: subprocess.Popen, wav_path: Path,
+    ) -> None:
+        """Read decode_ft8's captured stdout, write to log + per-slot spool.
+
+        decode_ft8 writes WSJT-X-style lines (``YYYY/MM/DD HH:MM:SS …``)
+        to stdout.  We capture via PIPE (see ``_fork_decoder_ft8_lib``)
+        so we can fan out to both the per-mode log file (the legacy
+        path ChTailer reads) and a per-slot ``.spots.txt`` file used by
+        the hs-uploader file-fallback FileTreeSource.
+        """
+        try:
+            data = proc.stdout.read() if proc.stdout is not None else b""
+        except (OSError, ValueError):
+            return
+        if not data:
+            return
+        try:
+            text = data.decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            return
+
+        lines = [ln + "\n" for ln in text.splitlines() if ln.strip()]
+        if not lines:
+            return
+
+        try:
+            for ln in lines:
+                self._log_fd.write(ln)
+            self._log_fd.flush()
+        except OSError as exc:
+            logger.warning(
+                "%s: failed appending decode_ft8 output to log: %s",
+                self._mode.upper(), exc,
+            )
+
+        if self._spool_spots:
+            # decode_ft8 lines carry the slot's wallclock; the per-slot
+            # file mirrors the wav_path so a FileTreeSource glob picks
+            # them up alongside.
+            spots_path = wav_path.with_suffix(".spots.txt")
+            try:
+                spots_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(spots_path, "w", encoding="utf-8") as f:
+                    f.writelines(lines)
+            except OSError as exc:
+                logger.warning(
+                    "%s: failed writing per-slot spots file %s: %s",
+                    self._mode.upper(), spots_path, exc,
+                )

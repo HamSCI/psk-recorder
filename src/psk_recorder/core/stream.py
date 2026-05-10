@@ -70,6 +70,7 @@ class ChannelSink:
         authority_reader: Optional[AuthorityReader] = None,
         decoder_kind: str = "jt9",
         decoder_depth: int = 3,
+        spool_spots: bool = False,
     ):
         self._mode = mode
         self._frequency_hz = frequency_hz
@@ -95,6 +96,7 @@ class ChannelSink:
             decoder_kind=decoder_kind,
             decoder_depth=decoder_depth,
             keep_wav=keep_wav,
+            spool_spots=spool_spots,
         )
 
         self._total_delivered: int = 0

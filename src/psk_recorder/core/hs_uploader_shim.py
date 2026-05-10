@@ -7,18 +7,26 @@ transport (which owns the TCP socket end-to-end — no third-party
 library involvement).
 
 Behind the ``PSK_USE_HS_UPLOADER`` env var feature flag for now;
-becomes the default once Phase 5c.3 (file-tree fallback) lands and
-the legacy path can be retired.
+becomes the default once the legacy path can be retired.
 
 The lifecycle interface (``start`` / ``stop`` / ``is_active``) matches
 the legacy class so ``recorder.PskRecorder._start_uploaders`` can pick
 between the two without conditional plumbing downstream of construction.
 
-Differences from the legacy path:
+Source selection (Phase 5c.3):
 
-* CH query uses ``cursor_column="ingested_at"`` (commit 93f4d5b's
+* ``SIGMOND_CLICKHOUSE_URL`` set → ``ClickHouseSource`` (the 5c.2 path).
+  CH query uses ``cursor_column="ingested_at"`` (commit 93f4d5b's
   fix carried over) and ``extra_where`` filters scope to this
   daemon's ``radiod_id`` so multi-instance is safe by construction.
+* CH unset (or ``ClickHouseSource`` construction fails) → fall back
+  to ``FileTreeSource`` reading per-slot ``.spots.txt`` files the
+  ``SlotWorker`` writes when ``PSK_USE_HS_UPLOADER=1`` and CH is
+  absent.  Files are deleted on PSKReporter ack (delete_on_ack
+  retention).
+
+Other notes:
+
 * ``PskReporterTcp`` owns the socket — no ``pskreporter`` Python
   library dependency, no PSKREPORTER_INTERVAL/NO_DEDUP env-var
   knobs.  Cadence is the pump interval here.
@@ -29,7 +37,9 @@ Differences from the legacy path:
 from __future__ import annotations
 
 import logging
+import os
 import threading
+from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -52,12 +62,18 @@ class HsPskReporterUploader:
         antenna: str = "",
         radiod_id: str = "",
         use_tcp: bool = True,
+        spool_dir: Optional[Path] = None,
     ) -> None:
         self._callsign = callsign
         self._grid_square = grid_square
         self._antenna = antenna
         self._radiod_id = radiod_id
         self._use_tcp = use_tcp
+        # spool_dir is the per-radiod spool root (`<spool>/<radiod_id>`)
+        # — the directory containing ft8/ and ft4/ subdirs that the slot
+        # writes per-slot ``.spots.txt`` files into when CH is absent.
+        # When None, file fallback isn't available.
+        self._spool_dir = Path(spool_dir) if spool_dir is not None else None
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._uploader = None
@@ -84,7 +100,6 @@ class HsPskReporterUploader:
 
         try:
             from hs_uploader import Pipeline, RetryPolicy, StationIdentity, Uploader
-            from hs_uploader.sources.clickhouse import ClickHouseSource
             from hs_uploader.transports.pskreporter import PskReporterTcp
             from hs_uploader.watermark.sqlite import (
                 SqliteWatermarkStore, default_path,
@@ -93,32 +108,8 @@ class HsPskReporterUploader:
             logger.warning("psk-uploader-hs disabled: %s", exc)
             return
 
-        try:
-            src = ClickHouseSource.from_env(
-                database="psk", table="spots",
-                accepted_schema_versions=[2],
-                primary_key_columns=[
-                    # psk.spots ORDER BY tuple — tiebreak hash takes
-                    # this set so two rows with identical (host_call,
-                    # mode, frequency, time, message) will tie on
-                    # cityHash64 and ship in a stable order.
-                    "host_call", "mode", "frequency", "time", "message",
-                ],
-                select_columns=[
-                    "time", "frequency", "mode", "snr_db", "tx_call",
-                    "grid", "score", "message",
-                ],
-                cursor_column="ingested_at",
-                extra_where=[
-                    ("radiod_id", "=", self._radiod_id),
-                    ("tx_call", "!=", ""),
-                    ("mode", "IN", ["ft8", "ft4"]),
-                ],
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "psk-uploader-hs: ClickHouseSource construct failed: %s", exc,
-            )
+        src = self._build_source()
+        if src is None:
             return
 
         try:
@@ -191,3 +182,110 @@ class HsPskReporterUploader:
                 logger.exception(
                     "psk-uploader-hs: unhandled error in pump loop",
                 )
+
+    # ----- source selection -----
+
+    def _build_source(self):
+        """Pick CH or file-fallback based on env.
+
+        ``SIGMOND_CLICKHOUSE_URL`` set → ClickHouseSource (the 5c.2
+        path).  Unset → FileTreeSource over the per-slot spool, which
+        the SlotWorker populates only when this combination of envs is
+        active (PSK_USE_HS_UPLOADER=1 + CH absent).
+        """
+        if os.environ.get("SIGMOND_CLICKHOUSE_URL"):
+            try:
+                from hs_uploader.sources.clickhouse import ClickHouseSource
+                return ClickHouseSource.from_env(
+                    database="psk", table="spots",
+                    accepted_schema_versions=[2],
+                    primary_key_columns=[
+                        # psk.spots ORDER BY tuple — tiebreak hash takes
+                        # this set so two rows with identical (host_call,
+                        # mode, frequency, time, message) tie on
+                        # cityHash64 and ship in a stable order.
+                        "host_call", "mode", "frequency", "time", "message",
+                    ],
+                    select_columns=[
+                        "time", "frequency", "mode", "snr_db", "tx_call",
+                        "grid", "score", "message",
+                    ],
+                    cursor_column="ingested_at",
+                    extra_where=[
+                        ("radiod_id", "=", self._radiod_id),
+                        ("tx_call", "!=", ""),
+                        ("mode", "IN", ["ft8", "ft4"]),
+                    ],
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "psk-uploader-hs: ClickHouseSource construct failed: %s",
+                    exc,
+                )
+                return None
+
+        if self._spool_dir is None:
+            logger.warning(
+                "psk-uploader-hs: no SIGMOND_CLICKHOUSE_URL and no spool_dir — "
+                "neither source available",
+            )
+            return None
+
+        try:
+            from hs_uploader.sources.files import FileSpec, FileTreeSource
+        except ImportError as exc:
+            logger.warning(
+                "psk-uploader-hs: FileTreeSource import failed: %s", exc,
+            )
+            return None
+
+        return FileTreeSource(
+            root=self._spool_dir,
+            specs=[
+                FileSpec(
+                    pattern="*.spots.txt",
+                    parser=_parse_spots_file,
+                    table="psk.spots",
+                ),
+            ],
+            retention=FileTreeSource.DELETE_ON_ACK,
+            source_id=f"psk-spool:{self._radiod_id}",
+        )
+
+
+# ----- spool file parser -----
+
+
+def _parse_spots_file(path, raw):
+    """Parse a per-slot ``.spots.txt`` file into per-spot dicts.
+
+    Each line is a decode_ft8 stdout line (WSJT-X-style timestamp +
+    spot fields).  Mode is inferred from the file's parent directory
+    (``ft8/`` or ``ft4/``); ``parse_decoder_line`` does the rest.
+
+    Returns a list of dicts shaped to match what
+    ``PskReporterTcp._record_to_spot`` expects: ``time`` (datetime,
+    promoted to ``Record.time`` by FileTreeSource), ``tx_call``,
+    ``frequency``, ``snr_db`` / ``score``, ``mode``, ``grid``,
+    ``message``.  Lines that don't parse are skipped silently.
+    """
+    from psk_recorder.core.ch_tailer import parse_decoder_line
+
+    mode = path.parent.name.lower()
+    if mode not in ("ft8", "ft4"):
+        mode = None
+
+    try:
+        text = raw.decode("utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        return []
+
+    rows = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        parsed = parse_decoder_line(line, mode=mode)
+        if parsed is None:
+            continue
+        rows.append(parsed)
+    return rows

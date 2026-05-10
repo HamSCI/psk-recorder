@@ -142,18 +142,135 @@ def test_pipeline_uses_radiod_id_filter_and_ingested_at_cursor(monkeypatch, tmp_
 
 
 def test_lifecycle_thread_starts_and_stops(monkeypatch, tmp_path):
-    """The thread comes up after start() and exits before stop()
-    returns.  Independent of whether the pump does any work — just
-    verifies thread management doesn't deadlock."""
+    """The thread comes up after start() with a file-fallback source
+    available (CH unset + spool_dir present) and exits before stop()
+    returns.  Verifies thread management doesn't deadlock."""
+    monkeypatch.setenv("HS_UPLOADER_STATE_DIR", str(tmp_path))
+    monkeypatch.delenv("SIGMOND_CLICKHOUSE_URL", raising=False)
+
+    spool = tmp_path / "spool" / "rid1"
+    spool.mkdir(parents=True)
+
+    u = HsPskReporterUploader(
+        callsign="AC0G/B1", grid_square="EM38ww", radiod_id="rid1",
+        spool_dir=spool,
+    )
+    u.start()
+    # FileTreeSource health is "ok" once the spool dir exists; pump()
+    # returns False because there are no .spots.txt files yet.  The
+    # thread still runs.
+    assert u.is_active
+    u.stop(timeout=2.0)
+    assert u.is_active is False
+
+
+def test_no_source_is_clean_noop(monkeypatch, tmp_path, caplog):
+    """No CH and no spool_dir → start is a clean no-op.
+
+    Without a source the pump has nothing to do; spawning a thread
+    just to spin would burn cycles, so start() returns early and
+    is_active stays False.
+    """
     monkeypatch.setenv("HS_UPLOADER_STATE_DIR", str(tmp_path))
     monkeypatch.delenv("SIGMOND_CLICKHOUSE_URL", raising=False)
 
     u = HsPskReporterUploader(
         callsign="AC0G/B1", grid_square="EM38ww", radiod_id="rid1",
+        spool_dir=None,
     )
-    u.start()
-    # Even with CH unconfigured, the source goes to no-op health and
-    # pump() returns False — the thread still runs.
-    assert u.is_active
-    u.stop(timeout=2.0)
+    with caplog.at_level("WARNING", logger="psk_recorder.core.hs_uploader_shim"):
+        u.start()
     assert u.is_active is False
+    assert any(
+        "neither source available" in r.message for r in caplog.records
+    )
+
+
+def test_file_fallback_picks_up_spool_files(monkeypatch, tmp_path):
+    """With no CH and a spool_dir containing per-slot files, the shim
+    builds a FileTreeSource that finds them and fans them out into
+    one Record per parsed line."""
+    monkeypatch.setenv("HS_UPLOADER_STATE_DIR", str(tmp_path))
+    monkeypatch.delenv("SIGMOND_CLICKHOUSE_URL", raising=False)
+
+    # Mirror what SlotWorker writes: <spool>/<radiod>/<mode>/<slot>.spots.txt
+    spool = tmp_path / "spool" / "rid1"
+    ft8 = spool / "ft8"
+    ft8.mkdir(parents=True)
+    (ft8 / "260510_171530_14074.spots.txt").write_text(
+        "2026/05/10 17:15:30  28 +0.11 14,074,461.9 ~ KJ5LMM LU1ALF -10\n"
+        "2026/05/10 17:15:30  25 +0.75 14,075,396.3 ~ CQ CX6TE GF26\n"
+    )
+
+    u = HsPskReporterUploader(
+        callsign="AC0G", grid_square="EM38ww", radiod_id="rid1",
+        spool_dir=spool,
+    )
+    src = u._build_source()  # noqa: SLF001
+    assert src is not None
+    batches = list(src.iter_batches(b"", limit=100))
+    assert len(batches) == 1
+    records = batches[0].records
+    assert len(records) == 2
+    # Mode comes from path.parent.name; tx_call from message body.
+    assert records[0].columns["mode"] == "ft8"
+    assert records[0].columns["tx_call"] == "LU1ALF"
+    assert records[1].columns["tx_call"] == "CX6TE"
+    # `time` was lifted out of cols into Record.time.
+    assert "time" not in records[0].columns
+    assert records[0].time.year == 2026
+
+
+def test_file_fallback_skips_unparseable_lines(tmp_path, monkeypatch):
+    monkeypatch.delenv("SIGMOND_CLICKHOUSE_URL", raising=False)
+    spool = tmp_path / "rid1"
+    ft8 = spool / "ft8"
+    ft8.mkdir(parents=True)
+    (ft8 / "260510_171530_14074.spots.txt").write_text(
+        "header line that does not match\n"
+        "\n"
+        "2026/05/10 17:15:30  28 +0.11 14,074,461.9 ~ KJ5LMM LU1ALF -10\n"
+        "garbage in the middle\n"
+    )
+
+    u = HsPskReporterUploader(
+        callsign="AC0G", grid_square="EM38ww", radiod_id="rid1",
+        spool_dir=spool,
+    )
+    src = u._build_source()  # noqa: SLF001
+    batches = list(src.iter_batches(b"", limit=100))
+    assert len(batches[0].records) == 1
+    assert batches[0].records[0].columns["tx_call"] == "LU1ALF"
+
+
+def test_ch_env_takes_precedence_over_spool(monkeypatch, tmp_path):
+    """If both CH env and spool_dir are set, CH wins (the 5c.2 path
+    is preferred — file is the fallback)."""
+    monkeypatch.setenv("SIGMOND_CLICKHOUSE_URL", "http://localhost:8123")
+    monkeypatch.setenv("SIGMOND_CLICKHOUSE_USER", "test")
+    monkeypatch.setenv("HS_UPLOADER_STATE_DIR", str(tmp_path))
+
+    fake_client = MagicMock()
+
+    def fake_query(sql, parameters=None):
+        result = MagicMock()
+        result.result_rows = [("time", "DateTime"), ("ingested_at", "DateTime")]
+        result.column_names = ["name", "type"]
+        return result
+
+    fake_client.query = MagicMock(side_effect=fake_query)
+    from hs_uploader.sources import clickhouse as ch_mod
+    monkeypatch.setattr(
+        ch_mod, "_default_client_factory", lambda cfg: fake_client,
+    )
+
+    spool = tmp_path / "spool" / "rid1"
+    spool.mkdir(parents=True)
+
+    u = HsPskReporterUploader(
+        callsign="AC0G", grid_square="EM38ww", radiod_id="rid1",
+        spool_dir=spool,
+    )
+    src = u._build_source()  # noqa: SLF001
+    # ClickHouseSource — the schema-validation query went out.
+    assert type(src).__name__ == "ClickHouseSource"
