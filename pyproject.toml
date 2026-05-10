@@ -14,6 +14,7 @@ authors = [
 dependencies = [
     "ka9q-python>=3.13.0",
     "callhash>=1.0.0",
+    "hs-uploader>=0.1.0",
     "numpy>=1.24.0",
     "tomli>=2.0; python_version < '3.11'",
 ]
@@ -34,3 +35,4 @@ testpaths = ["tests"]
 
 [tool.uv.sources]
 callhash = { path = "../callhash" }
+hs-uploader = { path = "../hs-uploader" }

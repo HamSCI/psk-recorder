@@ -92,6 +92,19 @@ ui_info "Installing psk-recorder (editable) into venv"
 "$VENV_DIR/bin/pip" install --upgrade pip setuptools wheel >/dev/null
 "$VENV_DIR/bin/pip" install -e "$REPO_SOURCE" >/dev/null
 
+# hs-uploader is a sibling repo (not on PyPI yet).  Install editable
+# from the canonical sigmond layout — the same convention as callhash
+# and ka9q-python.  Without this the `import hs_uploader` in the
+# new HsPskReporterUploader path fails at runtime.
+HS_UPLOADER_DIR="/opt/git/sigmond/hs-uploader"
+if [[ -d "$HS_UPLOADER_DIR" ]]; then
+    "$VENV_DIR/bin/pip" install -e "$HS_UPLOADER_DIR" >/dev/null
+    ui_info "Installed hs-uploader editable from $HS_UPLOADER_DIR"
+else
+    ui_error "$HS_UPLOADER_DIR not found — hs-uploader sibling repo required"
+    exit 1
+fi
+
 # Install our vendored pskreporter.py directly into the venv's
 # site-packages.  We don't depend on the upstream `pjsg/ftlib-
 # pskreporter` package because (1) the vendored copy is stdlib-only

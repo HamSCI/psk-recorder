@@ -25,6 +25,7 @@ from psk_recorder.config import (
 from psk_recorder.core.stream import ChannelSink
 from psk_recorder.core.ch_tailer import ChTailer
 from psk_recorder.core.uploader import PskReporterUploader
+from psk_recorder.core.hs_uploader_shim import HsPskReporterUploader
 
 logger = logging.getLogger(__name__)
 
@@ -274,9 +275,12 @@ class PskRecorder:
 
     def _start_uploaders(self) -> None:
         # ClickHouse-backed uploader: a single thread polls psk.spots
-        # for new rows and feeds them into the pskreporter UDP client.
-        # Replaces the legacy per-mode pskreporter-sender subprocesses
-        # (which couldn't parse our native-jt9 log format).
+        # for new rows and feeds them upstream.  Two implementations:
+        # the legacy `PskReporterUploader` (CH-poll + pskreporter
+        # library subprocess-style) and the hs-uploader-driven
+        # `HsPskReporterUploader` (Pipeline + PskReporterTcp transport).
+        # `PSK_USE_HS_UPLOADER=1` opts into the new path; default is
+        # legacy until Phase 5c.3 (file fallback) lands.
         callsign = self._station.get("callsign", "")
         grid = self._station.get("grid_square", "")
         if not callsign:
@@ -287,7 +291,13 @@ class PskRecorder:
         # Operators on constrained links can opt out via config.
         use_tcp = bool(self._paths.get("pskreporter_tcp", True))
 
-        uploader = PskReporterUploader(
+        use_hs = bool(os.environ.get("PSK_USE_HS_UPLOADER"))
+        uploader_cls = HsPskReporterUploader if use_hs else PskReporterUploader
+        logger.info(
+            "uploader: %s (PSK_USE_HS_UPLOADER=%s)",
+            uploader_cls.__name__, "1" if use_hs else "0",
+        )
+        uploader = uploader_cls(
             callsign=callsign,
             grid_square=grid,
             antenna=antenna,
