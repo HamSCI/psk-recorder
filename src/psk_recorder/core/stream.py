@@ -5,18 +5,33 @@ thread of its own for RTP reception — it receives sample batches via
 the `on_samples` callback that a shared `MultiStream` dispatches after
 demultiplexing by SSRC.
 
-Timing anchoring.  Under the RTP-reference labeling invariant
-(hf-timestd/docs/METROLOGY.md §4.5.1), psk-recorder anchors the UTC of
-each sample using radiod's RTP counter plus an optional
-rtp_to_utc_offset_ns from /run/hf-timestd/authority.json.  When
-authority.json is unavailable (standalone mode, no hf-timestd), we
-fall back to a one-time `time.time()` snapshot — the recorder still
-works, but the anchor inherits whatever error the system clock carries
-at that instant (the Saturday 2026-04-20 failure mode).  We refresh
-the authority-driven correction opportunistically (every ~60 s of
-samples) so large offset transitions (e.g., hf-timestd bootstrap
-completing, T3 Fusion locking) are picked up mid-run rather than
-requiring a recorder restart.
+Timing anchoring (rtp_to_wallclock authority — 2026-05-10).
+We timestamp each delivered batch via ka9q.rtp_to_wallclock(rtp_ts,
+channel_info), which converts the RTP timestamp of the batch's first
+sample to UTC using radiod's GPS_TIME / RTP_TIMESNAP snapshot.  This
+is the canonical source of truth for sample wall-clock — radiod
+captures the GPS-disciplined time once and we extrapolate from RTP
+sample positions, completely independent of:
+
+  - this host's system clock (chrony, NTP, GPSDO)
+  - hf-timestd's authority offset (now redundant for our anchor)
+  - startup-time accumulator state in MultiStream / the resequencer
+
+Previous design anchored via `time.time() - samples_so_far/rate` at
+the first on_samples call.  When the channel had been live in radiod
+before psk-recorder subscribed (the normal case after a process
+restart on a long-running radiod), `samples_so_far` already reflected
+hundreds of seconds of MultiStream-side accounting (resequencer
+startup batching, gap fills) so the wall-clock anchor was off by
+that span.  Effect: every WAV slot's labelled UTC was systematically
+EARLY by ~2-3 seconds, decoders reported FT8 DT clustering at +2.79s
+mean (B4-100 2026-05-10), and 73.7% of decodes were outside the
+nominal ±2.5s slot tolerance — most were not decoded at all.
+
+rtp_to_wallclock applies hf-timestd's chain_delay_correction_ns
+(measured by the L6 BPSK PPS calibrator, attached to the channel
+info on discovery) automatically, so the recorder still benefits
+from the RF→ADC→DSP latency calibration without managing it here.
 """
 
 from __future__ import annotations
@@ -36,17 +51,6 @@ from psk_recorder.core.slot import SlotWorker
 logger = logging.getLogger(__name__)
 
 RING_SECONDS = 60.0
-
-# Opportunistic authority refresh interval, measured in samples. Every
-# ~60 seconds of delivered samples we re-read authority.json and
-# rebase the stream epoch if the offset has drifted meaningfully.
-AUTHORITY_REFRESH_EVERY_SAMPLES = 60 * 12_000  # 60 s at 12 kHz
-
-# Re-anchor only when the authority-reported offset has drifted by
-# more than this from the offset used at the last anchor. Smaller
-# drifts are absorbed by the FT8/FT4 decoder tolerance and not worth
-# the log noise of a rebase.
-AUTHORITY_REANCHOR_THRESHOLD_SEC = 0.050  # 50 ms
 
 
 class ChannelSink:
@@ -93,17 +97,19 @@ class ChannelSink:
             keep_wav=keep_wav,
         )
 
-        self._stream_start_epoch: Optional[float] = None
         self._total_delivered: int = 0
-
-        # Authority-driven UTC anchoring (§4.5.1). A None reader disables
-        # the mechanism entirely and the sink reverts to the legacy
-        # wall-clock anchor — useful only for tests and the explicit
-        # "force standalone" operator toggle.
+        # ChannelInfo carrying gps_time / rtp_timesnap / chain_delay
+        # — required for ka9q.rtp_to_wallclock(); set by the recorder via
+        # set_channel_info() right after multi.add_channel() returns.
+        self._channel_info = None
+        # Whether we've already logged the "no channel_info, falling back"
+        # warning — keeps the log noise to one line per channel even when
+        # rtp_to_wallclock can't be used.
+        self._fallback_warned: bool = False
+        # Authority reader is retained so other consumers (e.g., diags)
+        # can still inspect what hf-timestd is publishing.  Not used for
+        # anchoring anymore — rtp_to_wallclock is the source of truth.
         self._reader = authority_reader if authority_reader is not None else AuthorityReader()
-        self._anchor_source: Optional[str] = None       # "authority" | "wall_clock"
-        self._anchor_offset_sec: Optional[float] = None  # applied rtp_to_utc offset, in seconds
-        self._samples_since_refresh: int = 0
 
     @property
     def mode(self) -> str:
@@ -137,140 +143,94 @@ class ChannelSink:
             self._mode.upper(), self._frequency_hz, self._total_delivered,
         )
 
-    def on_samples(self, samples: np.ndarray, quality) -> None:
-        """MultiStream callback — push samples into the ring.
+    def set_channel_info(self, channel_info) -> None:
+        """Attach the ChannelInfo carrying gps_time/rtp_timesnap/chain_delay.
 
-        First call anchors `_stream_start_epoch`; subsequent calls
-        extrapolate UTC from the delivered-sample counter. Every
-        AUTHORITY_REFRESH_EVERY_SAMPLES we re-read authority.json so a
-        large offset transition (e.g., hf-timestd bootstrap completing)
-        can be absorbed mid-run.
+        Called by the recorder right after multi.add_channel() returns.
+        Without it, on_samples falls back to wall-clock anchoring (the
+        old broken path) and logs a one-time warning per channel.
+        """
+        self._channel_info = channel_info
+
+    def on_samples(self, samples: np.ndarray, quality) -> None:
+        """MultiStream callback — timestamp via rtp_to_wallclock, push to ring.
+
+        For each batch we compute the RTP timestamp of the first sample
+        as `first_rtp_timestamp + batch_start_sample` and convert it to
+        UTC via ka9q.rtp_to_wallclock().  This ties every sample to
+        radiod's GPS-disciplined RTP_TIMESNAP/GPS_TIME pair, independent
+        of the host clock and the MultiStream-side accumulator state.
         """
         n = len(samples)
         if n == 0:
             return
 
-        if self._stream_start_epoch is None:
-            self._anchor_initial(quality)
-        else:
-            self._samples_since_refresh += n
-            if self._samples_since_refresh >= AUTHORITY_REFRESH_EVERY_SAMPLES:
-                self._samples_since_refresh = 0
-                self._refresh_authority_offset()
+        utc_of_first: Optional[float] = None
+        if self._channel_info is not None:
+            utc_of_first = self._utc_from_rtp(samples, quality)
 
-        batch_start_sample = quality.total_samples_delivered - n
-        utc_of_first = self._stream_start_epoch + (
-            batch_start_sample / self._sample_rate
-        )
+        if utc_of_first is None:
+            # Fallback path — the channel's GPS_TIME/RTP_TIMESNAP wasn't
+            # populated (very old radiod, or discovery hasn't snapped yet).
+            # Use the prior wall-clock anchor logic just enough to keep
+            # going; warn once.
+            utc_of_first = self._fallback_wallclock_utc(quality, n)
+            if not self._fallback_warned:
+                self._fallback_warned = True
+                logger.warning(
+                    "%s %d Hz: rtp_to_wallclock unavailable (channel_info=%s, "
+                    "gps_time=%s) — using wall-clock fallback; FT8 DT may drift",
+                    self._mode.upper(), self._frequency_hz,
+                    "set" if self._channel_info is not None else "unset",
+                    getattr(self._channel_info, "gps_time", None)
+                    if self._channel_info else None,
+                )
 
         self._ring.push(samples, utc_of_first)
         self._total_delivered = quality.total_samples_delivered
 
-    # ---- authority anchoring -----------------------------------------
+    def _utc_from_rtp(self, samples: np.ndarray, quality) -> Optional[float]:
+        """Compute UTC of first sample in batch via rtp_to_wallclock.
 
-    def _anchor_initial(self, quality) -> None:
-        """Compute `_stream_start_epoch` from the best available source.
-
-        Preference order:
-          1. authority.json with a usable offset → system_clock + offset
-             is treated as UTC, so the anchor is UTC-accurate up to
-             host-clock skew between radiod and the authority host.
-          2. system clock alone → the legacy path; recorder still works
-             but inherits whatever error the local clock carries.
+        RTP timestamps increment by 1 per output sample, so the first
+        sample of this batch has RTP TS = first_rtp_timestamp +
+        batch_start_sample (mod 2**32).  rtp_to_wallclock then converts
+        that to UTC seconds using radiod's GPS_TIME/RTP_TIMESNAP snapshot.
         """
-        now = time.time()
-        samples_so_far = quality.total_samples_delivered
-        offset_sec = self._read_current_offset()
-        corrected_now = now + (offset_sec or 0.0)
-        self._stream_start_epoch = corrected_now - (samples_so_far / self._sample_rate)
+        from ka9q import rtp_to_wallclock
 
-        if offset_sec is not None:
-            self._anchor_source = "authority"
-            self._anchor_offset_sec = offset_sec
-            logger.info(
-                "%s %d Hz: first samples received (samples_so_far=%d); anchored "
-                "via hf-timestd authority (offset=%+.3f s)",
-                self._mode.upper(), self._frequency_hz, samples_so_far, offset_sec,
-            )
-        else:
-            self._anchor_source = "wall_clock"
-            self._anchor_offset_sec = None
-            logger.warning(
-                "%s %d Hz: first samples received (samples_so_far=%d); anchored "
-                "via wall clock (hf-timestd authority unavailable — standalone "
-                "mode; WAV timestamps rely on this host's clock discipline)",
-                self._mode.upper(), self._frequency_hz, samples_so_far,
-            )
+        first_rtp = getattr(quality, "first_rtp_timestamp", 0)
+        if first_rtp == 0:
+            return None  # not yet populated by MultiStream
+        batch_start_sample = quality.total_samples_delivered - len(samples)
+        rtp_ts = (first_rtp + batch_start_sample) & 0xFFFFFFFF
+        return rtp_to_wallclock(rtp_ts, self._channel_info)
 
-    def _read_current_offset(self) -> Optional[float]:
-        """Read authority.json, return offset in seconds if usable."""
-        try:
-            snap = self._reader.read()
-        except Exception as e:
-            logger.debug("authority reader raised: %s", e)
-            return None
-        if snap is None or not snap.offset_usable:
-            return None
-        return snap.offset_seconds
+    def _fallback_wallclock_utc(self, quality, n: int) -> float:
+        """Best-effort UTC when rtp_to_wallclock can't run.
 
-    def _refresh_authority_offset(self) -> None:
-        """Re-read authority.json and rebase the stream epoch if the
-        authority offset has drifted enough to matter. No-op when the
-        reader is disabled, authority.json is still unavailable, or the
-        drift is below the re-anchor threshold."""
-        offset_sec = self._read_current_offset()
-        if offset_sec is None:
-            # Authority disappeared or became unusable. Keep the existing
-            # anchor — losing hf-timestd mid-run does not invalidate the
-            # RTP counter we've been tracking; it just means future drift
-            # correction is unavailable.
-            return
-
-        if self._anchor_source != "authority" or self._anchor_offset_sec is None:
-            # We were anchored via wall clock (or uninitialized); authority
-            # is now available. Rebase the epoch by the full offset.
-            assert self._stream_start_epoch is not None
-            self._stream_start_epoch += offset_sec
-            logger.info(
-                "%s %d Hz: authority became available mid-run; rebased epoch "
-                "by %+.3f s",
-                self._mode.upper(), self._frequency_hz, offset_sec,
-            )
-            self._anchor_source = "authority"
-            self._anchor_offset_sec = offset_sec
-            return
-
-        drift = offset_sec - self._anchor_offset_sec
-        if abs(drift) < AUTHORITY_REANCHOR_THRESHOLD_SEC:
-            return
-
-        assert self._stream_start_epoch is not None
-        self._stream_start_epoch += drift
-        logger.info(
-            "%s %d Hz: authority offset drifted by %+.3f s; rebased epoch",
-            self._mode.upper(), self._frequency_hz, drift,
-        )
-        self._anchor_offset_sec = offset_sec
-
-    @property
-    def anchor_source(self) -> Optional[str]:
-        """'authority' | 'wall_clock' | None (not yet anchored). For
-        operator diagnostics and tests."""
-        return self._anchor_source
-
-    @property
-    def anchor_offset_sec(self) -> Optional[float]:
-        """Applied rtp_to_utc offset in seconds if anchored via authority."""
-        return self._anchor_offset_sec
+        Anchors at first call, extrapolates from sample count thereafter.
+        Inherits all the host-clock-vs-radiod-counter drift the rtp path
+        was meant to eliminate, but at least the WAV files keep flowing.
+        """
+        if not hasattr(self, "_fb_anchor_utc"):
+            self._fb_anchor_utc = time.time()
+            self._fb_anchor_total = quality.total_samples_delivered
+        delta_samples = quality.total_samples_delivered - n - self._fb_anchor_total
+        return self._fb_anchor_utc + delta_samples / self._sample_rate
 
     def on_stream_dropped(self, reason: str) -> None:
         logger.warning(
             "%s %d Hz: stream dropped — %s",
             self._mode.upper(), self._frequency_hz, reason,
         )
-        self._stream_start_epoch = None
 
     def on_stream_restored(self, channel_info) -> None:
+        # MultiStream re-discovers and hands us a fresh ChannelInfo with
+        # an updated GPS_TIME/RTP_TIMESNAP snapshot; replace ours so
+        # rtp_to_wallclock keeps using a sane reference even if radiod
+        # restarted under us.
+        self._channel_info = channel_info
         logger.info(
             "%s %d Hz: stream restored",
             self._mode.upper(), self._frequency_hz,

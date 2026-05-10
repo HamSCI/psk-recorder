@@ -250,6 +250,10 @@ class PskRecorder:
             on_stream_restored=sink.on_stream_restored,
             lifetime=lifetime_arg,
         )
+        # Hand the freshly-discovered ChannelInfo (with GPS_TIME /
+        # RTP_TIMESNAP / chain_delay_correction populated) to the sink
+        # so on_samples can use rtp_to_wallclock as the UTC source.
+        sink.set_channel_info(ch_info)
         if lifetime_arg is not None:
             self._lifetime_entries.append((multi, ch_info.ssrc))
 
