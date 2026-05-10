@@ -233,16 +233,27 @@ class PskReporterUploader:
             # ever moves forward, so the watermark is race-free.
             # The original `time` is still in the row and is what we
             # ship to PSK Reporter.
+            # Filter by radiod_id so each psk-recorder instance ships
+            # only its own decodes.  Without this, two instances on the
+            # same host both pull every row and upload everything under
+            # their own callsign — every spot lands at PSK Reporter
+            # twice, each attributed to a different reporter.  ChTailer
+            # tags every row with radiod_id at insert time, so this is
+            # a strict 1:1 with the running daemon.
             result = self._client.query(
                 "SELECT time, frequency, mode, snr_db, tx_call, grid, "
                 "ingested_at "
                 "FROM psk.spots "
                 "WHERE ingested_at > {since:DateTime} "
+                "  AND radiod_id = {rid:String} "
                 "  AND tx_call != '' "
                 "  AND mode IN ('ft8', 'ft4') "
                 "ORDER BY ingested_at "
                 "LIMIT 1000",
-                parameters={"since": self._last_seen_time},
+                parameters={
+                    "since": self._last_seen_time,
+                    "rid": self._radiod_id,
+                },
             )
             rows = result.result_rows
         except Exception as e:
