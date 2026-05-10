@@ -54,6 +54,57 @@ if ! id -u "$SERVICE_USER" &>/dev/null; then
             "$SERVICE_USER"
 fi
 
+# --- Phase 1.5: ensure sibling repos (callhash, hs-uploader) ---
+# pyproject.toml declares these as path-based deps under [tool.uv.sources]:
+#     callhash    = { path = "../callhash" }
+#     hs-uploader = { path = "../hs-uploader" }
+# Plain pip (used below) doesn't honor [tool.uv.sources], so we install
+# both editable into the venv ourselves *before* the main `pip install -e .`
+# of psk-recorder.  If a sibling isn't at the canonical location, relocate
+# from common alternates (~, ~/git, /opt/git) or clone upstream.
+_ensure_sibling() {
+    local name="$1" repo_url="$2"
+    local target="/opt/git/sigmond/$name"
+
+    if [[ -f "$target/pyproject.toml" ]]; then
+        return 0
+    fi
+
+    ui_info "Sibling $name not at $target — searching common locations"
+    local invoker="${SUDO_USER:-${USER:-$(id -un)}}"
+    local src=""
+    for candidate in \
+        "/home/$invoker/$name" \
+        "/home/$invoker/git/$name" \
+        "/opt/git/$name"; do
+        if [[ -f "$candidate/pyproject.toml" ]]; then
+            src="$candidate"
+            break
+        fi
+    done
+
+    if [[ -n "$src" ]]; then
+        ui_info "Found at $src — relocating to $target"
+        if [[ -d "$target" && -n "$(ls -A "$target" 2>/dev/null)" ]]; then
+            ui_error "$target exists and is non-empty — inspect and remove first"
+            exit 1
+        fi
+        mkdir -p "$(dirname "$target")"
+        [[ -d "$target" ]] && rmdir "$target"
+        mv "$src" "$target"
+        ui_info "Relocated $name to $target"
+    else
+        ui_info "Not found locally — cloning from $repo_url"
+        git clone "$repo_url" "$target" || {
+            ui_error "Failed to clone $repo_url"
+            exit 1
+        }
+    fi
+}
+
+_ensure_sibling callhash    https://github.com/mijahauan/callhash
+_ensure_sibling hs-uploader https://github.com/mijahauan/hs-uploader
+
 # --- Phase 2: repo + venv ---
 if [[ ! -d "$REPO_SOURCE" ]]; then
     ui_info "Linking $REPO_ROOT -> $REPO_SOURCE"
@@ -88,22 +139,19 @@ if [[ ! -d "$VENV_DIR" ]] || [[ ! -x "$VENV_DIR/bin/pip" ]]; then
     python3 -m venv "$VENV_DIR"
 fi
 
-ui_info "Installing psk-recorder (editable) into venv"
 "$VENV_DIR/bin/pip" install --upgrade pip setuptools wheel >/dev/null
-"$VENV_DIR/bin/pip" install -e "$REPO_SOURCE" >/dev/null
 
-# hs-uploader is a sibling repo (not on PyPI yet).  Install editable
-# from the canonical sigmond layout — the same convention as callhash
-# and ka9q-python.  Without this the `import hs_uploader` in the
-# new HsPskReporterUploader path fails at runtime.
-HS_UPLOADER_DIR="/opt/git/sigmond/hs-uploader"
-if [[ -d "$HS_UPLOADER_DIR" ]]; then
-    "$VENV_DIR/bin/pip" install -e "$HS_UPLOADER_DIR" >/dev/null
-    ui_info "Installed hs-uploader editable from $HS_UPLOADER_DIR"
-else
-    ui_error "$HS_UPLOADER_DIR not found — hs-uploader sibling repo required"
-    exit 1
-fi
+# Install sibling packages editable first so pip's resolver finds them
+# when it processes psk-recorder's dependencies below.  Order matters:
+# callhash and hs-uploader must be present in the venv before
+# `pip install -e .` of psk-recorder.
+ui_info "Installing callhash (editable) into venv"
+"$VENV_DIR/bin/pip" install -e /opt/git/sigmond/callhash >/dev/null
+ui_info "Installing hs-uploader (editable) into venv"
+"$VENV_DIR/bin/pip" install -e /opt/git/sigmond/hs-uploader >/dev/null
+
+ui_info "Installing psk-recorder (editable) into venv"
+"$VENV_DIR/bin/pip" install -e "$REPO_SOURCE" >/dev/null
 
 # Install our vendored pskreporter.py directly into the venv's
 # site-packages.  We don't depend on the upstream `pjsg/ftlib-
