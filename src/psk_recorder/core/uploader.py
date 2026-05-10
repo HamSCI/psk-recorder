@@ -204,13 +204,26 @@ class PskReporterUploader:
         if self._client is None or self._reporter is None:
             return
         try:
+            # Filter on `ingested_at` (DEFAULT now() at INSERT) rather
+            # than decode `time` (the spot's UTC decode timestamp).  The
+            # decode timestamp is non-monotonic across modes: ChTailer
+            # has separate per-mode batches that flush asynchronously
+            # (ft8 every 15 s, ft4 every 7.5 s of decode cycle plus its
+            # own 15 s flush window), so a poll that catches an ft4
+            # batch first advances the watermark past the upcoming ft8
+            # batch's `time` values, permanently excluding them.
+            # `ingested_at` is set by ClickHouse at INSERT time and only
+            # ever moves forward, so the watermark is race-free.
+            # The original `time` is still in the row and is what we
+            # ship to PSK Reporter.
             result = self._client.query(
-                "SELECT time, frequency, mode, snr_db, tx_call, grid "
+                "SELECT time, frequency, mode, snr_db, tx_call, grid, "
+                "ingested_at "
                 "FROM psk.spots "
-                "WHERE time > {since:DateTime} "
+                "WHERE ingested_at > {since:DateTime} "
                 "  AND tx_call != '' "
                 "  AND mode IN ('ft8', 'ft4') "
-                "ORDER BY time "
+                "ORDER BY ingested_at "
                 "LIMIT 1000",
                 parameters={"since": self._last_seen_time},
             )
@@ -221,10 +234,10 @@ class PskReporterUploader:
         if not rows:
             return
 
-        latest_time = self._last_seen_time
+        latest_ingested = self._last_seen_time
         ft8_n = 0
         ft4_n = 0
-        for spot_time, freq_hz, mode, snr_db, tx_call, grid in rows:
+        for spot_time, freq_hz, mode, snr_db, tx_call, grid, ingested_at in rows:
             # Normalize spot_time to tz-aware UTC.  clickhouse-connect
             # may return naive datetimes (server-tz-relative) or
             # tz-aware ones depending on column metadata; standardize.
@@ -257,9 +270,15 @@ class PskReporterUploader:
                     tx_call, freq_hz, mode, e,
                 )
                 continue
-            if spot_aware > latest_time:
-                latest_time = spot_aware
-        self._last_seen_time = latest_time
+            # Advance watermark by INGEST order, not decode time.  See
+            # the SELECT comment for why.
+            ingested_aware = (
+                ingested_at if ingested_at.tzinfo is not None
+                else ingested_at.replace(tzinfo=timezone.utc)
+            )
+            if ingested_aware > latest_ingested:
+                latest_ingested = ingested_aware
+        self._last_seen_time = latest_ingested
         # INFO so `smd psk-watch` can pick this up without DEBUG noise.
         # The pskreporter library's own "uploading N spots" message
         # comes when the batch flushes (every PSKREPORTER_INTERVAL s);
