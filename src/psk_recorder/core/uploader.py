@@ -33,6 +33,14 @@ logger = logging.getLogger(__name__)
 # spots accumulate in the library's batch before its next UDP flush.
 POLL_INTERVAL_SEC = 5.0
 
+# How often to emit the "batch summary" log line — per-mode cycle count
+# and average spots/cycle.  Match the pskreporter library's batch
+# interval so the summary lines up with the visible "uploading N spots"
+# events.  PSKREPORTER_INTERVAL env defaults to 180 s upstream; 30 s in
+# our coordination.env.
+import os as _os  # local: avoid shadowing top-level imports
+BATCH_REPORT_SEC = float(_os.environ.get("PSKREPORTER_INTERVAL", "30"))
+
 
 class PskReporterUploader:
     """ClickHouse-backed PSK Reporter spot uploader.
@@ -77,6 +85,14 @@ class PskReporterUploader:
         # UTC since psk.spots.time is a UTC DateTime column.
         self._last_seen_time: Optional[datetime] = None
         self._uploaded_count = 0
+        # Cycle-stats accumulator.  Every BATCH_REPORT_SEC seconds (set
+        # to match PSKREPORTER_INTERVAL so summaries align with the
+        # library's "uploading N spots" log lines) we log a roll-up:
+        # per-mode cycle count + average spots per cycle.  A "cycle" =
+        # a distinct decode `time` value within the mode.
+        self._batch_window_start: float = 0.0
+        self._batch_cycle_times: dict = {"ft8": set(), "ft4": set()}
+        self._batch_spot_counts: dict = {"ft8": 0, "ft4": 0}
 
     # ----- lifecycle -----
 
@@ -147,6 +163,7 @@ class PskReporterUploader:
         # may be America/Chicago on this host), causing the WHERE-clause
         # comparison to land 5 h in the future and return zero rows.
         self._last_seen_time = datetime.now(timezone.utc)
+        self._batch_window_start = time.monotonic()
         self._stop.clear()
         self._thread = threading.Thread(
             target=self._run, daemon=True, name="psk-uploader-ch",
@@ -261,8 +278,12 @@ class PskReporterUploader:
                 self._uploaded_count += 1
                 if mode == "ft8":
                     ft8_n += 1
+                    self._batch_spot_counts["ft8"] += 1
+                    self._batch_cycle_times["ft8"].add(spot_aware)
                 elif mode == "ft4":
                     ft4_n += 1
+                    self._batch_spot_counts["ft4"] += 1
+                    self._batch_cycle_times["ft4"].add(spot_aware)
             except Exception as e:
                 logger.warning(
                     "psk-uploader-ch: spot() rejected row "
@@ -287,3 +308,26 @@ class PskReporterUploader:
             "psk-uploader-ch: queued ft8=%d ft4=%d (total %d)",
             ft8_n, ft4_n, self._uploaded_count,
         )
+
+        # Per-batch summary (matches pskreporter's flush cadence):
+        # cycle counts + avg spots/cycle for the last BATCH_REPORT_SEC.
+        # Fires even when only one mode had cycles in the window.
+        elapsed = time.monotonic() - self._batch_window_start
+        if elapsed >= BATCH_REPORT_SEC:
+            ft8_cycles = len(self._batch_cycle_times["ft8"])
+            ft4_cycles = len(self._batch_cycle_times["ft4"])
+            ft8_spots = self._batch_spot_counts["ft8"]
+            ft4_spots = self._batch_spot_counts["ft4"]
+            ft8_avg = ft8_spots / ft8_cycles if ft8_cycles else 0.0
+            ft4_avg = ft4_spots / ft4_cycles if ft4_cycles else 0.0
+            logger.info(
+                "psk-uploader-ch: batch %.0fs window: "
+                "ft8 cycles=%d (avg %.1f/cyc, %d total)  "
+                "ft4 cycles=%d (avg %.1f/cyc, %d total)",
+                elapsed, ft8_cycles, ft8_avg, ft8_spots,
+                ft4_cycles, ft4_avg, ft4_spots,
+            )
+            # Reset the window.
+            self._batch_window_start = time.monotonic()
+            self._batch_cycle_times = {"ft8": set(), "ft4": set()}
+            self._batch_spot_counts = {"ft8": 0, "ft4": 0}
