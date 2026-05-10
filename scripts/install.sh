@@ -92,6 +92,24 @@ ui_info "Installing psk-recorder (editable) into venv"
 "$VENV_DIR/bin/pip" install --upgrade pip setuptools wheel >/dev/null
 "$VENV_DIR/bin/pip" install -e "$REPO_SOURCE" >/dev/null
 
+# Overlay our vendored pskreporter.py onto the version pip-installed
+# from the upstream `pjsg/ftlib-pskreporter` package.  Adds two
+# env-var knobs we need (PSKREPORTER_INTERVAL + PSKREPORTER_NO_DEDUP)
+# which upstream hasn't merged yet.  See vendor/pskreporter.py for
+# the full diff vs upstream.  Idempotent: each install overwrites
+# the venv's copy with our patched version.
+VENDOR_PSKREPORTER="$REPO_SOURCE/vendor/pskreporter.py"
+if [[ -f "$VENDOR_PSKREPORTER" ]]; then
+    PYVER=$("$VENV_DIR/bin/python3" -c 'import sys; print(f"python{sys.version_info.major}.{sys.version_info.minor}")')
+    INSTALLED_PSKREPORTER="$VENV_DIR/lib/$PYVER/site-packages/pskreporter.py"
+    if [[ -f "$INSTALLED_PSKREPORTER" ]]; then
+        cp "$VENDOR_PSKREPORTER" "$INSTALLED_PSKREPORTER"
+        ui_info "Overlaid sigmond patches onto $INSTALLED_PSKREPORTER"
+    else
+        ui_warn "$INSTALLED_PSKREPORTER not present — pskreporter package not installed?"
+    fi
+fi
+
 # Post-install verify
 if ! sudo -u "$SERVICE_USER" "$VENV_DIR/bin/python3" -c 'import psk_recorder' 2>/dev/null; then
     ui_error "Post-install verify failed: $SERVICE_USER cannot import psk_recorder"
