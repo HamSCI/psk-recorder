@@ -177,9 +177,33 @@ class SlotWorker:
         return math.floor(latest_start / cadence) * cadence
 
     def _write_spool_wav(self, samples) -> Path:
-        slot_time = time.gmtime(self._next_slot_start)
+        # Filename HHMMSS must be an integer second AND must parse via
+        # ka9q/ft8_lib's `sscanf("%04d%02d%02d%c%02d%02d%02d", ...)`.
+        # Three constraints together:
+        #
+        #   1. 4-digit year — otherwise the parse fails and decode_ft8
+        #      falls back to file mod time → bogus +2.5 s dt bias.
+        #
+        #   2. For FT8 (integer-second slot boundaries :00/:15/:30/:45),
+        #      use slot_start_utc as-is.  dt centers near 0.
+        #
+        #   3. For FT4 half-second slots (:07.5, :22.5, :37.5, :52.5),
+        #      use math.ceil(slot_start_utc) — round UP to the next
+        #      integer second.  Empirically this puts decode_ft8's FT4
+        #      grid alignment 0.5 s past the true slot boundary, which
+        #      it tolerates and reports as dt ≈ +1.0 s.  If we
+        #      truncate instead (the strftime default), decode_ft8
+        #      aligns to the WRONG grid point and reports dt ≈ +7.5 s
+        #      (a full FT4 cadence period off).  Validated on B4-100
+        #      2026-05-11 by renaming the same .wav with different
+        #      second values: floor→+7.5, ceil→+1.0.
+        #
+        # WAV content is still extracted at the true slot_start_utc.
+        # Only the FILENAME label is rounded.
+        ceiled = int(math.ceil(self._next_slot_start))
+        slot_time = time.gmtime(ceiled)
         freq_khz = self._frequency_hz // 1000
-        filename = time.strftime("%y%m%d_%H%M%S", slot_time) + f"_{freq_khz}.wav"
+        filename = time.strftime("%Y%m%d_%H%M%S", slot_time) + f"_{freq_khz}.wav"
         wav_path = self._spool_dir / filename
 
         write_wav(
