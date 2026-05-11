@@ -80,6 +80,12 @@ class HsPskReporterUploader:
         self._transport = None
         self._pump_count = 0
         self._work_count = 0
+        # Cumulative per-mode spot counts shipped to PSK Reporter,
+        # derived from spool-dir deltas across each pump cycle.  Only
+        # populated in spool-dir (FileTreeSource) mode; stays at 0
+        # under ClickHouseSource because the spool is empty there.
+        self._uploaded_ft8 = 0
+        self._uploaded_ft4 = 0
 
     # ----- lifecycle -----
 
@@ -176,22 +182,76 @@ class HsPskReporterUploader:
         while not self._stop.wait(PUMP_INTERVAL_SEC):
             try:
                 self._pump_count += 1
+                # Snapshot per-mode spool counts BEFORE the pump.  The
+                # FileTreeSource consumes .spots.txt files and deletes
+                # them on PSKReporter ack, so the delta across the
+                # pump call IS the count of spots that shipped — no
+                # need to instrument the pipeline internals.  Only
+                # meaningful in spool-dir mode (CH path doesn't write
+                # files); we no-op the count otherwise.
+                ft8_before, ft4_before = self._count_spool_spots()
+
                 if self._uploader is not None and self._uploader.pump():
                     self._work_count += 1
-                    # INFO so `smd psk-watch` (sigmond) has something to
-                    # display.  Only fire on pump-with-work — quiet
-                    # pumps stay silent so the log doesn't churn every
-                    # 30 s when the band is dead.  Counts give operators
-                    # a steady "still alive, still shipping" signal.
+                    ft8_after, ft4_after = self._count_spool_spots()
+                    ft8_shipped = max(0, ft8_before - ft8_after)
+                    ft4_shipped = max(0, ft4_before - ft4_after)
+                    self._uploaded_ft8 += ft8_shipped
+                    self._uploaded_ft4 += ft4_shipped
+                    # INFO so `smd psk-watch` (sigmond) has something
+                    # to display.  Quiet pumps (no work) stay silent
+                    # so the log doesn't churn every 30 s on a dead
+                    # band.  Per-mode counts give the operator the
+                    # signal they actually want: "shipping 50 ft8 and
+                    # 5 ft4 per cycle" reads at a glance, "work=N
+                    # pumps=N" doesn't.
                     logger.info(
-                        "psk-uploader-hs: pump shipped batch "
-                        "(work=%d total, pumps=%d total)",
-                        self._work_count, self._pump_count,
+                        "psk-uploader-hs: shipped ft8=%d ft4=%d "
+                        "(total ft8=%d ft4=%d, work=%d)",
+                        ft8_shipped, ft4_shipped,
+                        self._uploaded_ft8, self._uploaded_ft4,
+                        self._work_count,
                     )
             except Exception:
                 logger.exception(
                     "psk-uploader-hs: unhandled error in pump loop",
                 )
+
+    def _count_spool_spots(self) -> tuple[int, int]:
+        """Sum lines in every .spots.txt under ft8/ and ft4/ subdirs.
+
+        Returns (ft8, ft4).  Returns (0, 0) when spool_dir isn't set
+        (CH-source mode) or the dirs don't exist yet — the delta
+        across a pump becomes 0 in that case and the log line still
+        emits, just with zeros, which is informative ("pump ran but
+        no spool work" hints at CH-source operation).
+        """
+        if self._spool_dir is None:
+            return (0, 0)
+        total_ft8 = 0
+        total_ft4 = 0
+        for mode_dir, target in (("ft8", "ft8"), ("ft4", "ft4")):
+            d = self._spool_dir / mode_dir
+            if not d.is_dir():
+                continue
+            count = 0
+            for spots_file in d.glob("*.spots.txt"):
+                try:
+                    with open(spots_file, "rb") as f:
+                        # Lines = number of decoded spots in this slot.
+                        # bytes mode + sum(1 for _ in f) avoids decoding
+                        # cost; we don't care about content here.
+                        count += sum(1 for _ in f)
+                except OSError:
+                    # Race: file deleted between glob() and open().
+                    # Skip — its rows will appear in the next pump
+                    # cycle (or already did, if deleted on ack).
+                    continue
+            if target == "ft8":
+                total_ft8 = count
+            else:
+                total_ft4 = count
+        return (total_ft8, total_ft4)
 
     # ----- source selection -----
 
