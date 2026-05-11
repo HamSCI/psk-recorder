@@ -59,6 +59,21 @@ class PskRecorder:
         )
         self._lifetime_thread: Optional[threading.Thread] = None
 
+    # Settled-capture gate (V1 fix per
+    # docs/TIMING-PIPELINE-WIRING.md §6.6 / §10.3).  Block on
+    # ensure_channel() until chrony has reported a settled state
+    # for SETTLE_REQUIRED_CYCLES consecutive readings, so the
+    # per-channel ChannelInfo anchors captured by ka9q-python
+    # inherit an ε_0 ≈ 0 system_time.  Without this gate, channels
+    # whose SSRCs were created before chrony settled (or before a
+    # radiod restart) carry stale anchors and produce slot
+    # timestamps wrong by minutes to hours — corrupting psk.spots'
+    # UTC field silently.  Verified 2026-05-11.
+    SETTLE_MAX_OFFSET_S = 0.0001        # 100 µs
+    SETTLE_REQUIRED_CYCLES = 3
+    SETTLE_POLL_SEC = 5.0
+    SETTLE_TIMEOUT_SEC = 60.0           # well below TimeoutStartSec=180
+
     def run(self) -> None:
         """Main entry: provision channels, start streams, block until signal."""
         self._running = True
@@ -66,6 +81,9 @@ class PskRecorder:
         signal.signal(signal.SIGINT, self._on_signal)
 
         try:
+            # V1 fix layer 1: gate ensure_channel() on chrony being
+            # settled.  See docs/TIMING-PIPELINE-WIRING.md §6.6.
+            self._wait_for_chrony_settled()
             self._provision_channels()
             self._start_streams()
             self._start_uploaders()
@@ -78,6 +96,129 @@ class PskRecorder:
             logger.exception("Fatal error in recorder")
         finally:
             self._shutdown()
+
+    def _wait_for_chrony_settled(self) -> bool:
+        """Block until chrony's Last offset has been below
+        ``SETTLE_MAX_OFFSET_S`` for ``SETTLE_REQUIRED_CYCLES``
+        consecutive readings.  Returns True if chrony settled within
+        the timeout, False if we timed out (degraded mode, logged
+        loudly).
+
+        Capturing per-channel anchors when chrony is settled means
+        the ChannelInfo's (gps_time, rtp_timesnap) pair inherits an
+        ε_0 ≈ 0 system_time.  Sample-clock arithmetic in
+        ka9q.rtp_to_wallclock then projects slot start times to
+        true UTC ± ε_now (chrony's current discipline error), not
+        ε_now − ε_0 with ε_0 frozen at the wrong value.
+
+        Silent no-op when chronyc is unavailable.  See
+        docs/TIMING-PIPELINE-WIRING.md §6.6 for the empirical
+        evidence and §10.3 for the architectural pattern.
+        """
+        import subprocess as _sub
+        try:
+            _sub.run(['chronyc', '-h'], capture_output=True, timeout=2.0)
+        except (FileNotFoundError, OSError, _sub.TimeoutExpired):
+            logger.warning(
+                "psk-recorder settled-capture gate: chronyc unavailable — "
+                "channel anchors will be captured without verification "
+                "(ε_0 may be non-zero, V1 not prevented; "
+                "slot timestamps may be silently wrong)"
+            )
+            return False
+
+        consecutive = 0
+        wait_start = time.monotonic()
+        deadline = wait_start + self.SETTLE_TIMEOUT_SEC
+        logger.info(
+            "psk-recorder settled-capture gate: waiting for chrony "
+            "(threshold |Last offset| <= %.0f µs, need %d consecutive readings, "
+            "timeout %.0fs)",
+            self.SETTLE_MAX_OFFSET_S * 1e6,
+            self.SETTLE_REQUIRED_CYCLES,
+            self.SETTLE_TIMEOUT_SEC,
+        )
+        while time.monotonic() < deadline:
+            try:
+                proc = _sub.run(
+                    ['chronyc', '-n', 'tracking'],
+                    capture_output=True, text=True, timeout=5.0,
+                )
+            except (_sub.TimeoutExpired, OSError) as exc:
+                logger.debug("psk-recorder settled-capture: chronyc failed: %s", exc)
+                time.sleep(self.SETTLE_POLL_SEC)
+                consecutive = 0
+                continue
+            if proc.returncode != 0:
+                time.sleep(self.SETTLE_POLL_SEC)
+                consecutive = 0
+                continue
+
+            last_offset = self._parse_chronyc_last_offset(proc.stdout)
+            if last_offset is None:
+                logger.debug(
+                    "psk-recorder settled-capture: could not parse "
+                    "Last offset from chronyc tracking output"
+                )
+                time.sleep(self.SETTLE_POLL_SEC)
+                consecutive = 0
+                continue
+
+            if abs(last_offset) <= self.SETTLE_MAX_OFFSET_S:
+                consecutive += 1
+                logger.info(
+                    "psk-recorder settled-capture: chrony Last offset "
+                    "%+.1f µs OK (%d/%d)",
+                    last_offset * 1e6,
+                    consecutive,
+                    self.SETTLE_REQUIRED_CYCLES,
+                )
+                if consecutive >= self.SETTLE_REQUIRED_CYCLES:
+                    elapsed = time.monotonic() - wait_start
+                    logger.info(
+                        "psk-recorder settled-capture: chrony settled after "
+                        "%.1fs — proceeding to provision channels", elapsed,
+                    )
+                    return True
+            else:
+                if consecutive > 0:
+                    logger.info(
+                        "psk-recorder settled-capture: chrony Last offset "
+                        "%+.1f µs > threshold; resetting counter",
+                        last_offset * 1e6,
+                    )
+                consecutive = 0
+            time.sleep(self.SETTLE_POLL_SEC)
+
+        logger.warning(
+            "psk-recorder settled-capture: timeout after %.0fs — "
+            "proceeding with degraded anchors (slot timestamps may "
+            "be wrong on some channels; visible as future-dated "
+            "WAV filenames per docs/TIMING-PIPELINE-WIRING.md §6.6)",
+            self.SETTLE_TIMEOUT_SEC,
+        )
+        return False
+
+    @staticmethod
+    def _parse_chronyc_last_offset(text: str) -> Optional[float]:
+        """Parse `chronyc tracking`'s ``Last offset`` line.
+
+        Returns the offset in seconds (float), or None if unparseable.
+        Matches the parser in hf-timestd's CoreRecorderV2.
+        """
+        for line in (text or '').splitlines():
+            s = line.strip()
+            if s.startswith('Last offset'):
+                _, _, val = s.partition(':')
+                val = val.strip()
+                if not val:
+                    return None
+                token = val.split()[0]
+                try:
+                    return float(token)
+                except ValueError:
+                    return None
+        return None
 
     def _provision_channels(self) -> None:
         """Create ChannelSinks and register them with MultiStream(s).
