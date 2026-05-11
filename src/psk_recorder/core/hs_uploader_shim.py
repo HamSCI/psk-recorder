@@ -178,6 +178,16 @@ class HsPskReporterUploader:
                 self._pump_count += 1
                 if self._uploader is not None and self._uploader.pump():
                     self._work_count += 1
+                    # INFO so `smd psk-watch` (sigmond) has something to
+                    # display.  Only fire on pump-with-work — quiet
+                    # pumps stay silent so the log doesn't churn every
+                    # 30 s when the band is dead.  Counts give operators
+                    # a steady "still alive, still shipping" signal.
+                    logger.info(
+                        "psk-uploader-hs: pump shipped batch "
+                        "(work=%d total, pumps=%d total)",
+                        self._work_count, self._pump_count,
+                    )
             except Exception:
                 logger.exception(
                     "psk-uploader-hs: unhandled error in pump loop",
