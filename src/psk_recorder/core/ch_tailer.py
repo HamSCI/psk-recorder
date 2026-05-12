@@ -536,9 +536,17 @@ def _default_writer_factory(batch_rows: int):
     Sigmond core stays stdlib-only; this import only happens when a
     tailer actually starts, and the writer is itself a no-op when CH
     is not configured.
+
+    `schema_version=2` matches the live psk.spots migration tier
+    (CH migration 002_add_jt9_columns.sql, registry hash
+    8ee544049db79fd0 in hs_uploader.schema._BUILTINS).  Consumers —
+    both `ClickHouseSource.accepted_schema_versions=[2]` and the new
+    `SqliteSource` filter on this — so the producer must tag rows at
+    the matching version or the SqliteSource silently treats them as
+    stale-schema and yields nothing.
     """
     from sigmond.hamsci_ch import Writer
     return Writer.from_env(
         table="spots", mode="psk",
-        schema_version=1, batch_rows=batch_rows,
+        schema_version=2, batch_rows=batch_rows,
     )
