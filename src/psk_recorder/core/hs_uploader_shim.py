@@ -81,11 +81,16 @@ class HsPskReporterUploader:
         self._pump_count = 0
         self._work_count = 0
         # Cumulative per-mode spot counts shipped to PSK Reporter,
-        # derived from spool-dir deltas across each pump cycle.  Only
-        # populated in spool-dir (FileTreeSource) mode; stays at 0
-        # under ClickHouseSource because the spool is empty there.
+        # accumulated from the hs-uploader on_batch_outcome callback
+        # (see _on_batch_outcome below).  Works uniformly across
+        # ClickHouseSource / SqliteSource / FileTreeSource — replaces
+        # the spool-dir delta logic that only worked for the file path.
         self._uploaded_ft8 = 0
         self._uploaded_ft4 = 0
+        # Per-pump tallies; reset to 0 at the top of each pump cycle
+        # so the journal log line reports just this cycle's deltas.
+        self._pump_ft8 = 0
+        self._pump_ft4 = 0
 
     # ----- lifecycle -----
 
@@ -144,7 +149,16 @@ class HsPskReporterUploader:
             retry=RetryPolicy.exponential(base=2.0, cap_sec=300.0),
             batch_limit=500,
         )
-        self._uploader = Uploader([pipeline])
+        # `on_batch_outcome` counts shipped records per-mode directly
+        # from `batch.records`.  Works uniformly across CH / SQLite /
+        # file sources — the previous spool-dir delta only counted
+        # under FileTreeSource and read 0 under SqliteSource (see the
+        # comment at _count_spool_spots() below for the historical
+        # constraint that's now lifted).
+        self._uploader = Uploader(
+            [pipeline],
+            on_batch_outcome=self._on_batch_outcome,
+        )
 
         self._stop.clear()
         self._thread = threading.Thread(
@@ -182,22 +196,16 @@ class HsPskReporterUploader:
         while not self._stop.wait(PUMP_INTERVAL_SEC):
             try:
                 self._pump_count += 1
-                # Snapshot per-mode spool counts BEFORE the pump.  The
-                # FileTreeSource consumes .spots.txt files and deletes
-                # them on PSKReporter ack, so the delta across the
-                # pump call IS the count of spots that shipped — no
-                # need to instrument the pipeline internals.  Only
-                # meaningful in spool-dir mode (CH path doesn't write
-                # files); we no-op the count otherwise.
-                ft8_before, ft4_before = self._count_spool_spots()
+                # Reset per-pump per-mode tallies; the on_batch_outcome
+                # callback fires inside pump() and fills these in.
+                # Works across CH / SQLite / file sources uniformly.
+                self._pump_ft8 = 0
+                self._pump_ft4 = 0
 
                 if self._uploader is not None and self._uploader.pump():
                     self._work_count += 1
-                    ft8_after, ft4_after = self._count_spool_spots()
-                    ft8_shipped = max(0, ft8_before - ft8_after)
-                    ft4_shipped = max(0, ft4_before - ft4_after)
-                    self._uploaded_ft8 += ft8_shipped
-                    self._uploaded_ft4 += ft4_shipped
+                    self._uploaded_ft8 += self._pump_ft8
+                    self._uploaded_ft4 += self._pump_ft4
                     # INFO so `smd psk-watch` (sigmond) has something
                     # to display.  Quiet pumps (no work) stay silent
                     # so the log doesn't churn every 30 s on a dead
@@ -208,7 +216,7 @@ class HsPskReporterUploader:
                     logger.info(
                         "psk-uploader-hs: shipped ft8=%d ft4=%d "
                         "(total ft8=%d ft4=%d, work=%d)",
-                        ft8_shipped, ft4_shipped,
+                        self._pump_ft8, self._pump_ft4,
                         self._uploaded_ft8, self._uploaded_ft4,
                         self._work_count,
                     )
@@ -217,41 +225,25 @@ class HsPskReporterUploader:
                     "psk-uploader-hs: unhandled error in pump loop",
                 )
 
-    def _count_spool_spots(self) -> tuple[int, int]:
-        """Sum lines in every .spots.txt under ft8/ and ft4/ subdirs.
+    def _on_batch_outcome(self, pipeline, batch, outcome) -> None:
+        """hs-uploader callback: tally per-mode records as they ship.
 
-        Returns (ft8, ft4).  Returns (0, 0) when spool_dir isn't set
-        (CH-source mode) or the dirs don't exist yet — the delta
-        across a pump becomes 0 in that case and the log line still
-        emits, just with zeros, which is informative ("pump ran but
-        no spool work" hints at CH-source operation).
+        Only count on ``acked`` / ``partial_ack`` — ``retry_later`` and
+        ``permanent`` mean the records didn't reach PSKReporter on
+        this attempt.  partial_ack is approximate (the record list
+        includes the records the transport tried; rejects within the
+        batch still get counted), but PskReporterTcp's normal flow is
+        all-or-nothing.
         """
-        if self._spool_dir is None:
-            return (0, 0)
-        total_ft8 = 0
-        total_ft4 = 0
-        for mode_dir, target in (("ft8", "ft8"), ("ft4", "ft4")):
-            d = self._spool_dir / mode_dir
-            if not d.is_dir():
-                continue
-            count = 0
-            for spots_file in d.glob("*.spots.txt"):
-                try:
-                    with open(spots_file, "rb") as f:
-                        # Lines = number of decoded spots in this slot.
-                        # bytes mode + sum(1 for _ in f) avoids decoding
-                        # cost; we don't care about content here.
-                        count += sum(1 for _ in f)
-                except OSError:
-                    # Race: file deleted between glob() and open().
-                    # Skip — its rows will appear in the next pump
-                    # cycle (or already did, if deleted on ack).
-                    continue
-            if target == "ft8":
-                total_ft8 = count
-            else:
-                total_ft4 = count
-        return (total_ft8, total_ft4)
+        if outcome.kind not in ("acked", "partial_ack"):
+            return
+        for r in batch.records:
+            cols = r.columns or {}
+            mode = str(cols.get("mode", "")).lower()
+            if mode == "ft8":
+                self._pump_ft8 += 1
+            elif mode == "ft4":
+                self._pump_ft4 += 1
 
     # ----- source selection -----
 
