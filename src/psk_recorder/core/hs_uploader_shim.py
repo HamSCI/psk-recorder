@@ -256,47 +256,59 @@ class HsPskReporterUploader:
     # ----- source selection -----
 
     def _build_source(self):
-        """Pick CH or file-fallback based on env.
+        """Pick the source based on env, in priority order:
 
-        ``SIGMOND_CLICKHOUSE_URL`` set → ClickHouseSource (the 5c.2
-        path).  Unset → FileTreeSource over the per-slot spool, which
-        the SlotWorker populates only when this combination of envs is
-        active (PSK_USE_HS_UPLOADER=1 + CH absent).
+        1. ``SIGMOND_CLICKHOUSE_URL`` set → ``ClickHouseSource`` (the
+           pre-migration path; matches upstream wsprdaemon-server shape).
+        2. ``SIGMOND_SQLITE_PATH`` set, OR the default sink
+           ``/var/lib/sigmond/sink.db`` exists → ``SqliteSource`` (the
+           post-``smd storage migrate-to-sqlite`` default; producer-side
+           is ``sigmond.hamsci_ch.SqliteWriter``).
+        3. Else fall through to the per-slot ``FileTreeSource`` — the
+           SlotWorker populates that spool when CH is absent AND no
+           local SQLite sink is configured either.
+
+        The same `database`, `table`, `select_columns`, and `extra_where`
+        kwargs flow through CH and SQLite paths so the same multi-
+        instance scoping (``radiod_id`` filter) and column projection
+        apply in both backends.
         """
+        # ----- shared (CH + SQLite) selection args -----
+        common_kwargs = dict(
+            database="psk",
+            table="spots",
+            accepted_schema_versions=[2],
+            primary_key_columns=[
+                # psk.spots ORDER BY tuple — tiebreak hash takes this
+                # set so two rows with identical (host_call, mode,
+                # frequency, time, message) tie on cityHash64 and ship
+                # in a stable order.  Ignored by SqliteSource (id is
+                # the natural monotone cursor) but kept for API parity.
+                "host_call", "mode", "frequency", "time", "message",
+            ],
+            select_columns=[
+                "time", "frequency", "mode", "snr_db", "tx_call",
+                "grid", "score", "message",
+            ],
+            cursor_column="ingested_at",
+            extra_where=[
+                ("radiod_id", "=", self._radiod_id),
+                ("tx_call", "!=", ""),
+                ("mode", "IN", ["ft8", "ft4"]),
+            ],
+            # First-pump-after-fresh-watermark anchor: start at
+            # wallclock-now, not epoch.  Without this, an empty
+            # watermark.db (first deploy, lost state, switched
+            # uploaders) re-ships every historical row, which the
+            # legacy uploader has likely already shipped —
+            # PSKReporter shows duplicates.
+            start_at="now",
+        )
+
         if os.environ.get("SIGMOND_CLICKHOUSE_URL"):
             try:
                 from hs_uploader.sources.clickhouse import ClickHouseSource
-                return ClickHouseSource.from_env(
-                    database="psk", table="spots",
-                    accepted_schema_versions=[2],
-                    primary_key_columns=[
-                        # psk.spots ORDER BY tuple — tiebreak hash takes
-                        # this set so two rows with identical (host_call,
-                        # mode, frequency, time, message) tie on
-                        # cityHash64 and ship in a stable order.
-                        "host_call", "mode", "frequency", "time", "message",
-                    ],
-                    select_columns=[
-                        "time", "frequency", "mode", "snr_db", "tx_call",
-                        "grid", "score", "message",
-                    ],
-                    cursor_column="ingested_at",
-                    extra_where=[
-                        ("radiod_id", "=", self._radiod_id),
-                        ("tx_call", "!=", ""),
-                        ("mode", "IN", ["ft8", "ft4"]),
-                    ],
-                    # First-pump-after-fresh-watermark anchor: start at
-                    # wallclock-now, not epoch.  Without this, an empty
-                    # watermark.db (first deploy, lost state, switched
-                    # uploaders) re-ships every historical row in
-                    # psk.spots, which the legacy uploader has likely
-                    # already shipped — PSKReporter shows duplicates.
-                    # Once a watermark exists, restarts resume from it
-                    # and start_at is ignored (per ClickHouseSource's
-                    # contract).
-                    start_at="now",
-                )
+                return ClickHouseSource.from_env(**common_kwargs)
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "psk-uploader-hs: ClickHouseSource construct failed: %s",
@@ -304,10 +316,31 @@ class HsPskReporterUploader:
                 )
                 return None
 
+        # SQLite path — preferred when CH is absent because
+        # `smd storage migrate-to-sqlite` writes the producer half
+        # (sigmond.hamsci_ch.SqliteWriter) but the consumer (this shim)
+        # has to be told to read from the queue.  Try construction
+        # unconditionally; SqliteSource.from_env returns a no-op source
+        # when neither SIGMOND_SQLITE_PATH nor the default file exists.
+        try:
+            from hs_uploader.sources.sqlite import SqliteSource, HEALTH_NOOP
+            sqlite_src = SqliteSource.from_env(**common_kwargs)
+            if sqlite_src.health() != HEALTH_NOOP:
+                logger.info(
+                    "psk-uploader-hs: using SqliteSource (sink at %s)",
+                    sqlite_src._config.path if sqlite_src._config else "?",
+                )
+                return sqlite_src
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "psk-uploader-hs: SqliteSource construct failed: %s",
+                exc,
+            )
+
         if self._spool_dir is None:
             logger.warning(
-                "psk-uploader-hs: no SIGMOND_CLICKHOUSE_URL and no spool_dir — "
-                "neither source available",
+                "psk-uploader-hs: no SIGMOND_CLICKHOUSE_URL, no SQLite "
+                "sink, and no spool_dir — neither source available",
             )
             return None
 

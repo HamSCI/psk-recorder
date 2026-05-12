@@ -165,7 +165,7 @@ def test_lifecycle_thread_starts_and_stops(monkeypatch, tmp_path):
 
 
 def test_no_source_is_clean_noop(monkeypatch, tmp_path, caplog):
-    """No CH and no spool_dir → start is a clean no-op.
+    """No CH, no SQLite, and no spool_dir → start is a clean no-op.
 
     Without a source the pump has nothing to do; spawning a thread
     just to spin would burn cycles, so start() returns early and
@@ -173,6 +173,8 @@ def test_no_source_is_clean_noop(monkeypatch, tmp_path, caplog):
     """
     monkeypatch.setenv("HS_UPLOADER_STATE_DIR", str(tmp_path))
     monkeypatch.delenv("SIGMOND_CLICKHOUSE_URL", raising=False)
+    monkeypatch.delenv("SIGMOND_SQLITE_PATH", raising=False)
+    _disable_default_sqlite_sink(monkeypatch)
 
     u = HsPskReporterUploader(
         callsign="AC0G/B1", grid_square="EM38ww", radiod_id="rid1",
@@ -186,12 +188,28 @@ def test_no_source_is_clean_noop(monkeypatch, tmp_path, caplog):
     )
 
 
+def _disable_default_sqlite_sink(monkeypatch):
+    """Force SqliteSource.from_env to return a no-op source.
+
+    Without this, a test host that happens to have
+    `/var/lib/sigmond/sink.db` present (e.g. ran a migrate dry-run)
+    would silently pick SqliteSource over the file fallback.
+    """
+    import hs_uploader.sources.sqlite as sqlite_mod
+    monkeypatch.setattr(
+        sqlite_mod._ConnectionConfig, "from_env",
+        classmethod(lambda cls, env=None: None),
+    )
+
+
 def test_file_fallback_picks_up_spool_files(monkeypatch, tmp_path):
     """With no CH and a spool_dir containing per-slot files, the shim
     builds a FileTreeSource that finds them and fans them out into
     one Record per parsed line."""
     monkeypatch.setenv("HS_UPLOADER_STATE_DIR", str(tmp_path))
     monkeypatch.delenv("SIGMOND_CLICKHOUSE_URL", raising=False)
+    monkeypatch.delenv("SIGMOND_SQLITE_PATH", raising=False)
+    _disable_default_sqlite_sink(monkeypatch)
 
     # Mirror what SlotWorker writes: <spool>/<radiod>/<mode>/<slot>.spots.txt
     spool = tmp_path / "spool" / "rid1"
@@ -223,6 +241,8 @@ def test_file_fallback_picks_up_spool_files(monkeypatch, tmp_path):
 
 def test_file_fallback_skips_unparseable_lines(tmp_path, monkeypatch):
     monkeypatch.delenv("SIGMOND_CLICKHOUSE_URL", raising=False)
+    monkeypatch.delenv("SIGMOND_SQLITE_PATH", raising=False)
+    _disable_default_sqlite_sink(monkeypatch)
     spool = tmp_path / "rid1"
     ft8 = spool / "ft8"
     ft8.mkdir(parents=True)
@@ -274,3 +294,74 @@ def test_ch_env_takes_precedence_over_spool(monkeypatch, tmp_path):
     src = u._build_source()  # noqa: SLF001
     # ClickHouseSource — the schema-validation query went out.
     assert type(src).__name__ == "ClickHouseSource"
+
+
+def test_sqlite_source_picked_when_sigmond_sqlite_path_set(monkeypatch, tmp_path):
+    """`SIGMOND_SQLITE_PATH` set + no CH → shim picks SqliteSource.
+
+    Mirrors the post-`smd storage migrate-to-sqlite` host shape: the
+    producer's hamsci_ch.SqliteWriter has written rows to the queue
+    table, and the shim drains them via SqliteSource → PskReporterTcp.
+    """
+    import sqlite3
+    monkeypatch.setenv("HS_UPLOADER_STATE_DIR", str(tmp_path))
+    monkeypatch.delenv("SIGMOND_CLICKHOUSE_URL", raising=False)
+    sink = tmp_path / "sink.db"
+    # Materialise the queue table so SqliteSource doesn't go to
+    # HEALTH_UNREACHABLE on the first poll — same shape the writer
+    # creates on its first flush.
+    conn = sqlite3.connect(sink)
+    conn.execute(
+        "CREATE TABLE pending_uploads ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "target_db TEXT, target_table TEXT, "
+        "schema_version INTEGER, payload_json TEXT, queued_at TEXT)"
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setenv("SIGMOND_SQLITE_PATH", str(sink))
+
+    u = HsPskReporterUploader(
+        callsign="AC0G", grid_square="EM38ww", radiod_id="rid1",
+        spool_dir=tmp_path / "unused-spool",
+    )
+    src = u._build_source()  # noqa: SLF001
+    assert type(src).__name__ == "SqliteSource"
+    assert src.source_id() == "sqlite:psk.spots"
+
+
+def test_ch_takes_precedence_over_sqlite(monkeypatch, tmp_path):
+    """When both CH and SQLite env are set, CH wins.
+
+    Matches the documented priority: SIGMOND_CLICKHOUSE_URL → CH,
+    SIGMOND_SQLITE_PATH → SQLite, else file.  Operators flipping from
+    CH to SQLite go via `smd storage migrate-to-sqlite`, which
+    neutralises SIGMOND_CLICKHOUSE_URL — so on a healthy host only
+    one of the two is set.
+    """
+    monkeypatch.setenv("HS_UPLOADER_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("SIGMOND_CLICKHOUSE_URL", "http://localhost:8123")
+    monkeypatch.setenv("SIGMOND_CLICKHOUSE_USER", "test")
+    monkeypatch.setenv("SIGMOND_SQLITE_PATH", str(tmp_path / "sink.db"))
+
+    fake_client = MagicMock()
+    fake_client.query = MagicMock(side_effect=lambda *a, **kw: _ch_columns_fixture())
+    from hs_uploader.sources import clickhouse as ch_mod
+    monkeypatch.setattr(
+        ch_mod, "_default_client_factory", lambda cfg: fake_client,
+    )
+
+    u = HsPskReporterUploader(
+        callsign="AC0G", grid_square="EM38ww", radiod_id="rid1",
+        spool_dir=tmp_path / "unused-spool",
+    )
+    src = u._build_source()  # noqa: SLF001
+    assert type(src).__name__ == "ClickHouseSource"
+
+
+def _ch_columns_fixture():
+    """Minimal CH client `query()` response — used by the priority test."""
+    r = MagicMock()
+    r.result_rows = [("time", "DateTime"), ("ingested_at", "DateTime")]
+    r.column_names = ["name", "type"]
+    return r
