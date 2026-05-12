@@ -30,6 +30,45 @@ from psk_recorder.core.hs_uploader_shim import HsPskReporterUploader
 logger = logging.getLogger(__name__)
 
 
+def _env_float(name: str, default: float, *, scale: float = 1.0) -> float:
+    """Parse a positive float env var.  `scale` converts the env-var
+    unit to the constant's unit (e.g. 1e-6 for µs→s) and is applied
+    consistently to BOTH the env value and the default so the caller
+    states `default` in the env-var's natural unit.  Invalid or
+    non-positive values fall back to `default * scale` with a warning."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default * scale
+    try:
+        v = float(raw) * scale
+        if v <= 0:
+            raise ValueError("must be > 0")
+        return v
+    except (ValueError, TypeError):
+        logger.warning(
+            "psk-recorder: ignoring invalid %s=%r (using default %g)",
+            name, raw, default,
+        )
+        return default * scale
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        v = int(raw)
+        if v < 1:
+            raise ValueError("must be >= 1")
+        return v
+    except (ValueError, TypeError):
+        logger.warning(
+            "psk-recorder: ignoring invalid %s=%r (using default %d)",
+            name, raw, default,
+        )
+        return default
+
+
 class PskRecorder:
     """Manages all FT4/FT8 channels for a single radiod."""
 
@@ -69,10 +108,37 @@ class PskRecorder:
     # radiod restart) carry stale anchors and produce slot
     # timestamps wrong by minutes to hours — corrupting psk.spots'
     # UTC field silently.  Verified 2026-05-11.
-    SETTLE_MAX_OFFSET_S = 0.0001        # 100 µs
-    SETTLE_REQUIRED_CYCLES = 3
-    SETTLE_POLL_SEC = 5.0
-    SETTLE_TIMEOUT_SEC = 60.0           # well below TimeoutStartSec=180
+    #
+    # Defaults assume bare-metal hosts with hardware GPS PPS where
+    # chrony tracks within tens of µs.  On VMs and hosts with looser
+    # discipline, chrony's Last offset may stably sit at 200-500 µs
+    # — the 100 µs default would always time out.  Each constant
+    # below is overridable via the matching `PSK_SETTLE_*` env var:
+    #
+    #   PSK_SETTLE_MAX_OFFSET_US     ceiling on |Last offset| (µs).
+    #                                Set to e.g. 1000 on a VM.
+    #   PSK_SETTLE_REQUIRED_CYCLES   consecutive settled polls before
+    #                                we consider chrony stable.
+    #   PSK_SETTLE_POLL_SEC          poll interval (s).
+    #   PSK_SETTLE_TIMEOUT_SEC       overall wait cap (s) before
+    #                                proceeding with degraded anchors.
+    #
+    # All env reads happen at class-load time (process start), so a
+    # restart picks up the new value.  Invalid values fall back to
+    # the conservative default and log a warning at gate time.
+    # Resolved at module-load time; env overrides apply per process.
+    SETTLE_MAX_OFFSET_S = _env_float(
+        "PSK_SETTLE_MAX_OFFSET_US", 100.0, scale=1e-6,
+    )
+    SETTLE_REQUIRED_CYCLES = _env_int(
+        "PSK_SETTLE_REQUIRED_CYCLES", 3,
+    )
+    SETTLE_POLL_SEC = _env_float(
+        "PSK_SETTLE_POLL_SEC", 5.0,
+    )
+    SETTLE_TIMEOUT_SEC = _env_float(
+        "PSK_SETTLE_TIMEOUT_SEC", 60.0,
+    )
 
     def run(self) -> None:
         """Main entry: provision channels, start streams, block until signal."""
