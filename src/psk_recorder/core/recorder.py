@@ -298,7 +298,12 @@ class PskRecorder:
 
         status = resolve_radiod_status(self._radiod)
         logger.info("Connecting to radiod at %s", status)
-        self._control = RadiodControl(status)
+        # client_id makes ka9q-python derive a per-(client, radiod)
+        # multicast destination so this recorder's channels never share
+        # a multicast group with peer clients on the same radiod
+        # (wspr-recorder, hfdl-recorder, hf-timestd, etc.).  CONTRACT
+        # v0.3 §7 / ka9q-python ≥ 3.14.0.
+        self._control = RadiodControl(status, client_id="psk-recorder")
 
         # Surface the Fusion governor identity at startup so the journal
         # record makes multi-radiod attribution clear. See
