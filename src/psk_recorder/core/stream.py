@@ -5,33 +5,40 @@ thread of its own for RTP reception — it receives sample batches via
 the `on_samples` callback that a shared `MultiStream` dispatches after
 demultiplexing by SSRC.
 
-Timing anchoring (rtp_to_wallclock authority — 2026-05-10).
-We timestamp each delivered batch via ka9q.rtp_to_wallclock(rtp_ts,
-channel_info), which converts the RTP timestamp of the batch's first
-sample to UTC using radiod's GPS_TIME / RTP_TIMESNAP snapshot.  This
-is the canonical source of truth for sample wall-clock — radiod
-captures the GPS-disciplined time once and we extrapolate from RTP
-sample positions, completely independent of:
+Timing model (anchor-once, sample-count projection — 2026-05-13).
 
-  - this host's system clock (chrony, NTP, GPSDO)
-  - hf-timestd's authority offset (now redundant for our anchor)
-  - startup-time accumulator state in MultiStream / the resequencer
+  1. On the FIRST on_samples batch, we read one wall-clock anchor and
+     save the corresponding total_samples_delivered counter.  Preferred
+     source: ka9q.rtp_to_wallclock(first_rtp, channel_info), which gives
+     us radiod's GPS_TIME / RTP_TIMESNAP snapshot — and hf-timestd's
+     chain_delay_correction_ns if hf-timestd is publishing.  Fallback
+     when channel_info is unavailable: `time.time()` minus n/sample_rate.
 
-Previous design anchored via `time.time() - samples_so_far/rate` at
-the first on_samples call.  When the channel had been live in radiod
-before psk-recorder subscribed (the normal case after a process
-restart on a long-running radiod), `samples_so_far` already reflected
-hundreds of seconds of MultiStream-side accounting (resequencer
-startup batching, gap fills) so the wall-clock anchor was off by
-that span.  Effect: every WAV slot's labelled UTC was systematically
-EARLY by ~2-3 seconds, decoders reported FT8 DT clustering at +2.79s
-mean (B4-100 2026-05-10), and 73.7% of decodes were outside the
-nominal ±2.5s slot tolerance — most were not decoded at all.
+  2. Every subsequent batch's UTC is computed by pure sample-count
+     projection from the anchor:
+         utc_of_first = anchor_utc + (total_delivered - n - anchor_total) / sr
+     No wall-clock re-reads. No channel_info refreshes.  This mirrors
+     the wspr-recorder BandRecorder design (grid-propagated minute
+     wallclocks via `first_wallclock + 60 * minute_count`) and is what
+     guarantees every WAV / slot has exactly the same sample count
+     and identical alignment to its predecessors.
 
-rtp_to_wallclock applies hf-timestd's chain_delay_correction_ns
-(measured by the L6 BPSK PPS calibrator, attached to the channel
-info on discovery) automatically, so the recorder still benefits
-from the RF→ADC→DSP latency calibration without managing it here.
+  3. Gross-error tripwire: every batch we compute the delta between
+     projected UTC and current wall clock.  If `|delta| > GROSS_THRESHOLD_SEC`
+     for `GROSS_TRIPS_FOR_EXIT` consecutive batches, the recorder exits
+     non-zero so systemd can restart it with a fresh anchor.  The
+     threshold is set generously above FT8's ±2.5s decoder tolerance
+     (so a trip means "decodes have been silently zero for some time")
+     and small enough that a single missed cycle gets us a restart.
+
+Previous design (rtp_to_wallclock per batch, with channel_info refresh
+on stream-restored) re-anchored the timing whenever a multicast gap
+recovered.  Each refresh adopted radiod's then-current view of UTC,
+introducing a wall-clock dependency that occasionally cascaded into
+"decodes=N/N but spots=0" states (B4-100, 2026-05-13: PSK silently
+fell from 275 spots/min to 0 over a few minutes; stop+start was the
+only known cure).  The anchor-once model with a restart tripwire
+removes both the silent-degradation surface AND the manual recovery.
 """
 
 from __future__ import annotations
@@ -51,6 +58,11 @@ from psk_recorder.core.slot import SlotWorker
 logger = logging.getLogger(__name__)
 
 RING_SECONDS = 60.0
+
+# Anchor-once gross-error tripwire (see module docstring).
+GROSS_THRESHOLD_SEC = 2.0       # |projected_utc − wall_now| that counts as a trip
+GROSS_TRIPS_FOR_EXIT = 3        # consecutive trips before sys.exit (restart)
+GROSS_EXIT_CODE = 75            # EX_TEMPFAIL — systemd sees it and restarts
 
 
 class ChannelSink:
@@ -101,16 +113,21 @@ class ChannelSink:
 
         self._total_delivered: int = 0
         # ChannelInfo carrying gps_time / rtp_timesnap / chain_delay
-        # — required for ka9q.rtp_to_wallclock(); set by the recorder via
-        # set_channel_info() right after multi.add_channel() returns.
+        # — used ONCE to derive the initial anchor via rtp_to_wallclock.
+        # After the first batch the anchor is frozen; channel_info refreshes
+        # from on_stream_restored() are deliberately ignored.
         self._channel_info = None
-        # Whether we've already logged the "no channel_info, falling back"
-        # warning — keeps the log noise to one line per channel even when
-        # rtp_to_wallclock can't be used.
-        self._fallback_warned: bool = False
+        # Anchor-once state (see module docstring).  Set on the first
+        # on_samples() batch; never re-set afterwards.
+        self._anchor_utc: Optional[float] = None
+        self._anchor_total_samples: int = 0
+        self._anchor_source: str = ""        # diagnostic: "rtp_to_wallclock" | "wallclock_fallback"
+        # Gross-error tripwire state — count of consecutive batches with
+        # |projected − wall| > threshold.  Resets to 0 on any clean check.
+        self._gross_trips: int = 0
         # Authority reader is retained so other consumers (e.g., diags)
         # can still inspect what hf-timestd is publishing.  Not used for
-        # anchoring anymore — rtp_to_wallclock is the source of truth.
+        # anchoring anymore — the one-shot anchor read is the only path.
         self._reader = authority_reader if authority_reader is not None else AuthorityReader()
 
     @property
@@ -155,71 +172,122 @@ class ChannelSink:
         self._channel_info = channel_info
 
     def on_samples(self, samples: np.ndarray, quality) -> None:
-        """MultiStream callback — timestamp via rtp_to_wallclock, push to ring.
+        """MultiStream callback — anchor once, then sample-count project.
 
-        For each batch we compute the RTP timestamp of the first sample
-        as `first_rtp_timestamp + batch_start_sample` and convert it to
-        UTC via ka9q.rtp_to_wallclock().  This ties every sample to
-        radiod's GPS-disciplined RTP_TIMESNAP/GPS_TIME pair, independent
-        of the host clock and the MultiStream-side accumulator state.
+        First batch sets `_anchor_utc` + `_anchor_total_samples` via
+        rtp_to_wallclock (preferred) or `time.time()` (fallback).  Every
+        subsequent batch's UTC is computed by pure sample-count
+        projection — no wall-clock reads, no channel_info refreshes.
+
+        Every batch also runs the gross-error tripwire: if projected UTC
+        diverges from wall clock by more than GROSS_THRESHOLD_SEC for
+        GROSS_TRIPS_FOR_EXIT consecutive batches, we sys.exit() and let
+        systemd restart us with a fresh anchor.
         """
         n = len(samples)
         if n == 0:
             return
 
-        utc_of_first: Optional[float] = None
-        if self._channel_info is not None:
-            utc_of_first = self._utc_from_rtp(samples, quality)
+        if self._anchor_utc is None:
+            anchor, source = self._compute_initial_anchor(samples, quality)
+            if anchor is None:
+                # rtp_to_wallclock failed AND time.time() somehow returned
+                # something useless — extremely rare; defer to the next
+                # batch rather than push samples with a bogus UTC.
+                return
+            self._anchor_utc = anchor
+            self._anchor_total_samples = quality.total_samples_delivered - n
+            self._anchor_source = source
+            logger.info(
+                "%s %d Hz: anchored via %s at UTC %.3f (sample %d, "
+                "wall delta %+.3fs)",
+                self._mode.upper(), self._frequency_hz, source,
+                self._anchor_utc, self._anchor_total_samples,
+                self._anchor_utc - time.time(),
+            )
 
-        if utc_of_first is None:
-            # Fallback path — the channel's GPS_TIME/RTP_TIMESNAP wasn't
-            # populated (very old radiod, or discovery hasn't snapped yet).
-            # Use the prior wall-clock anchor logic just enough to keep
-            # going; warn once.
-            utc_of_first = self._fallback_wallclock_utc(quality, n)
-            if not self._fallback_warned:
-                self._fallback_warned = True
-                logger.warning(
-                    "%s %d Hz: rtp_to_wallclock unavailable (channel_info=%s, "
-                    "gps_time=%s) — using wall-clock fallback; FT8 DT may drift",
-                    self._mode.upper(), self._frequency_hz,
-                    "set" if self._channel_info is not None else "unset",
-                    getattr(self._channel_info, "gps_time", None)
-                    if self._channel_info else None,
-                )
+        # Pure sample-count projection — the timing invariant the user
+        # asked for (and the same model wspr-recorder's BandRecorder uses).
+        delta_samples = (
+            quality.total_samples_delivered - n - self._anchor_total_samples
+        )
+        utc_of_first = (
+            self._anchor_utc + delta_samples / self._sample_rate
+        )
+
+        self._gross_error_check(utc_of_first, n)
 
         self._ring.push(samples, utc_of_first)
         self._total_delivered = quality.total_samples_delivered
 
-    def _utc_from_rtp(self, samples: np.ndarray, quality) -> Optional[float]:
-        """Compute UTC of first sample in batch via rtp_to_wallclock.
+    def _compute_initial_anchor(self, samples: np.ndarray, quality):
+        """Return (anchor_utc, source) for the very first batch.
 
-        RTP timestamps increment by 1 per output sample, so the first
-        sample of this batch has RTP TS = first_rtp_timestamp +
-        batch_start_sample (mod 2**32).  rtp_to_wallclock then converts
-        that to UTC seconds using radiod's GPS_TIME/RTP_TIMESNAP snapshot.
+        Preferred: rtp_to_wallclock — includes hf-timestd's chain delay
+        correction when authority is published.  Fallback: time.time()
+        adjusted to "UTC of first sample in this batch".  Either way,
+        this is the ONLY wall-clock read for the recorder's lifetime.
         """
-        from ka9q import rtp_to_wallclock
+        n = len(samples)
+        if self._channel_info is not None:
+            try:
+                from ka9q import rtp_to_wallclock
+                first_rtp = getattr(quality, "first_rtp_timestamp", 0)
+                if first_rtp != 0:
+                    batch_start_sample = quality.total_samples_delivered - n
+                    rtp_ts = (first_rtp + batch_start_sample) & 0xFFFFFFFF
+                    utc = rtp_to_wallclock(rtp_ts, self._channel_info)
+                    if utc is not None:
+                        return utc, "rtp_to_wallclock"
+            except Exception as exc:                # noqa: BLE001
+                logger.warning(
+                    "%s %d Hz: rtp_to_wallclock raised on anchor: %s",
+                    self._mode.upper(), self._frequency_hz, exc,
+                )
+        # Wall-clock fallback: time.time() *is* the UTC of "right now",
+        # so the UTC of this batch's FIRST sample is (now - n/sample_rate).
+        return time.time() - n / self._sample_rate, "wallclock_fallback"
 
-        first_rtp = getattr(quality, "first_rtp_timestamp", 0)
-        if first_rtp == 0:
-            return None  # not yet populated by MultiStream
-        batch_start_sample = quality.total_samples_delivered - len(samples)
-        rtp_ts = (first_rtp + batch_start_sample) & 0xFFFFFFFF
-        return rtp_to_wallclock(rtp_ts, self._channel_info)
-
-    def _fallback_wallclock_utc(self, quality, n: int) -> float:
-        """Best-effort UTC when rtp_to_wallclock can't run.
-
-        Anchors at first call, extrapolates from sample count thereafter.
-        Inherits all the host-clock-vs-radiod-counter drift the rtp path
-        was meant to eliminate, but at least the WAV files keep flowing.
+    def _gross_error_check(self, utc_of_first: float, n: int) -> None:
+        """Trip if projected UTC is far enough from wall clock to break
+        FT8 / FT4 alignment.  Exits non-zero on sustained trip.
         """
-        if not hasattr(self, "_fb_anchor_utc"):
-            self._fb_anchor_utc = time.time()
-            self._fb_anchor_total = quality.total_samples_delivered
-        delta_samples = quality.total_samples_delivered - n - self._fb_anchor_total
-        return self._fb_anchor_utc + delta_samples / self._sample_rate
+        # Compare projected UTC of the LAST sample in this batch to
+        # wall_now — both are "what UTC is right now from each side".
+        projected_now = utc_of_first + n / self._sample_rate
+        delta = projected_now - time.time()
+        if abs(delta) > GROSS_THRESHOLD_SEC:
+            self._gross_trips += 1
+            # Log the first trip + every 50th thereafter to avoid spam
+            # but make the steady-state visible.
+            if (self._gross_trips == 1
+                    or self._gross_trips % 50 == 0
+                    or self._gross_trips >= GROSS_TRIPS_FOR_EXIT):
+                logger.error(
+                    "%s %d Hz: gross-error trip %d/%d: projected UTC "
+                    "is %+.3fs off wall clock (anchor stale; restart "
+                    "needed to re-anchor)",
+                    self._mode.upper(), self._frequency_hz,
+                    self._gross_trips, GROSS_TRIPS_FOR_EXIT, delta,
+                )
+            if self._gross_trips >= GROSS_TRIPS_FOR_EXIT:
+                logger.error(
+                    "%s %d Hz: gross-error tripped %d consecutive batches "
+                    "— exiting %d for systemd restart",
+                    self._mode.upper(), self._frequency_hz,
+                    self._gross_trips, GROSS_EXIT_CODE,
+                )
+                import sys
+                sys.exit(GROSS_EXIT_CODE)
+        else:
+            if self._gross_trips > 0:
+                logger.info(
+                    "%s %d Hz: gross-error counter cleared after %d "
+                    "trips (delta back to %+.3fs)",
+                    self._mode.upper(), self._frequency_hz,
+                    self._gross_trips, delta,
+                )
+            self._gross_trips = 0
 
     def on_stream_dropped(self, reason: str) -> None:
         logger.warning(
@@ -228,13 +296,14 @@ class ChannelSink:
         )
 
     def on_stream_restored(self, channel_info) -> None:
-        # MultiStream re-discovers and hands us a fresh ChannelInfo with
-        # an updated GPS_TIME/RTP_TIMESNAP snapshot; replace ours so
-        # rtp_to_wallclock keeps using a sane reference even if radiod
-        # restarted under us.
-        self._channel_info = channel_info
+        # Anchor-once invariant: the original anchor was set from the
+        # FIRST channel_info we ever saw.  Refreshing it here would
+        # re-anchor against radiod's then-current snapshot of UTC —
+        # exactly the behavior that used to silently mistune psk-recorder
+        # after a multicast hiccup (see module docstring).  Log the event
+        # for observability but do NOT touch self._channel_info.
         logger.info(
-            "%s %d Hz: stream restored",
+            "%s %d Hz: stream restored (anchor unchanged)",
             self._mode.upper(), self._frequency_hz,
         )
 

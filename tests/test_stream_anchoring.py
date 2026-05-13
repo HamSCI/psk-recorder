@@ -1,61 +1,55 @@
-"""Tests for ChannelSink UTC anchoring via AuthorityReader
-(hf-timestd/docs/METROLOGY.md §4.5.1 RTP-reference invariant)."""
+"""Tests for ChannelSink's anchor-once + gross-error-tripwire model.
 
-import logging
+The recorder reads wall clock ONCE on the first batch (via
+rtp_to_wallclock when channel_info is available, else time.time()
+fallback), saves an `_anchor_utc` + `_anchor_total_samples` pair,
+and projects every subsequent batch's UTC by pure sample-count
+arithmetic.  No further wall-clock reads are used for timing.
+
+A gross-error tripwire runs on every batch — if the projected UTC
+diverges from wall_now by GROSS_THRESHOLD_SEC for GROSS_TRIPS_FOR_EXIT
+consecutive batches, the recorder exits non-zero so systemd restarts
+it with a fresh anchor.
+
+These tests use a fake Ring + SlotWorker via monkey-patching so we
+can drive on_samples() in isolation.
+"""
+
 import shutil
+import sys
 import tempfile
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
 from unittest import mock
 
 import numpy as np
 
 from psk_recorder.core.stream import (
-    AUTHORITY_REANCHOR_THRESHOLD_SEC,
-    AUTHORITY_REFRESH_EVERY_SAMPLES,
+    GROSS_EXIT_CODE,
+    GROSS_THRESHOLD_SEC,
+    GROSS_TRIPS_FOR_EXIT,
     ChannelSink,
 )
 
 
 @dataclass
 class _FakeQuality:
+    """Stand-in for MultiStream's StreamQuality."""
     total_samples_delivered: int = 0
+    first_rtp_timestamp: int = 0
 
 
-class _FakeSnap:
-    """Stand-in for AuthoritySnapshot exposing just what the sink reads."""
-    def __init__(self, usable: bool, offset_sec: float = 0.0):
-        self._usable = usable
-        self._offset_sec = offset_sec
-
-    @property
-    def offset_usable(self) -> bool:
-        return self._usable
-
-    @property
-    def offset_seconds(self) -> float:
-        return self._offset_sec
+class _FakeChannelInfo:
+    """Stand-in for ka9q's ChannelInfo carrying gps_time / rtp_timesnap."""
+    def __init__(self, gps_time=1462564880_000_000_000, rtp_timesnap=1):
+        self.gps_time = gps_time
+        self.rtp_timesnap = rtp_timesnap
 
 
-class _FakeReader:
-    def __init__(self, snaps: List[Optional[_FakeSnap]]):
-        """snaps is a queue of successive return values for read()."""
-        self._snaps = list(snaps)
-
-    def read(self):
-        if not self._snaps:
-            return None
-        # Last value is sticky — repeated reads after queue drains
-        # return the final snap.
-        if len(self._snaps) > 1:
-            return self._snaps.pop(0)
-        return self._snaps[0]
-
-
-def _make_sink(reader=None) -> ChannelSink:
+def _make_sink() -> ChannelSink:
     tmp = Path(tempfile.mkdtemp())
+    (tmp / "ft8").mkdir(exist_ok=True)
     log_fd = open(tmp / "log", "ab")
     sink = ChannelSink(
         mode="ft8",
@@ -67,193 +61,238 @@ def _make_sink(reader=None) -> ChannelSink:
         log_fd=log_fd,
         decoder_path="/nonexistent",
         keep_wav=False,
-        authority_reader=reader,
+        authority_reader=None,
     )
-    # Attach tmp for cleanup by caller.
     sink._tmp_dir = tmp  # type: ignore[attr-defined]
     return sink
 
 
-def _cleanup_sink(sink: ChannelSink) -> None:
+def _cleanup_sink(sink) -> None:
     tmp = getattr(sink, "_tmp_dir", None)
     if tmp:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-class TestChannelSinkAuthorityAnchoring(unittest.TestCase):
-    def test_first_call_with_authority_uses_offset_for_anchor(self):
-        """Authority available at stream start: offset is applied to the
-        wall-clock anchor so RTP time mapped through the anchor matches
-        UTC + offset."""
-        reader = _FakeReader([_FakeSnap(usable=True, offset_sec=107.0)])
-        sink = _make_sink(reader=reader)
+class TestAnchorOnce(unittest.TestCase):
+
+    def test_first_batch_anchors_from_wall_clock_fallback(self):
+        """No channel_info → time.time()-based anchor on first batch."""
+        sink = _make_sink()
         try:
-            samples = np.zeros(120, dtype=np.float32)
-            quality = _FakeQuality(total_samples_delivered=120)
+            samples = np.zeros(2400, dtype=np.float32)   # 200 ms at 12 kHz
+            q = _FakeQuality(total_samples_delivered=2400, first_rtp_timestamp=0)
             with mock.patch("psk_recorder.core.stream.time.time",
-                            return_value=1000.0):
-                sink.on_samples(samples, quality)
-            # Expected epoch: (1000 + 107) - (120/12000) = 1106.990
-            self.assertAlmostEqual(sink._stream_start_epoch, 1106.990, places=3)
-            self.assertEqual(sink.anchor_source, "authority")
-            self.assertAlmostEqual(sink.anchor_offset_sec, 107.0, places=3)
+                            return_value=1_700_000_000.0):
+                with mock.patch.object(sink._ring, "push") as push:
+                    sink.on_samples(samples, q)
+            self.assertEqual(sink._anchor_source, "wallclock_fallback")
+            # First-sample UTC = wall_now - n/sample_rate = 1700000000.0 - 0.2
+            self.assertAlmostEqual(sink._anchor_utc, 1_699_999_999.8, places=3)
+            self.assertEqual(sink._anchor_total_samples, 0)
+            # Ring received the projected UTC for the first sample.
+            push.assert_called_once()
+            self.assertAlmostEqual(push.call_args[0][1],
+                                   1_699_999_999.8, places=3)
         finally:
             _cleanup_sink(sink)
 
-    def test_first_call_without_authority_falls_back_to_wall_clock(self):
-        """No authority: anchor uses wall_clock directly, matching legacy
-        behavior."""
-        reader = _FakeReader([None])
-        sink = _make_sink(reader=reader)
+    def test_first_batch_anchors_via_rtp_to_wallclock_when_available(self):
+        """channel_info set + rtp_to_wallclock returns a number → use it."""
+        sink = _make_sink()
+        sink.set_channel_info(_FakeChannelInfo())
         try:
-            samples = np.zeros(120, dtype=np.float32)
-            quality = _FakeQuality(total_samples_delivered=120)
-            with self.assertLogs("psk_recorder.core.stream", level="WARNING") as cm, \
-                 mock.patch("psk_recorder.core.stream.time.time", return_value=1000.0):
-                sink.on_samples(samples, quality)
-            # Expected epoch: 1000 - (120/12000) = 999.990 (no offset)
-            self.assertAlmostEqual(sink._stream_start_epoch, 999.990, places=3)
-            self.assertEqual(sink.anchor_source, "wall_clock")
-            self.assertIsNone(sink.anchor_offset_sec)
-            self.assertTrue(any("standalone mode" in r.message for r in cm.records))
-        finally:
-            _cleanup_sink(sink)
-
-    def test_unusable_snapshot_treated_as_missing(self):
-        """t_level_active=None -> offset_usable=False -> wall_clock path."""
-        reader = _FakeReader([_FakeSnap(usable=False)])
-        sink = _make_sink(reader=reader)
-        try:
-            samples = np.zeros(120, dtype=np.float32)
-            quality = _FakeQuality(total_samples_delivered=120)
-            sink.on_samples(samples, quality)
-            self.assertEqual(sink.anchor_source, "wall_clock")
-        finally:
-            _cleanup_sink(sink)
-
-    def test_reader_exception_treated_as_unavailable(self):
-        class _BoomReader:
-            def read(self):
-                raise RuntimeError("boom")
-        sink = _make_sink(reader=_BoomReader())
-        try:
-            samples = np.zeros(120, dtype=np.float32)
-            quality = _FakeQuality(total_samples_delivered=120)
-            sink.on_samples(samples, quality)
-            self.assertEqual(sink.anchor_source, "wall_clock")
-        finally:
-            _cleanup_sink(sink)
-
-    def test_refresh_absorbs_large_offset_drift(self):
-        """Authority offset changes by > threshold after the refresh
-        window; the stream epoch rebases by the drift amount."""
-        # First snap: 0 ms offset. Later: +200 ms (beyond 50 ms threshold).
-        reader = _FakeReader([
-            _FakeSnap(usable=True, offset_sec=0.0),
-            _FakeSnap(usable=True, offset_sec=0.200),
-        ])
-        sink = _make_sink(reader=reader)
-        try:
-            sr = 12_000
-            samples_chunk = np.zeros(sr, dtype=np.float32)  # 1 s each
-            delivered = 0
-
-            # First chunk anchors the stream at offset=0.
-            delivered += sr
-            q = _FakeQuality(total_samples_delivered=delivered)
-            with mock.patch("psk_recorder.core.stream.time.time", return_value=2000.0):
-                sink.on_samples(samples_chunk, q)
-            epoch_initial = sink._stream_start_epoch
-
-            # Drive enough samples through to trigger the refresh.
-            total_to_feed = AUTHORITY_REFRESH_EVERY_SAMPLES + sr
-            while delivered < total_to_feed:
-                delivered += sr
-                q = _FakeQuality(total_samples_delivered=delivered)
+            samples = np.zeros(2400, dtype=np.float32)
+            q = _FakeQuality(total_samples_delivered=2400,
+                             first_rtp_timestamp=1_000_000)
+            with mock.patch("ka9q.rtp_to_wallclock",
+                            return_value=1_700_000_500.0):
                 with mock.patch("psk_recorder.core.stream.time.time",
-                                return_value=2000.0 + delivered / sr):
-                    sink.on_samples(samples_chunk, q)
-
-            # Epoch should have been rebased by ~0.200 s forward.
-            self.assertAlmostEqual(
-                sink._stream_start_epoch - epoch_initial, 0.200, places=3,
-            )
-            self.assertAlmostEqual(sink.anchor_offset_sec, 0.200, places=3)
+                                return_value=1_700_000_500.0):
+                    with mock.patch.object(sink._ring, "push"):
+                        sink.on_samples(samples, q)
+            self.assertEqual(sink._anchor_source, "rtp_to_wallclock")
+            self.assertAlmostEqual(sink._anchor_utc, 1_700_000_500.0, places=3)
         finally:
             _cleanup_sink(sink)
 
-    def test_refresh_ignores_small_drift_below_threshold(self):
-        """Offset drifts by less than AUTHORITY_REANCHOR_THRESHOLD_SEC;
-        no rebase should occur (noise not worth the log)."""
-        reader = _FakeReader([
-            _FakeSnap(usable=True, offset_sec=0.0),
-            _FakeSnap(usable=True, offset_sec=0.010),  # 10 ms, well under 50 ms
-        ])
-        sink = _make_sink(reader=reader)
+    def test_subsequent_batches_use_pure_sample_count_projection(self):
+        """Second batch's UTC = anchor + delivered_since_anchor/sample_rate.
+
+        Critically: time.time() is moved during the test, but the
+        projection IGNORES that — confirms zero wall-clock dependency
+        after anchor."""
+        sink = _make_sink()
         try:
-            sr = 12_000
-            samples_chunk = np.zeros(sr, dtype=np.float32)
-            delivered = 0
+            sr = sink.sample_rate
+            with mock.patch.object(sink._ring, "push") as push:
+                # Anchor at wall_now=1000.0 with 1 sec of samples.
+                with mock.patch("psk_recorder.core.stream.time.time",
+                                return_value=1000.0):
+                    sink.on_samples(
+                        np.zeros(sr, dtype=np.float32),
+                        _FakeQuality(total_samples_delivered=sr),
+                    )
 
-            delivered += sr
-            q = _FakeQuality(total_samples_delivered=delivered)
-            with mock.patch("psk_recorder.core.stream.time.time", return_value=3000.0):
-                sink.on_samples(samples_chunk, q)
-            epoch_initial = sink._stream_start_epoch
+                # Now ANY value of time.time() must not affect the
+                # projection — push another 0.5 s of samples and verify
+                # we see anchor + 1.0 s (since anchor accounted for the
+                # FIRST 1 s and the new batch's first sample is at +1.0 s).
+                with mock.patch("psk_recorder.core.stream.time.time",
+                                return_value=999_999_999.0):  # absurd
+                    sink.on_samples(
+                        np.zeros(sr // 2, dtype=np.float32),
+                        _FakeQuality(total_samples_delivered=sr + sr // 2),
+                    )
 
-            total_to_feed = AUTHORITY_REFRESH_EVERY_SAMPLES + sr
-            while delivered < total_to_feed:
-                delivered += sr
-                q = _FakeQuality(total_samples_delivered=delivered)
-                sink.on_samples(samples_chunk, q)
-
-            # Epoch is unchanged (drift 10 ms < threshold 50 ms).
-            self.assertEqual(sink._stream_start_epoch, epoch_initial)
-            self.assertAlmostEqual(sink.anchor_offset_sec, 0.0, places=3)
+            # First push: utc_of_first = anchor (1000.0 - 1.0) = 999.0
+            self.assertAlmostEqual(push.call_args_list[0][0][1], 999.0, places=4)
+            # Second push: anchor + (sr / sr) = anchor + 1.0 = 1000.0
+            self.assertAlmostEqual(push.call_args_list[1][0][1], 1000.0, places=4)
         finally:
             _cleanup_sink(sink)
 
-    def test_authority_becomes_available_mid_run(self):
-        """Initially anchored via wall_clock; authority shows up later —
-        epoch should rebase by the full offset on the next refresh."""
-        reader = _FakeReader([
-            None,                                 # at anchor time
-            _FakeSnap(usable=True, offset_sec=0.500),  # later
-        ])
-        sink = _make_sink(reader=reader)
+    def test_on_stream_restored_does_not_change_anchor(self):
+        """Stream-gap recovery must NOT re-anchor; that was the old
+        wall-clock-correlated bug."""
+        sink = _make_sink()
+        sink.set_channel_info(_FakeChannelInfo(rtp_timesnap=1))
         try:
-            sr = 12_000
-            samples_chunk = np.zeros(sr, dtype=np.float32)
-            delivered = 0
+            sr = sink.sample_rate
+            with mock.patch.object(sink._ring, "push"):
+                with mock.patch("ka9q.rtp_to_wallclock",
+                                return_value=2000.0):
+                    sink.on_samples(
+                        np.zeros(sr, dtype=np.float32),
+                        _FakeQuality(total_samples_delivered=sr,
+                                     first_rtp_timestamp=1),
+                    )
+            initial_anchor = sink._anchor_utc
+            initial_total = sink._anchor_total_samples
+            initial_channel = sink._channel_info
 
-            delivered += sr
-            q = _FakeQuality(total_samples_delivered=delivered)
-            with mock.patch("psk_recorder.core.stream.time.time", return_value=4000.0):
-                sink.on_samples(samples_chunk, q)
-            self.assertEqual(sink.anchor_source, "wall_clock")
-            epoch_initial = sink._stream_start_epoch
+            # Stream "restored" with a totally different channel_info.
+            sink.on_stream_restored(_FakeChannelInfo(rtp_timesnap=999))
 
-            total_to_feed = AUTHORITY_REFRESH_EVERY_SAMPLES + sr
-            while delivered < total_to_feed:
-                delivered += sr
-                q = _FakeQuality(total_samples_delivered=delivered)
-                sink.on_samples(samples_chunk, q)
-
-            self.assertEqual(sink.anchor_source, "authority")
-            self.assertAlmostEqual(
-                sink._stream_start_epoch - epoch_initial, 0.500, places=3,
-            )
+            # Anchor MUST be unchanged.
+            self.assertEqual(sink._anchor_utc, initial_anchor)
+            self.assertEqual(sink._anchor_total_samples, initial_total)
+            # channel_info MUST also be unchanged (any new snapshot ignored).
+            self.assertIs(sink._channel_info, initial_channel)
         finally:
             _cleanup_sink(sink)
 
-    def test_empty_batch_does_nothing(self):
-        reader = _FakeReader([_FakeSnap(usable=True, offset_sec=0.0)])
-        sink = _make_sink(reader=reader)
+
+class TestGrossErrorTripwire(unittest.TestCase):
+
+    def test_clean_batches_do_not_trip(self):
+        """Projected UTC matches wall_now → counter stays at 0."""
+        sink = _make_sink()
         try:
-            q = _FakeQuality(total_samples_delivered=0)
-            sink.on_samples(np.array([], dtype=np.float32), q)
-            self.assertIsNone(sink._stream_start_epoch)
-            self.assertIsNone(sink.anchor_source)
+            sr = sink.sample_rate
+            with mock.patch.object(sink._ring, "push"):
+                with mock.patch("psk_recorder.core.stream.time.time",
+                                return_value=1000.0):
+                    sink.on_samples(
+                        np.zeros(sr, dtype=np.float32),
+                        _FakeQuality(total_samples_delivered=sr),
+                    )
+                # Several more batches with consistent wall-clock advance.
+                for i in range(5):
+                    delivered = sr * (2 + i)
+                    with mock.patch("psk_recorder.core.stream.time.time",
+                                    return_value=1000.0 + (1 + i)):
+                        sink.on_samples(
+                            np.zeros(sr, dtype=np.float32),
+                            _FakeQuality(total_samples_delivered=delivered),
+                        )
+            self.assertEqual(sink._gross_trips, 0)
+        finally:
+            _cleanup_sink(sink)
+
+    def test_gross_error_increments_counter(self):
+        """When wall_now is far from projection, the trip counter advances."""
+        sink = _make_sink()
+        try:
+            sr = sink.sample_rate
+            with mock.patch.object(sink._ring, "push"):
+                # Anchor at wall_now=1000 — projected_utc tracks samples.
+                with mock.patch("psk_recorder.core.stream.time.time",
+                                return_value=1000.0):
+                    sink.on_samples(
+                        np.zeros(sr, dtype=np.float32),
+                        _FakeQuality(total_samples_delivered=sr),
+                    )
+                # Next batch: pretend wall clock jumped 10 sec — projection
+                # is now 9s behind wall.  Above the 2s threshold → trip.
+                with mock.patch("psk_recorder.core.stream.time.time",
+                                return_value=1010.0):
+                    sink.on_samples(
+                        np.zeros(sr, dtype=np.float32),
+                        _FakeQuality(total_samples_delivered=sr * 2),
+                    )
+            self.assertEqual(sink._gross_trips, 1)
+        finally:
+            _cleanup_sink(sink)
+
+    def test_gross_error_exits_after_consecutive_trips(self):
+        """K consecutive trips → sys.exit(GROSS_EXIT_CODE)."""
+        sink = _make_sink()
+        try:
+            sr = sink.sample_rate
+            with mock.patch.object(sink._ring, "push"):
+                # Anchor.
+                with mock.patch("psk_recorder.core.stream.time.time",
+                                return_value=1000.0):
+                    sink.on_samples(
+                        np.zeros(sr, dtype=np.float32),
+                        _FakeQuality(total_samples_delivered=sr),
+                    )
+                # Force GROSS_TRIPS_FOR_EXIT consecutive bad batches.
+                with self.assertRaises(SystemExit) as cm:
+                    for i in range(GROSS_TRIPS_FOR_EXIT):
+                        with mock.patch("psk_recorder.core.stream.time.time",
+                                        return_value=2000.0 + i):
+                            sink.on_samples(
+                                np.zeros(sr, dtype=np.float32),
+                                _FakeQuality(
+                                    total_samples_delivered=sr * (2 + i),
+                                ),
+                            )
+                self.assertEqual(cm.exception.code, GROSS_EXIT_CODE)
+        finally:
+            _cleanup_sink(sink)
+
+    def test_clean_batch_resets_trip_counter(self):
+        """A single bad batch followed by a clean one must reset the counter
+        (otherwise transient hiccups would accumulate to a false exit)."""
+        sink = _make_sink()
+        try:
+            sr = sink.sample_rate
+            with mock.patch.object(sink._ring, "push"):
+                # Anchor at 1000.
+                with mock.patch("psk_recorder.core.stream.time.time",
+                                return_value=1000.0):
+                    sink.on_samples(
+                        np.zeros(sr, dtype=np.float32),
+                        _FakeQuality(total_samples_delivered=sr),
+                    )
+                # One trip.
+                with mock.patch("psk_recorder.core.stream.time.time",
+                                return_value=1010.0):
+                    sink.on_samples(
+                        np.zeros(sr, dtype=np.float32),
+                        _FakeQuality(total_samples_delivered=sr * 2),
+                    )
+                self.assertEqual(sink._gross_trips, 1)
+                # Now a clean batch — wall_now matches projection (1.0 s into
+                # stream means wall_now = anchor + sr/sr = 1000.0).
+                with mock.patch("psk_recorder.core.stream.time.time",
+                                return_value=1001.0):
+                    sink.on_samples(
+                        np.zeros(sr, dtype=np.float32),
+                        _FakeQuality(total_samples_delivered=sr * 3),
+                    )
+                self.assertEqual(sink._gross_trips, 0)
         finally:
             _cleanup_sink(sink)
 
