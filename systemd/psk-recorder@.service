@@ -21,10 +21,21 @@ WorkingDirectory=/opt/psk-recorder
 ExecStartPre=+/bin/mkdir -p /var/lib/psk-recorder/%i/ft8
 ExecStartPre=+/bin/mkdir -p /var/lib/psk-recorder/%i/ft4
 ExecStartPre=+/bin/mkdir -p /var/log/psk-recorder
-ExecStartPre=+/bin/mkdir -p /var/lib/hs-uploader
 ExecStartPre=+/usr/bin/chown -R pskrec:pskrec /var/lib/psk-recorder/%i
 ExecStartPre=+/usr/bin/chown -R pskrec:pskrec /var/log/psk-recorder
-ExecStartPre=+/usr/bin/chown pskrec:pskrec /var/lib/hs-uploader
+# /var/lib/hs-uploader is SHARED across HamSCI client users (pskrec,
+# wsprdaemon, ...) — its setgid+group-write shape is owned by
+# tmpfiles.d/hs-uploader.conf (root:sigmond, mode 02775).  Earlier
+# versions of this unit had:
+#
+#   ExecStartPre=+/bin/mkdir -p /var/lib/hs-uploader
+#   ExecStartPre=+/usr/bin/chown pskrec:pskrec /var/lib/hs-uploader
+#
+# Both wrong: the first redundant with tmpfiles.d, the second hostile —
+# it re-stomped the dir's group from sigmond to pskrec on every
+# psk-recorder restart, locking wsprdaemon-client's wd-upload-hs out
+# of the shared watermarks.db with "attempt to write a readonly
+# database".  Observed on bee1 2026-05-14.  Removed.
 
 ExecStart=/opt/psk-recorder/venv/bin/python3 -m psk_recorder.cli daemon \
     --config /etc/psk-recorder/psk-recorder-config.toml \
