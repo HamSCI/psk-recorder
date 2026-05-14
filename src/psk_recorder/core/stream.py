@@ -23,22 +23,21 @@ Timing model (anchor-once, sample-count projection — 2026-05-13).
      guarantees every WAV / slot has exactly the same sample count
      and identical alignment to its predecessors.
 
-  3. Gross-error tripwire: every batch we compute the delta between
-     projected UTC and current wall clock.  If `|delta| > GROSS_THRESHOLD_SEC`
-     for `GROSS_TRIPS_FOR_EXIT` consecutive batches, the recorder exits
-     non-zero so systemd can restart it with a fresh anchor.  The
-     threshold is set generously above FT8's ±2.5s decoder tolerance
-     (so a trip means "decodes have been silently zero for some time")
-     and small enough that a single missed cycle gets us a restart.
-
 Previous design (rtp_to_wallclock per batch, with channel_info refresh
 on stream-restored) re-anchored the timing whenever a multicast gap
 recovered.  Each refresh adopted radiod's then-current view of UTC,
 introducing a wall-clock dependency that occasionally cascaded into
 "decodes=N/N but spots=0" states (B4-100, 2026-05-13: PSK silently
 fell from 275 spots/min to 0 over a few minutes; stop+start was the
-only known cure).  The anchor-once model with a restart tripwire
-removes both the silent-degradation surface AND the manual recovery.
+only known cure).  The anchor-once model removes the silent-degradation
+surface entirely.
+
+Per METROLOGY.md §4.5 RTP-reference invariant, the recorder does not
+diagnose timing health on its own — that is hf-timestd's job.  If the
+host clock is badly wrong at anchor time, decode rate goes to zero and
+the operator sees the symptom through the standard decode-health
+signal (psk decodes_ok/decodes_total + sigmond's wav_snapshot), not
+through any client-side wall-clock comparison.
 """
 
 from __future__ import annotations
@@ -58,11 +57,6 @@ from psk_recorder.core.slot import SlotWorker
 logger = logging.getLogger(__name__)
 
 RING_SECONDS = 60.0
-
-# Anchor-once gross-error tripwire (see module docstring).
-GROSS_THRESHOLD_SEC = 2.0       # |projected_utc − wall_now| that counts as a trip
-GROSS_TRIPS_FOR_EXIT = 3        # consecutive trips before sys.exit (restart)
-GROSS_EXIT_CODE = 75            # EX_TEMPFAIL — systemd sees it and restarts
 
 
 class ChannelSink:
@@ -122,9 +116,6 @@ class ChannelSink:
         self._anchor_utc: Optional[float] = None
         self._anchor_total_samples: int = 0
         self._anchor_source: str = ""        # diagnostic: "rtp_to_wallclock" | "wallclock_fallback"
-        # Gross-error tripwire state — count of consecutive batches with
-        # |projected − wall| > threshold.  Resets to 0 on any clean check.
-        self._gross_trips: int = 0
         # Authority reader is retained so other consumers (e.g., diags)
         # can still inspect what hf-timestd is publishing.  Not used for
         # anchoring anymore — the one-shot anchor read is the only path.
@@ -178,11 +169,6 @@ class ChannelSink:
         rtp_to_wallclock (preferred) or `time.time()` (fallback).  Every
         subsequent batch's UTC is computed by pure sample-count
         projection — no wall-clock reads, no channel_info refreshes.
-
-        Every batch also runs the gross-error tripwire: if projected UTC
-        diverges from wall clock by more than GROSS_THRESHOLD_SEC for
-        GROSS_TRIPS_FOR_EXIT consecutive batches, we sys.exit() and let
-        systemd restart us with a fresh anchor.
         """
         n = len(samples)
         if n == 0:
@@ -199,11 +185,9 @@ class ChannelSink:
             self._anchor_total_samples = quality.total_samples_delivered - n
             self._anchor_source = source
             logger.info(
-                "%s %d Hz: anchored via %s at UTC %.3f (sample %d, "
-                "wall delta %+.3fs)",
+                "%s %d Hz: anchored via %s at UTC %.3f (sample %d)",
                 self._mode.upper(), self._frequency_hz, source,
                 self._anchor_utc, self._anchor_total_samples,
-                self._anchor_utc - time.time(),
             )
 
         # Pure sample-count projection — the timing invariant the user
@@ -214,8 +198,6 @@ class ChannelSink:
         utc_of_first = (
             self._anchor_utc + delta_samples / self._sample_rate
         )
-
-        self._gross_error_check(utc_of_first, n)
 
         self._ring.push(samples, utc_of_first)
         self._total_delivered = quality.total_samples_delivered
@@ -247,47 +229,6 @@ class ChannelSink:
         # Wall-clock fallback: time.time() *is* the UTC of "right now",
         # so the UTC of this batch's FIRST sample is (now - n/sample_rate).
         return time.time() - n / self._sample_rate, "wallclock_fallback"
-
-    def _gross_error_check(self, utc_of_first: float, n: int) -> None:
-        """Trip if projected UTC is far enough from wall clock to break
-        FT8 / FT4 alignment.  Exits non-zero on sustained trip.
-        """
-        # Compare projected UTC of the LAST sample in this batch to
-        # wall_now — both are "what UTC is right now from each side".
-        projected_now = utc_of_first + n / self._sample_rate
-        delta = projected_now - time.time()
-        if abs(delta) > GROSS_THRESHOLD_SEC:
-            self._gross_trips += 1
-            # Log the first trip + every 50th thereafter to avoid spam
-            # but make the steady-state visible.
-            if (self._gross_trips == 1
-                    or self._gross_trips % 50 == 0
-                    or self._gross_trips >= GROSS_TRIPS_FOR_EXIT):
-                logger.error(
-                    "%s %d Hz: gross-error trip %d/%d: projected UTC "
-                    "is %+.3fs off wall clock (anchor stale; restart "
-                    "needed to re-anchor)",
-                    self._mode.upper(), self._frequency_hz,
-                    self._gross_trips, GROSS_TRIPS_FOR_EXIT, delta,
-                )
-            if self._gross_trips >= GROSS_TRIPS_FOR_EXIT:
-                logger.error(
-                    "%s %d Hz: gross-error tripped %d consecutive batches "
-                    "— exiting %d for systemd restart",
-                    self._mode.upper(), self._frequency_hz,
-                    self._gross_trips, GROSS_EXIT_CODE,
-                )
-                import sys
-                sys.exit(GROSS_EXIT_CODE)
-        else:
-            if self._gross_trips > 0:
-                logger.info(
-                    "%s %d Hz: gross-error counter cleared after %d "
-                    "trips (delta back to %+.3fs)",
-                    self._mode.upper(), self._frequency_hz,
-                    self._gross_trips, delta,
-                )
-            self._gross_trips = 0
 
     def on_stream_dropped(self, reason: str) -> None:
         logger.warning(

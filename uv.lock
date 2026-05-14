@@ -37,6 +37,24 @@ wheels = [
 ]
 
 [[package]]
+name = "hs-uploader"
+version = "0.1.0"
+source = { directory = "../hs-uploader" }
+dependencies = [
+    { name = "tomli", marker = "python_full_version < '3.11'" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "clickhouse-connect", marker = "extra == 'clickhouse'", specifier = ">=0.7" },
+    { name = "httpx", marker = "extra == 'http'", specifier = ">=0.27" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
+    { name = "pytest-httpserver", marker = "extra == 'dev'", specifier = ">=1.0" },
+    { name = "tomli", marker = "python_full_version < '3.11'", specifier = ">=2.0" },
+]
+provides-extras = ["clickhouse", "psws", "wsprnet", "wsprdaemon", "pskreporter", "http", "dev"]
+
+[[package]]
 name = "iniconfig"
 version = "2.3.0"
 source = { registry = "https://pypi.org/simple" }
@@ -47,15 +65,15 @@ wheels = [
 
 [[package]]
 name = "ka9q-python"
-version = "3.13.0"
+version = "3.14.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/16/46/37fcc135022903d38608ee6767e293ad8eb4db83ea2342a499b08c1e8cb4/ka9q_python-3.13.0.tar.gz", hash = "sha256:2b00c14965fe68b5a1def38e3a1707fb7ba129b583175f44d198609b8362842d", size = 243053, upload-time = "2026-05-08T13:54:19.972Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/93/b9/b33321c299e04dcb34c5f79d30e0c54dd60af7a0887f44ac73e67771852d/ka9q_python-3.14.2.tar.gz", hash = "sha256:0a2962bc0bde3091938e43458f5c70f567442669180fa66dc85c637f3b3f84c2", size = 254208, upload-time = "2026-05-14T11:00:13.719Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/4c/08/bf803959188f65f7298f7a8e978be7b2ccd72b017aca94fc91859f3d106d/ka9q_python-3.13.0-py3-none-any.whl", hash = "sha256:dd88c5763204821d7f1e4f2a59cac6fa463a92c4bfce82f30018d28b3e6fbb27", size = 100226, upload-time = "2026-05-08T13:54:18.634Z" },
+    { url = "https://files.pythonhosted.org/packages/68/a5/792658df39e9bb895e6904314b925e0bac41e059eb37dfcc570845c9280e/ka9q_python-3.14.2-py3-none-any.whl", hash = "sha256:59920b944b42823a566de60587c03850d690b9399ceb627927c27da031b48491", size = 104911, upload-time = "2026-05-14T11:00:12.319Z" },
 ]
 
 [[package]]
@@ -229,6 +247,7 @@ version = "0.4.0"
 source = { editable = "." }
 dependencies = [
     { name = "callhash" },
+    { name = "hs-uploader" },
     { name = "ka9q-python" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
@@ -243,7 +262,8 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "callhash", directory = "../callhash" },
-    { name = "ka9q-python", specifier = ">=3.13.0" },
+    { name = "hs-uploader", directory = "../hs-uploader" },
+    { name = "ka9q-python", specifier = ">=3.14.0" },
     { name = "numpy", specifier = ">=1.24.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
     { name = "tomli", marker = "python_full_version < '3.11'", specifier = ">=2.0" },

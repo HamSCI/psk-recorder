@@ -215,7 +215,21 @@ class SlotWorker:
         return wav_path
 
     def _fork_decoder(self, wav_path: Path) -> None:
-        slot_start = self._next_slot_start or time.time()
+        if self._next_slot_start is None:
+            # Should never happen — the ring buffer always carries a
+            # sample-count-projected UTC for the slot once the recorder
+            # has anchored.  Falling back to time.time() here means the
+            # slot label is now off the RTP-reference path; log so the
+            # operator sees the degraded mode (METROLOGY.md §4.5).
+            logger.warning(
+                "%s %d Hz: slot_start unset at decode fork — falling back "
+                "to wall clock for slot label.  Pipeline anchor is missing; "
+                "decode-time labeling may be wrong.",
+                self._mode.upper(), self._frequency_hz,
+            )
+            slot_start = time.time()
+        else:
+            slot_start = self._next_slot_start
         if self._decoder_kind == DECODER_JT9:
             self._fork_decoder_jt9(wav_path, slot_start)
         else:

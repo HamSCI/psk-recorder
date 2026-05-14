@@ -1,15 +1,10 @@
-"""Tests for ChannelSink's anchor-once + gross-error-tripwire model.
+"""Tests for ChannelSink's anchor-once model.
 
 The recorder reads wall clock ONCE on the first batch (via
 rtp_to_wallclock when channel_info is available, else time.time()
 fallback), saves an `_anchor_utc` + `_anchor_total_samples` pair,
 and projects every subsequent batch's UTC by pure sample-count
 arithmetic.  No further wall-clock reads are used for timing.
-
-A gross-error tripwire runs on every batch — if the projected UTC
-diverges from wall_now by GROSS_THRESHOLD_SEC for GROSS_TRIPS_FOR_EXIT
-consecutive batches, the recorder exits non-zero so systemd restarts
-it with a fresh anchor.
 
 These tests use a fake Ring + SlotWorker via monkey-patching so we
 can drive on_samples() in isolation.
@@ -25,12 +20,7 @@ from unittest import mock
 
 import numpy as np
 
-from psk_recorder.core.stream import (
-    GROSS_EXIT_CODE,
-    GROSS_THRESHOLD_SEC,
-    GROSS_TRIPS_FOR_EXIT,
-    ChannelSink,
-)
+from psk_recorder.core.stream import ChannelSink
 
 
 @dataclass
@@ -178,121 +168,6 @@ class TestAnchorOnce(unittest.TestCase):
             self.assertEqual(sink._anchor_total_samples, initial_total)
             # channel_info MUST also be unchanged (any new snapshot ignored).
             self.assertIs(sink._channel_info, initial_channel)
-        finally:
-            _cleanup_sink(sink)
-
-
-class TestGrossErrorTripwire(unittest.TestCase):
-
-    def test_clean_batches_do_not_trip(self):
-        """Projected UTC matches wall_now → counter stays at 0."""
-        sink = _make_sink()
-        try:
-            sr = sink.sample_rate
-            with mock.patch.object(sink._ring, "push"):
-                with mock.patch("psk_recorder.core.stream.time.time",
-                                return_value=1000.0):
-                    sink.on_samples(
-                        np.zeros(sr, dtype=np.float32),
-                        _FakeQuality(total_samples_delivered=sr),
-                    )
-                # Several more batches with consistent wall-clock advance.
-                for i in range(5):
-                    delivered = sr * (2 + i)
-                    with mock.patch("psk_recorder.core.stream.time.time",
-                                    return_value=1000.0 + (1 + i)):
-                        sink.on_samples(
-                            np.zeros(sr, dtype=np.float32),
-                            _FakeQuality(total_samples_delivered=delivered),
-                        )
-            self.assertEqual(sink._gross_trips, 0)
-        finally:
-            _cleanup_sink(sink)
-
-    def test_gross_error_increments_counter(self):
-        """When wall_now is far from projection, the trip counter advances."""
-        sink = _make_sink()
-        try:
-            sr = sink.sample_rate
-            with mock.patch.object(sink._ring, "push"):
-                # Anchor at wall_now=1000 — projected_utc tracks samples.
-                with mock.patch("psk_recorder.core.stream.time.time",
-                                return_value=1000.0):
-                    sink.on_samples(
-                        np.zeros(sr, dtype=np.float32),
-                        _FakeQuality(total_samples_delivered=sr),
-                    )
-                # Next batch: pretend wall clock jumped 10 sec — projection
-                # is now 9s behind wall.  Above the 2s threshold → trip.
-                with mock.patch("psk_recorder.core.stream.time.time",
-                                return_value=1010.0):
-                    sink.on_samples(
-                        np.zeros(sr, dtype=np.float32),
-                        _FakeQuality(total_samples_delivered=sr * 2),
-                    )
-            self.assertEqual(sink._gross_trips, 1)
-        finally:
-            _cleanup_sink(sink)
-
-    def test_gross_error_exits_after_consecutive_trips(self):
-        """K consecutive trips → sys.exit(GROSS_EXIT_CODE)."""
-        sink = _make_sink()
-        try:
-            sr = sink.sample_rate
-            with mock.patch.object(sink._ring, "push"):
-                # Anchor.
-                with mock.patch("psk_recorder.core.stream.time.time",
-                                return_value=1000.0):
-                    sink.on_samples(
-                        np.zeros(sr, dtype=np.float32),
-                        _FakeQuality(total_samples_delivered=sr),
-                    )
-                # Force GROSS_TRIPS_FOR_EXIT consecutive bad batches.
-                with self.assertRaises(SystemExit) as cm:
-                    for i in range(GROSS_TRIPS_FOR_EXIT):
-                        with mock.patch("psk_recorder.core.stream.time.time",
-                                        return_value=2000.0 + i):
-                            sink.on_samples(
-                                np.zeros(sr, dtype=np.float32),
-                                _FakeQuality(
-                                    total_samples_delivered=sr * (2 + i),
-                                ),
-                            )
-                self.assertEqual(cm.exception.code, GROSS_EXIT_CODE)
-        finally:
-            _cleanup_sink(sink)
-
-    def test_clean_batch_resets_trip_counter(self):
-        """A single bad batch followed by a clean one must reset the counter
-        (otherwise transient hiccups would accumulate to a false exit)."""
-        sink = _make_sink()
-        try:
-            sr = sink.sample_rate
-            with mock.patch.object(sink._ring, "push"):
-                # Anchor at 1000.
-                with mock.patch("psk_recorder.core.stream.time.time",
-                                return_value=1000.0):
-                    sink.on_samples(
-                        np.zeros(sr, dtype=np.float32),
-                        _FakeQuality(total_samples_delivered=sr),
-                    )
-                # One trip.
-                with mock.patch("psk_recorder.core.stream.time.time",
-                                return_value=1010.0):
-                    sink.on_samples(
-                        np.zeros(sr, dtype=np.float32),
-                        _FakeQuality(total_samples_delivered=sr * 2),
-                    )
-                self.assertEqual(sink._gross_trips, 1)
-                # Now a clean batch — wall_now matches projection (1.0 s into
-                # stream means wall_now = anchor + sr/sr = 1000.0).
-                with mock.patch("psk_recorder.core.stream.time.time",
-                                return_value=1001.0):
-                    sink.on_samples(
-                        np.zeros(sr, dtype=np.float32),
-                        _FakeQuality(total_samples_delivered=sr * 3),
-                    )
-                self.assertEqual(sink._gross_trips, 0)
         finally:
             _cleanup_sink(sink)
 
