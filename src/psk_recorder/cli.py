@@ -60,8 +60,16 @@ def main():
 
     if not root.handlers:
         handler = logging.StreamHandler(sys.stderr)
+        # Include ISO-8601 timestamp so off-line log scrapers (e.g.
+        # sigmond's decode-health collector) can anchor events in
+        # time.  systemd's StandardOutput=append:<file> writes raw
+        # stdout/stderr to the file with no timestamp prefix; without
+        # %(asctime)s every line is a timeless string.
         handler.setFormatter(
-            logging.Formatter("%(levelname)s:%(name)s:%(message)s")
+            logging.Formatter(
+                fmt='%(asctime)s.%(msecs)03dZ %(levelname)s:%(name)s:%(message)s',
+                datefmt='%Y-%m-%dT%H:%M:%S',
+            )
         )
         root.addHandler(handler)
     else:
