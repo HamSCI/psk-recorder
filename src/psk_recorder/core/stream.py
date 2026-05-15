@@ -237,14 +237,30 @@ class ChannelSink:
         )
 
     def on_stream_restored(self, channel_info) -> None:
-        # Anchor-once invariant: the original anchor was set from the
-        # FIRST channel_info we ever saw.  Refreshing it here would
-        # re-anchor against radiod's then-current snapshot of UTC —
-        # exactly the behavior that used to silently mistune psk-recorder
-        # after a multicast hiccup (see module docstring).  Log the event
-        # for observability but do NOT touch self._channel_info.
+        # Re-anchor on stream restoration.  MultiStream only fires this
+        # callback after _drop_timeout_sec (default 15s) of silence AND
+        # a successful ensure_channel() — i.e. a real radiod restart or
+        # comparable outage, never a sub-second multicast hiccup.  On
+        # such a restart, MultiStream resets ``slot.quality =
+        # StreamQuality()``, so ``quality.total_samples_delivered``
+        # restarts at 0.  Holding the pre-restart anchor across that
+        # discontinuity produces wildly negative ``delta_samples`` in
+        # on_samples(), every projected UTC misses every slot window,
+        # and decodes silently fall to 0/0 forever (observed B4-100
+        # 2026-05-14: radiod bounced at 20:13/20:14, every band silent
+        # for 3 h until manual stop+start).
+        #
+        # The original comment here cited "mistuning after a multicast
+        # hiccup", but MultiStream's 15s threshold makes that scenario
+        # impossible to reach via this callback — transient packet loss
+        # never fires on_stream_restored.  Re-anchoring is the
+        # intended behavior.
+        self._channel_info = channel_info
+        self._anchor_utc = None
+        self._anchor_total_samples = 0
+        self._anchor_source = ""
         logger.info(
-            "%s %d Hz: stream restored (anchor unchanged)",
+            "%s %d Hz: stream restored — re-anchoring on next batch",
             self._mode.upper(), self._frequency_hz,
         )
 
