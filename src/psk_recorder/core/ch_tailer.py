@@ -1,16 +1,18 @@
-"""ClickHouse tailer for psk-recorder (CONTRACT v0.6 §17).
+"""Spot-log tailer for psk-recorder (CONTRACT v0.6 §17).
 
 Watches the per-mode spot-log file `<log_dir>/<radiod_id>-{ft8,ft4}.log`
 that `decode_ft8` writes to, parses each new line, and inserts rows
-into `psk.spots` via `sigmond.hamsci_ch.Writer`.  Runs as a daemon
-thread inside the PskRecorder process, parallel to PskReporterUploader
-(which also tails the same log file via `pskreporter-sender`).
+into `psk.spots` via `sigmond.hamsci_ch.Writer.from_env()`.  Runs as a
+daemon thread inside the PskRecorder process, parallel to
+PskReporterUploader (which also tails the same log file via
+`pskreporter-sender`).
 
-The CH path is additive: when `SIGMOND_CLICKHOUSE_URL` is unset the
-tailer is a clean no-op (writer stays in noop mode), and pskreporter
-uploads are unaffected.  When SFTP/PSKReporter is eventually retired
-in favor of `hs-uploader`, this tailer remains as the producer-side
-sink.
+`Writer.from_env()` stages rows into sigmond's local SQLite sink by
+default (`/var/lib/sigmond/sink.db`); `hs-uploader`'s `SqliteSource`
+is the reader half.  This tailer is the producer-side sink that path
+depends on, and is additive — pskreporter uploads are unaffected.
+The writer resolves to a clean no-op only when the sink path is
+unwritable (e.g. a standalone host outside a sigmond install).
 
 Wire format from `decode_ft8.c:363` (ka9q/ft8_lib):
     fprintf(stdout,"%4d/%02d/%02d %02d:%02d:%02d %3d %+4.2lf %'.1lf ~ %s\\n",
@@ -102,8 +104,8 @@ def parse_decode_ft8_line(line: str, *, mode: str) -> Optional[dict]:
         return None
     try:
         # decode_ft8 emits timestamps in UTC; tag the parsed datetime
-        # tz-aware so clickhouse-connect serializes correctly even when
-        # the ClickHouse server's tz is something other than UTC.
+        # tz-aware so the sink writer serializes it unambiguously
+        # rather than guessing a local timezone.
         ts = datetime.strptime(
             parts[0] + " " + parts[1], "%Y/%m/%d %H:%M:%S"
         ).replace(tzinfo=timezone.utc)
@@ -173,8 +175,8 @@ def parse_jt9_line(line: str, *, mode: Optional[str] = None) -> Optional[dict]:
         return None
 
     # Date + time → UTC datetime (slot HHMMSS has full second resolution).
-    # slot.py emits these in UTC; tag tz-aware so clickhouse-connect
-    # doesn't reinterpret in the server's timezone.
+    # slot.py emits these in UTC; tag tz-aware so the sink writer
+    # doesn't reinterpret them in a local timezone.
     try:
         ts = datetime.strptime(
             parts[0] + parts[1], "%y%m%d%H%M%S"
@@ -319,7 +321,7 @@ class ChTailer:
 
     Spawns a daemon thread that polls the log for new lines, parses
     them, and inserts rows into `psk.spots` via hamsci_ch.Writer.
-    No-op when SIGMOND_CLICKHOUSE_URL is unset.
+    Clean no-op only when the sink path is unwritable.
     """
 
     POLL_INTERVAL_SEC = 1.0       # how often to read new lines
@@ -368,9 +370,9 @@ class ChTailer:
     def start(self) -> None:
         """Build the writer and start the polling thread.
 
-        Returns immediately. If SIGMOND_CLICKHOUSE_URL is unset the
-        writer is a no-op and we still start the thread (so health is
-        observable via `is_active`).  Failure to import the writer
+        Returns immediately. If the writer resolves to a no-op (sink
+        path unwritable) we still start the thread, so health stays
+        observable via `is_active`.  Failure to import the writer
         package is logged and the thread exits.
         """
         try:
@@ -379,8 +381,8 @@ class ChTailer:
             logger.warning("ch_tailer disabled (%s): %s", self._mode, e)
             return
         if self._writer.is_noop:
-            logger.debug("ch_tailer %s: SIGMOND_CLICKHOUSE_URL unset; noop",
-                         self._mode)
+            logger.debug("ch_tailer %s: sink writer is a no-op "
+                         "(sink path unwritable)", self._mode)
         # Skip historical content — only tail from current end.
         if self._log_path.exists():
             try:
@@ -534,16 +536,15 @@ def _default_writer_factory(batch_rows: int):
     """Lazy-import `sigmond.hamsci_ch.Writer` for `psk.spots`.
 
     Sigmond core stays stdlib-only; this import only happens when a
-    tailer actually starts, and the writer is itself a no-op when CH
-    is not configured.
+    tailer actually starts.  `Writer.from_env()` resolves the backend
+    (sigmond's SQLite sink by default); the writer is itself a no-op
+    when the sink path is unwritable.
 
-    `schema_version=2` matches the live psk.spots migration tier
-    (CH migration 002_add_jt9_columns.sql, registry hash
-    8ee544049db79fd0 in hs_uploader.schema._BUILTINS).  Consumers —
-    both `ClickHouseSource.accepted_schema_versions=[2]` and the new
-    `SqliteSource` filter on this — so the producer must tag rows at
-    the matching version or the SqliteSource silently treats them as
-    stale-schema and yields nothing.
+    `schema_version=2` is the tag every staged row carries.  The
+    `hs-uploader` reader (`SqliteSource.accepted_schema_versions=[2]`)
+    filters on it — so the producer must tag rows at the matching
+    version or the source silently treats them as stale-schema and
+    yields nothing.
     """
     from sigmond.hamsci_ch import Writer
     return Writer.from_env(

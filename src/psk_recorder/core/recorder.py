@@ -69,6 +69,20 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _sqlite_sink_available() -> bool:
+    """True when the SQLite sink the hs-uploader reads from is in play.
+
+    Mirrors `hs_uploader.sources.sqlite._ConnectionConfig.from_env`:
+    an explicit `SIGMOND_SQLITE_PATH`, or the default sink file already
+    on disk.  When the sink is in play the hs-uploader shim selects
+    `SqliteSource`, so the per-slot `.spots.txt` spool files would
+    never be consumed — the recorder skips writing them.
+    """
+    if (os.environ.get("SIGMOND_SQLITE_PATH") or "").strip():
+        return True
+    return Path("/var/lib/sigmond/sink.db").exists()
+
+
 class PskRecorder:
     """Manages all FT4/FT8 channels for a single radiod."""
 
@@ -364,14 +378,16 @@ class PskRecorder:
             )
         decoder_depth = int(self._paths.get("decoder_depth", 3))
         keep_wav = self._paths.get("keep_wav", False)
-        # Phase 5c.3: tee per-slot decoder output into <wav>.spots.txt
-        # files when the hs-uploader is on AND we have no ClickHouse.
-        # That's the file-fallback mode the shim's FileTreeSource picks
-        # up.  Skipping the write when CH is reachable (or when the
-        # legacy uploader is in use) keeps the spool dir clean.
+        # Tee per-slot decoder output into <wav>.spots.txt files only
+        # when the hs-uploader is on AND there is no SQLite sink for it
+        # to read — that's the file-fallback mode the shim's
+        # FileTreeSource picks up.  With a sink present the shim reads
+        # SqliteSource and the spool files would only pile up
+        # unconsumed; with the legacy uploader in use they're unused
+        # either way.  Skipping the write keeps the spool dir clean.
         spool_spots = bool(
             os.environ.get("PSK_USE_HS_UPLOADER")
-            and not os.environ.get("SIGMOND_CLICKHOUSE_URL")
+            and not _sqlite_sink_available()
         )
         logger.info(
             "decoder_kind=%s path=%s depth=%d spool_spots=%s",
@@ -496,14 +512,14 @@ class PskRecorder:
                 logger.exception("Failed to start MultiStream")
 
     def _start_uploaders(self) -> None:
-        # ClickHouse-backed uploader: a single thread polls psk.spots
-        # for new rows and feeds them upstream.  Two implementations:
-        # the legacy `PskReporterUploader` (CH-poll + pskreporter
-        # library subprocess-style) and the hs-uploader-driven
-        # `HsPskReporterUploader` (Pipeline + PskReporterTcp transport).
-        # `PSK_USE_HS_UPLOADER=1` opts into the new path; default is
-        # legacy.  The hs path picks ClickHouseSource when CH is set,
-        # FileTreeSource over the per-slot spool otherwise (5c.3).
+        # Spot uploader: a single thread feeds psk.spots rows upstream
+        # to PSKReporter.  Two implementations: the legacy
+        # `PskReporterUploader` (supervises the `pskreporter`
+        # subprocess) and the hs-uploader-driven `HsPskReporterUploader`
+        # (Pipeline + PskReporterTcp transport).  `PSK_USE_HS_UPLOADER=1`
+        # opts into the new path; default is legacy.  The hs path reads
+        # SqliteSource when sigmond's SQLite sink is present, else
+        # FileTreeSource over the per-slot spool.
         callsign = self._station.get("callsign", "")
         grid = self._station.get("grid_square", "")
         if not callsign:
@@ -547,9 +563,10 @@ class PskRecorder:
 
         Each tailer watches the same `<radiod_id>-<mode>.log` file
         pskreporter-sender tails, parses new lines, and inserts rows
-        into `psk.spots`.  No-op when SIGMOND_CLICKHOUSE_URL is unset.
-        Failure to import / start is non-fatal: the existing PSKReporter
-        upload path is unaffected.
+        into `psk.spots` via `sigmond.hamsci_ch.Writer.from_env()` —
+        sigmond's local SQLite sink by default.  Failure to import /
+        start is non-fatal: the existing PSKReporter upload path is
+        unaffected.
         """
         log_dir = Path(self._paths.get("log_dir", "/var/log/psk-recorder"))
         callsign = self._station.get("callsign", "")

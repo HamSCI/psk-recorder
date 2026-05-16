@@ -13,17 +13,17 @@ The lifecycle interface (``start`` / ``stop`` / ``is_active``) matches
 the legacy class so ``recorder.PskRecorder._start_uploaders`` can pick
 between the two without conditional plumbing downstream of construction.
 
-Source selection (Phase 5c.3):
+Source selection:
 
-* ``SIGMOND_CLICKHOUSE_URL`` set → ``ClickHouseSource`` (the 5c.2 path).
-  CH query uses ``cursor_column="ingested_at"`` (commit 93f4d5b's
-  fix carried over) and ``extra_where`` filters scope to this
-  daemon's ``radiod_id`` so multi-instance is safe by construction.
-* CH unset (or ``ClickHouseSource`` construction fails) → fall back
-  to ``FileTreeSource`` reading per-slot ``.spots.txt`` files the
-  ``SlotWorker`` writes when ``PSK_USE_HS_UPLOADER=1`` and CH is
-  absent.  Files are deleted on PSKReporter ack (delete_on_ack
-  retention).
+* ``SqliteSource`` — reads sigmond's local SQLite sink
+  (``/var/lib/sigmond/sink.db`` by default, or ``SIGMOND_SQLITE_PATH``),
+  the queue ``sigmond.hamsci_ch.SqliteWriter`` fills.  ``extra_where``
+  filters scope the queue to this daemon's ``radiod_id`` so multi-
+  instance is safe by construction.
+* No SQLite sink → fall back to ``FileTreeSource`` reading per-slot
+  ``.spots.txt`` files the ``SlotWorker`` writes when
+  ``PSK_USE_HS_UPLOADER=1`` and no sink is present.  Files are deleted
+  on PSKReporter ack (delete_on_ack retention).
 
 Other notes:
 
@@ -37,7 +37,6 @@ Other notes:
 from __future__ import annotations
 
 import logging
-import os
 import threading
 from pathlib import Path
 from typing import Optional
@@ -46,9 +45,9 @@ logger = logging.getLogger(__name__)
 
 
 # How often we ask the orchestrator to pump.  Each pump pulls one
-# batch from CH and ships it via the transport, so this IS the upload
-# cadence.  30 s aligns with the FT4/FT8 slot rate; same value as
-# the legacy PSKREPORTER_INTERVAL.
+# batch from the source and ships it via the transport, so this IS the
+# upload cadence.  30 s aligns with the FT4/FT8 slot rate; same value
+# as the legacy PSKREPORTER_INTERVAL.
 PUMP_INTERVAL_SEC = 30.0
 
 
@@ -71,8 +70,8 @@ class HsPskReporterUploader:
         self._use_tcp = use_tcp
         # spool_dir is the per-radiod spool root (`<spool>/<radiod_id>`)
         # — the directory containing ft8/ and ft4/ subdirs that the slot
-        # writes per-slot ``.spots.txt`` files into when CH is absent.
-        # When None, file fallback isn't available.
+        # writes per-slot ``.spots.txt`` files into when no SQLite sink
+        # is present.  When None, file fallback isn't available.
         self._spool_dir = Path(spool_dir) if spool_dir is not None else None
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -83,8 +82,8 @@ class HsPskReporterUploader:
         # Cumulative per-mode spot counts shipped to PSK Reporter,
         # accumulated from the hs-uploader on_batch_outcome callback
         # (see _on_batch_outcome below).  Works uniformly across
-        # ClickHouseSource / SqliteSource / FileTreeSource — replaces
-        # the spool-dir delta logic that only worked for the file path.
+        # SqliteSource / FileTreeSource — replaces the spool-dir delta
+        # logic that only worked for the file path.
         self._uploaded_ft8 = 0
         self._uploaded_ft4 = 0
         # Per-pump tallies; reset to 0 at the top of each pump cycle
@@ -150,7 +149,7 @@ class HsPskReporterUploader:
             batch_limit=500,
         )
         # `on_batch_outcome` counts shipped records per-mode directly
-        # from `batch.records`.  Works uniformly across CH / SQLite /
+        # from `batch.records`.  Works uniformly across SqliteSource /
         # file sources — the previous spool-dir delta only counted
         # under FileTreeSource and read 0 under SqliteSource (see the
         # comment at _count_spool_spots() below for the historical
@@ -198,7 +197,7 @@ class HsPskReporterUploader:
                 self._pump_count += 1
                 # Reset per-pump per-mode tallies; the on_batch_outcome
                 # callback fires inside pump() and fills these in.
-                # Works across CH / SQLite / file sources uniformly.
+                # Works across SqliteSource / file sources uniformly.
                 self._pump_ft8 = 0
                 self._pump_ft4 = 0
 
@@ -250,39 +249,25 @@ class HsPskReporterUploader:
     def _build_source(self):
         """Pick the source based on env, in priority order:
 
-        1. ``SIGMOND_CLICKHOUSE_URL`` set → ``ClickHouseSource`` (the
-           pre-migration path; matches upstream wsprdaemon-server shape).
-        2. ``SIGMOND_SQLITE_PATH`` set, OR the default sink
-           ``/var/lib/sigmond/sink.db`` exists → ``SqliteSource`` (the
-           post-``smd storage migrate-to-sqlite`` default; producer-side
-           is ``sigmond.hamsci_ch.SqliteWriter``).
-        3. Else fall through to the per-slot ``FileTreeSource`` — the
-           SlotWorker populates that spool when CH is absent AND no
-           local SQLite sink is configured either.
+        1. ``SIGMOND_SQLITE_PATH`` set, OR the default sink
+           ``/var/lib/sigmond/sink.db`` exists → ``SqliteSource``
+           (producer-side is ``sigmond.hamsci_ch.SqliteWriter``).
+        2. Else fall through to the per-slot ``FileTreeSource`` — the
+           SlotWorker populates that spool when no local SQLite sink
+           is configured.
 
-        The same `database`, `table`, `select_columns`, and `extra_where`
-        kwargs flow through CH and SQLite paths so the same multi-
-        instance scoping (``radiod_id`` filter) and column projection
-        apply in both backends.
+        `database`, `table`, `select_columns`, and `extra_where` scope
+        the SQLite queue to this daemon (``radiod_id`` filter) and
+        project the columns ``PskReporterTcp`` needs.
         """
-        # ----- shared (CH + SQLite) selection args -----
-        common_kwargs = dict(
+        sqlite_kwargs = dict(
             database="psk",
             table="spots",
             accepted_schema_versions=[2],
-            primary_key_columns=[
-                # psk.spots ORDER BY tuple — tiebreak hash takes this
-                # set so two rows with identical (host_call, mode,
-                # frequency, time, message) tie on cityHash64 and ship
-                # in a stable order.  Ignored by SqliteSource (id is
-                # the natural monotone cursor) but kept for API parity.
-                "host_call", "mode", "frequency", "time", "message",
-            ],
             select_columns=[
                 "time", "frequency", "mode", "snr_db", "tx_call",
                 "grid", "score", "message",
             ],
-            cursor_column="ingested_at",
             extra_where=[
                 ("radiod_id", "=", self._radiod_id),
                 ("tx_call", "!=", ""),
@@ -297,26 +282,13 @@ class HsPskReporterUploader:
             start_at="now",
         )
 
-        if os.environ.get("SIGMOND_CLICKHOUSE_URL"):
-            try:
-                from hs_uploader.sources.clickhouse import ClickHouseSource
-                return ClickHouseSource.from_env(**common_kwargs)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "psk-uploader-hs: ClickHouseSource construct failed: %s",
-                    exc,
-                )
-                return None
-
-        # SQLite path — preferred when CH is absent because
-        # `smd storage migrate-to-sqlite` writes the producer half
-        # (sigmond.hamsci_ch.SqliteWriter) but the consumer (this shim)
-        # has to be told to read from the queue.  Try construction
+        # SQLite path — sigmond.hamsci_ch.SqliteWriter is the producer
+        # half; this shim is the consumer.  Try construction
         # unconditionally; SqliteSource.from_env returns a no-op source
         # when neither SIGMOND_SQLITE_PATH nor the default file exists.
         try:
             from hs_uploader.sources.sqlite import SqliteSource, HEALTH_NOOP
-            sqlite_src = SqliteSource.from_env(**common_kwargs)
+            sqlite_src = SqliteSource.from_env(**sqlite_kwargs)
             if sqlite_src.health() != HEALTH_NOOP:
                 logger.info(
                     "psk-uploader-hs: using SqliteSource (sink at %s)",
@@ -331,8 +303,8 @@ class HsPskReporterUploader:
 
         if self._spool_dir is None:
             logger.warning(
-                "psk-uploader-hs: no SIGMOND_CLICKHOUSE_URL, no SQLite "
-                "sink, and no spool_dir — neither source available",
+                "psk-uploader-hs: no SQLite sink and no spool_dir "
+                "— no source available",
             )
             return None
 
