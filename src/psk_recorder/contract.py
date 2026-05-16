@@ -109,9 +109,10 @@ def build_inventory(config: dict, config_path: Path) -> dict:
         }
         instances.append(instance)
 
-        instance_logs: dict[str, Any] = {
-            "process": f"{log_dir}/{radiod_id}.log",
-        }
+        # The process log goes to the systemd journal
+        # (StandardOutput=journal) — see it via `smd log psk-recorder`.
+        # log_paths lists only file-based logs (for `smd log --files`).
+        instance_logs: dict[str, Any] = {}
         spot_logs: dict[str, str] = {}
         if ft8_freqs:
             spot_logs["ft8"] = f"{log_dir}/{radiod_id}-ft8.log"

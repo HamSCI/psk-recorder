@@ -50,7 +50,9 @@ TimeoutStartSec=180
 Restart=always
 RestartSec=5
 
-StandardOutput=append:/var/log/psk-recorder/%i.log
+# Logs go to the systemd journal (sigmond standard) — query with
+# `journalctl -u psk-recorder@%i` or `smd log psk-recorder`.
+StandardOutput=journal
 StandardError=inherit
 SyslogIdentifier=psk-recorder@%i
 
