@@ -31,14 +31,15 @@ sudo systemctl reset-failed psk-recorder@<radiod_id>
 
 Three log streams per instance:
 
-| File | Written by | Contents |
+| Stream | Written by | Contents |
 |---|---|---|
-| `/var/log/psk-recorder/<id>.log` | systemd (stdout/stderr) | Process log: startup, channel provisioning, slot stats, errors. |
-| `/var/log/psk-recorder/<id>-ft8.log` | `decode_ft8` (forked per slot) | One line per FT8 spot. Tailed by `pskreporter-sender`. |
-| `/var/log/psk-recorder/<id>-ft4.log` | `decode_ft8` (forked per slot) | One line per FT4 spot. Tailed by `pskreporter-sender`. |
+| systemd journal (`SyslogIdentifier=psk-recorder@<id>`) | the daemon's stdout (`StandardOutput=journal`) | Process log: startup, channel provisioning, slot stats, errors. |
+| `/var/log/psk-recorder/<id>-ft8.log` | the decoder (forked per slot) | One line per FT8 spot. Tailed by `pskreporter-sender`. |
+| `/var/log/psk-recorder/<id>-ft4.log` | the decoder (forked per slot) | One line per FT4 spot. Tailed by `pskreporter-sender`. |
 
-`journalctl -u psk-recorder@<id>` shows systemd-level events; the app
-log is the file above (the unit redirects stdout there).
+`journalctl -u psk-recorder@<id>` (or `smd log psk-recorder`) shows the
+process log; the per-mode spot logs stay as files. Only the file-based
+spot logs are listed in `inventory --json` `log_paths`.
 
 ### Per-minute stats lines
 
@@ -119,8 +120,8 @@ avahi-resolve -n <host>-status.local
 ### "insufficient samples, skipping" (sustained, not just startup)
 
 The ring buffer doesn't have a full slot of audio when the slot
-worker fires. Usually means the RTP stream dropped. Check the process
-log for `on_stream_dropped` / `on_stream_restored` events and verify
+worker fires. Usually means the RTP stream dropped. Check the journal
+for `on_stream_dropped` / `on_stream_restored` events and verify
 network multicast is reaching the host. Brief bursts of these
 warnings on startup are normal.
 
@@ -151,8 +152,8 @@ failure (above) or a config validation fault.
 ### `pskreporter-sender` exits and restarts in a loop
 
 The supervisor in `uploader.py` restarts on exit with backoff. Look
-at `/var/log/psk-recorder/<id>.log` for `[pskreporter-ft8]` /
-`[pskreporter-ft4]` stderr lines — the sender's argparse output
+in the journal (`journalctl -u psk-recorder@<id>`) for
+`[pskreporter-ft8]` / `[pskreporter-ft4]` stderr lines — the sender's argparse output
 appears there, and any Python tracebacks. A common cause is the
 sender importing the wrong `pskreporter` Python module if the
 configured binary uses `#!/usr/bin/env python3` outside the venv.

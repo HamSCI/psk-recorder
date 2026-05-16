@@ -75,7 +75,6 @@ psk-recorder version   --json
   "git": {"sha": "...", "short": "...", "ref": "main", "dirty": false},
   "log_paths": {
     "bee1-rx888": {
-      "process": "/var/log/psk-recorder/bee1-rx888.log",
       "spots": {
         "ft8": "/var/log/psk-recorder/bee1-rx888-ft8.log",
         "ft4": "/var/log/psk-recorder/bee1-rx888-ft4.log"
@@ -170,14 +169,16 @@ millisecond-accurate skew studies) requires no contract-level work.
 
 ## §10 — Logging discipline
 
-- Process logs go to `/var/log/psk-recorder/<radiod_id>.log` via the
-  unit's `StandardOutput=append:`. This duplicates the journal but
-  keeps a self-contained per-instance file, matching the sigmond
-  conventions.
+- The process log goes to the systemd journal via the unit's
+  `StandardOutput=journal` (`SyslogIdentifier=psk-recorder@<id>`) —
+  query it with `journalctl -u psk-recorder@<id>` or `smd log
+  psk-recorder`. It is journal-only; there is no per-instance process
+  log file.
 - Spot logs go to `/var/log/psk-recorder/<radiod_id>-{ft8,ft4}.log`.
-- Every file-log path is surfaced in `inventory --json` under the
-  top-level `log_paths` object, keyed by radiod id (since one
-  `psk-recorder` install can host multiple instances).
+- The file-based spot-log paths are surfaced in `inventory --json`
+  under the top-level `log_paths` object, keyed by radiod id (since
+  one `psk-recorder` install can host multiple instances). The
+  journal-only process log is not listed there.
 
 ## §11 — Runtime log level
 

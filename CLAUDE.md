@@ -165,7 +165,7 @@ freqs_hz    = [14080000, 7047500, ...]
 - Config: `/etc/psk-recorder/psk-recorder-config.toml`
 - Spool: `/var/lib/psk-recorder/<radiod_id>/{ft8,ft4}/YYMMDD_HHMMSS.wav`
 - Spot logs: `/var/log/psk-recorder/<radiod_id>-{ft8,ft4}.log`
-- Process log: `/var/log/psk-recorder/<radiod_id>.log`
+- Process log: systemd journal (`journalctl -u psk-recorder@<radiod_id>`)
 - Venv: `/opt/psk-recorder/venv`
 - Source: `/opt/git/sigmond/psk-recorder` (editable install)
 - Service user: `pskrec:pskrec`

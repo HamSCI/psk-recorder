@@ -139,8 +139,10 @@ Instances are independent — failure of one does not affect the other.
 | `/opt/git/sigmond/psk-recorder/` | Source checkout (editable install root) | repo owner; readable by `pskrec` |
 | `/opt/psk-recorder/venv/` | Python venv | root |
 | `/var/lib/psk-recorder/<radiod_id>/{ft8,ft4}/` | WAV spool (deleted after decode unless `keep_wav = true`) | `pskrec` |
-| `/var/log/psk-recorder/<radiod_id>.log` | Process log (systemd-redirected stdout) | `pskrec` |
 | `/var/log/psk-recorder/<radiod_id>-{ft8,ft4}.log` | Per-mode spot log (decoder appends, sender tails) | `pskrec` |
+
+The process log goes to the systemd journal (`StandardOutput=journal`),
+not a file — query it with `journalctl -u psk-recorder@<radiod_id>`.
 
 ## Uninstall
 

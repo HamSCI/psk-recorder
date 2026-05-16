@@ -84,8 +84,8 @@ PYTHONPATH=src python3 -m pytest tests/ -v
 per-mode log files in the decoder's native format (WSJT-X-canonical
 for jt9, decode_ft8-native for the fallback), supervise a long-running
 `pskreporter-sender` per mode that tails those logs and uploads to
-pskreporter.info, and (when sigmond's CH staging tier is configured)
-also stream parsed rows into `psk.spots` via `sigmond.hamsci_ch.Writer`.
+pskreporter.info, and stream parsed rows into `psk.spots` via
+`sigmond.hamsci_ch.Writer` (sigmond's local SQLite sink by default).
 
 **Does not:** reimplement the FT8/FT4 decoder, reimplement the
 pskreporter protocol, or talk to `radiod` over anything but
