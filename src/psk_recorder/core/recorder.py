@@ -69,6 +69,37 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+# PSK_DELIVERY_MODE — how spots reach PSKReporter.
+#
+#   server (default): client only ships to wsprdaemon servers; the
+#                     gw1-elected pskreporter_forwarder service POSTs
+#                     to pskreporter.info on the client's behalf.
+#                     Spots are tagged forward_to_pskreporter=True in
+#                     the local sink → tar → psk.spots.
+#   direct          : client POSTs directly to pskreporter.info (today's
+#                     behavior). No wsprdaemon-server path: the
+#                     ch_tailer that feeds the local SQLite sink is
+#                     not started, so nothing ships to wsprdaemon.
+#   both            : client POSTs directly AND ships to wsprdaemon.
+#                     Spots are tagged forward_to_pskreporter=False so
+#                     the server does NOT re-post (avoids duplicates).
+_VALID_DELIVERY_MODES = ("server", "direct", "both")
+
+
+def _resolve_delivery_mode() -> str:
+    """Read + validate PSK_DELIVERY_MODE; fall back to 'server' on
+    anything bogus. We log the choice once at startup so an operator
+    typo doesn't silently disable direct delivery."""
+    raw = (os.environ.get("PSK_DELIVERY_MODE") or "server").strip().lower()
+    if raw not in _VALID_DELIVERY_MODES:
+        logger.warning(
+            "PSK_DELIVERY_MODE=%r is not one of %s; defaulting to 'server'",
+            raw, _VALID_DELIVERY_MODES,
+        )
+        return "server"
+    return raw
+
+
 def _sqlite_sink_available() -> bool:
     """True when the SQLite sink the hs-uploader reads from is in play.
 
@@ -520,6 +551,14 @@ class PskRecorder:
         # opts into the new path; default is legacy.  The hs path reads
         # SqliteSource when sigmond's SQLite sink is present, else
         # FileTreeSource over the per-slot spool.
+        mode = _resolve_delivery_mode()
+        if mode == "server":
+            logger.info(
+                "PSK_DELIVERY_MODE=server: direct PSKReporter uploader "
+                "disabled; spots will reach PSKReporter via wsprdaemon "
+                "server forwarding"
+            )
+            return
         callsign = self._station.get("callsign", "")
         grid = self._station.get("grid_square", "")
         if not callsign:
@@ -567,7 +606,24 @@ class PskRecorder:
         sigmond's local SQLite sink by default.  Failure to import /
         start is non-fatal: the existing PSKReporter upload path is
         unaffected.
+
+        Gated by PSK_DELIVERY_MODE (default `server`):
+          * `server` / `both` → tailers run; every row carries
+            `forward_to_pskreporter` derived from the mode
+            (server=True, both=False — the latter avoids the server
+            double-posting on top of our own direct upload).
+          * `direct`           → tailers do NOT start; no rows reach
+            the local sink, so hs-uploader's tar transport ships
+            nothing FT-side and the wsprdaemon-server path is bypassed.
         """
+        mode = _resolve_delivery_mode()
+        if mode == "direct":
+            logger.info(
+                "PSK_DELIVERY_MODE=direct: ch_tailers disabled; "
+                "no spots will be staged for wsprdaemon-server delivery"
+            )
+            return
+        forward_flag = (mode == "server")  # both → False
         log_dir = Path(self._paths.get("log_dir", "/var/log/psk-recorder"))
         callsign = self._station.get("callsign", "")
         grid = self._station.get("grid_square", "")
@@ -592,26 +648,27 @@ class PskRecorder:
         )) / self._radiod_id
         callhash_path = spool_root / "callhash.json"
 
-        for mode in ("ft8", "ft4"):
-            if not get_freqs(self._radiod, mode):
+        for tailer_mode in ("ft8", "ft4"):
+            if not get_freqs(self._radiod, tailer_mode):
                 continue
-            log_path = log_dir / f"{self._radiod_id}-{mode}.log"
+            log_path = log_dir / f"{self._radiod_id}-{tailer_mode}.log"
             try:
                 tailer = ChTailer(
                     log_path=log_path,
-                    mode=mode,
+                    mode=tailer_mode,
                     radiod_id=self._radiod_id,
                     host_call=callsign,
                     host_grid=grid,
                     processing_version=proc_version,
                     callhash_path=callhash_path,
+                    forward_to_pskreporter=forward_flag,
                 )
                 tailer.start()
                 self._ch_tailers.append(tailer)
             except Exception:
                 logger.exception(
                     "ch_tailer %s startup failed; PSKReporter path unaffected",
-                    mode,
+                    tailer_mode,
                 )
 
     def _notify_ready(self) -> None:

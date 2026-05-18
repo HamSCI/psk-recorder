@@ -63,6 +63,27 @@ local SQLite sink (`/var/lib/sigmond/sink.db`) by default. It resolves
 to a no-op when the sink path is unwritable, so psk-recorder still runs
 standalone with no sigmond present.
 
+### Delivery mode (`PSK_DELIVERY_MODE`)
+
+Three operator-selectable routes for how a spot reaches PSKReporter:
+
+| `PSK_DELIVERY_MODE` | Direct uploader | ChTailer (→ local sink → wsprdaemon tar) | Row tag `forward_to_pskreporter` |
+|---|---|---|---|
+| `server` (default) | off          | on   | true (server posts on our behalf) |
+| `direct`           | on           | off  | n/a (no row written) |
+| `both`             | on           | on   | false (avoid double-post) |
+
+The `server` default centralizes PSKReporter delivery responsibility on
+the wsprdaemon servers' gw1-elected `pskreporter_forwarder` — clients
+that pick it save the bandwidth of a second outbound POST per cycle,
+and the server retries on the client's behalf during PSKReporter
+outages. Choose `direct` only when you don't want the wsprdaemon
+servers to handle delivery; choose `both` when you want belt-and-suspenders
+redundancy (you POST directly + the server has a copy but won't re-post).
+
+Unknown / empty values fall back to `server` with a one-shot warning,
+so an operator typo doesn't silently disable delivery.
+
 ## Per-module responsibilities
 
 ### `core/recorder.py` — `PskRecorder`

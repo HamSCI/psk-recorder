@@ -224,6 +224,33 @@ class TestChTailer(unittest.TestCase):
                 self.assertEqual(row["radiod_id"], "test-rx888")
                 self.assertEqual(row["processing_version"], "0.1.0+abc")
                 self.assertEqual(row["mode"], "ft8")
+                # PR 3: forward_to_pskreporter defaults to True (matches
+                # PSK_DELIVERY_MODE=server, the new default — wsprdaemon
+                # server is responsible for posting to PSKReporter).
+                self.assertEqual(row["forward_to_pskreporter"], True)
+
+    def test_forward_to_pskreporter_false_when_constructed_false(self):
+        """PSK_DELIVERY_MODE=both → constructor receives forward=False,
+        each inserted row carries the flag through unchanged."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "test.log"
+            log_path.write_text("")
+            tailer, fake = self._make_tailer(
+                log_path, forward_to_pskreporter=False,
+            )
+            tailer.start()
+            try:
+                with open(log_path, "a") as f:
+                    f.write(LINE_PLAIN + "\n")
+                deadline = time.monotonic() + 4.0
+                while time.monotonic() < deadline and len(fake.inserts) < 1:
+                    time.sleep(0.1)
+            finally:
+                tailer.stop(timeout=2.0)
+            self.assertGreaterEqual(len(fake.inserts), 1)
+            for row in fake.inserts:
+                self.assertEqual(row["forward_to_pskreporter"], False)
 
     def test_handles_log_rotation(self):
         """File-shrunk-below-last-pos → tailer resets to head and replays.
