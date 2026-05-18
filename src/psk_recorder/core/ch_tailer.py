@@ -340,6 +340,7 @@ class ChTailer:
         batch_rows: int = 200,
         writer_factory=None,
         callhash_path: Optional[Path] = None,
+        forward_to_pskreporter: bool = True,
     ) -> None:
         self._log_path = Path(log_path)
         self._mode = mode
@@ -350,6 +351,11 @@ class ChTailer:
         self._batch_rows = batch_rows
         self._writer_factory = writer_factory or _default_writer_factory
         self._writer = None
+        # Tags every row written to the local sink so the wsprdaemon
+        # server's gw1-elected pskreporter_forwarder knows whether to
+        # POST it to pskreporter.info. Controlled by PSK_DELIVERY_MODE
+        # in recorder.py — True for "server", False for "both".
+        self._forward_to_pskreporter = bool(forward_to_pskreporter)
 
         # WSJT-X compound-callsign hash table.  Per-radiod (shared
         # across modes — same compound calls show up on FT8 and FT4).
@@ -488,6 +494,7 @@ class ChTailer:
             row["radiod_id"] = self._radiod_id
             row["instance"] = self._radiod_id
             row["processing_version"] = self._processing_version
+            row["forward_to_pskreporter"] = self._forward_to_pskreporter
             rows.append(row)
         if rows:
             try:
