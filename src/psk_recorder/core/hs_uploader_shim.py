@@ -280,6 +280,13 @@ class HsPskReporterUploader:
             # legacy uploader has likely already shipped —
             # PSKReporter shows duplicates.
             start_at="now",
+            # Don't delete on ack — the same psk.spots queue is also
+            # consumed by the forthcoming wsprdaemon-tar transport (PR
+            # 5) for the via-server delivery path, and by future
+            # query-style consumers like Andrew Roland's scrapers.
+            # Cleanup is centralized in `smd storage trim --all`
+            # (PSK_RETENTION_MIN, default 60 min, 30-min floor).
+            delete_on_commit=False,
         )
 
         # SQLite path — sigmond.hamsci_ch.SqliteWriter is the producer
