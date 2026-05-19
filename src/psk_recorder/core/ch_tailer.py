@@ -2,10 +2,9 @@
 
 Watches the per-mode spot-log file `<log_dir>/<radiod_id>-{ft8,ft4}.log`
 that `decode_ft8` writes to, parses each new line, and inserts rows
-into `psk.spots` via `sigmond.hamsci_ch.Writer.from_env()`.  Runs as a
-daemon thread inside the PskRecorder process, parallel to
-PskReporterUploader (which also tails the same log file via
-`pskreporter-sender`).
+into `psk.spots` via `sigmond.hamsci_sink.Writer.from_env()`.  Runs as a
+daemon thread inside the PskRecorder process, parallel to the
+HsPskReporterUploader's PSKReporter upload path.
 
 `Writer.from_env()` stages rows into sigmond's local SQLite sink by
 default (`/var/lib/sigmond/sink.db`); `hs-uploader`'s `SqliteSource`
@@ -320,7 +319,7 @@ class ChTailer:
     """One tailer per (radiod, mode) log file.
 
     Spawns a daemon thread that polls the log for new lines, parses
-    them, and inserts rows into `psk.spots` via hamsci_ch.Writer.
+    them, and inserts rows into `psk.spots` via hamsci_sink.Writer.
     Clean no-op only when the sink path is unwritable.
     """
 
@@ -540,7 +539,7 @@ class ChTailer:
 
 
 def _default_writer_factory(batch_rows: int):
-    """Lazy-import `sigmond.hamsci_ch.Writer` for `psk.spots`.
+    """Lazy-import `sigmond.hamsci_sink.Writer` for `psk.spots`.
 
     Sigmond core stays stdlib-only; this import only happens when a
     tailer actually starts.  `Writer.from_env()` resolves the backend
@@ -553,7 +552,7 @@ def _default_writer_factory(batch_rows: int):
     version or the source silently treats them as stale-schema and
     yields nothing.
     """
-    from sigmond.hamsci_ch import Writer
+    from sigmond.hamsci_sink import Writer
     return Writer.from_env(
         table="spots", mode="psk",
         schema_version=2, batch_rows=batch_rows,

@@ -63,10 +63,10 @@ def build_inventory(config: dict, config_path: Path) -> dict:
 
         spool_path = f"{paths.get('spool_dir', '/var/lib/psk-recorder')}/{radiod_id}"
 
-        # CONTRACT v0.6 §17 — output sinks per instance.  File sinks are
-        # always declared; the CH sink is added only when sigmond has
-        # published SIGMOND_CLICKHOUSE_URL (a CH-disabled host stays
-        # file-only with no extra moving parts).
+        # CONTRACT v0.6 §17 — output sinks per instance.  psk-recorder
+        # writes spots into sigmond's local SQLite sink (via the
+        # in-process tailer) and to per-mode log files; both are file
+        # sinks from the contract's point of view.
         data_sinks: list[dict[str, Any]] = [
             {
                 "kind":           "file",
@@ -83,15 +83,6 @@ def build_inventory(config: dict, config_path: Path) -> dict:
                 "mb_per_day":     5,
             },
         ]
-        if os.environ.get("SIGMOND_CLICKHOUSE_URL", "").strip():
-            data_sinks.append({
-                "kind":           "clickhouse",
-                "target":         "psk.spots",
-                "schema_ref":     "psk:2",
-                "retention_days": 14,
-                "mb_per_day":     8,
-                "health":         "ok",
-            })
 
         instance = {
             "instance": radiod_id,

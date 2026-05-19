@@ -317,7 +317,7 @@ class TestBracketedCalls:
 # ── ChTailer ↔ callhash integration ────────────────────────────────────────
 
 class _FakeChWriter:
-    """Minimal stand-in for sigmond.hamsci_ch.Writer — counts inserts."""
+    """Minimal stand-in for sigmond.hamsci_sink.Writer — counts inserts."""
 
     def __init__(self):
         self.inserts = []

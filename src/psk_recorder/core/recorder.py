@@ -2,7 +2,7 @@
 
 One PskRecorder per radiod instance (= one systemd unit).
 Creates ChannelStream objects for each frequency, manages log
-file descriptors, and supervises PskReporterUploaders.
+file descriptors, and supervises HsPskReporterUploaders.
 """
 
 from __future__ import annotations
@@ -24,7 +24,6 @@ from psk_recorder.config import (
 )
 from psk_recorder.core.stream import ChannelSink
 from psk_recorder.core.ch_tailer import ChTailer
-from psk_recorder.core.uploader import PskReporterUploader
 from psk_recorder.core.hs_uploader_shim import HsPskReporterUploader
 
 logger = logging.getLogger(__name__)
@@ -129,7 +128,7 @@ class PskRecorder:
         # (MultiStream, ssrc) pairs — populated as channels are provisioned,
         # used by the keep-alive thread to refresh radiod's LIFETIME timer.
         self._lifetime_entries: list[tuple[object, int]] = []
-        self._uploaders: list[PskReporterUploader] = []
+        self._uploaders: list[HsPskReporterUploader] = []
         self._ch_tailers: list[ChTailer] = []
         self._log_fds: dict[str, object] = {}
         self._running = False
@@ -544,13 +543,10 @@ class PskRecorder:
 
     def _start_uploaders(self) -> None:
         # Spot uploader: a single thread feeds psk.spots rows upstream
-        # to PSKReporter.  Two implementations: the legacy
-        # `PskReporterUploader` (supervises the `pskreporter`
-        # subprocess) and the hs-uploader-driven `HsPskReporterUploader`
-        # (Pipeline + PskReporterTcp transport).  `PSK_USE_HS_UPLOADER=1`
-        # opts into the new path; default is legacy.  The hs path reads
-        # SqliteSource when sigmond's SQLite sink is present, else
-        # FileTreeSource over the per-slot spool.
+        # to PSKReporter via the hs-uploader-driven `HsPskReporterUploader`
+        # (Pipeline + PskReporterTcp transport).  It reads SqliteSource
+        # when sigmond's SQLite sink is present, else FileTreeSource over
+        # the per-slot spool.
         mode = _resolve_delivery_mode()
         if mode == "server":
             logger.info(
@@ -569,31 +565,18 @@ class PskRecorder:
         # Operators on constrained links can opt out via config.
         use_tcp = bool(self._paths.get("pskreporter_tcp", True))
 
-        use_hs = bool(os.environ.get("PSK_USE_HS_UPLOADER"))
-        if use_hs:
-            spool_dir = Path(self._paths.get(
-                "spool_dir", "/var/lib/psk-recorder",
-            )) / self._radiod_id
-            uploader = HsPskReporterUploader(
-                callsign=callsign,
-                grid_square=grid,
-                antenna=antenna,
-                radiod_id=self._radiod_id,
-                use_tcp=use_tcp,
-                spool_dir=spool_dir,
-            )
-        else:
-            uploader = PskReporterUploader(
-                callsign=callsign,
-                grid_square=grid,
-                antenna=antenna,
-                radiod_id=self._radiod_id,
-                use_tcp=use_tcp,
-            )
-        logger.info(
-            "uploader: %s (PSK_USE_HS_UPLOADER=%s)",
-            type(uploader).__name__, "1" if use_hs else "0",
+        spool_dir = Path(self._paths.get(
+            "spool_dir", "/var/lib/psk-recorder",
+        )) / self._radiod_id
+        uploader = HsPskReporterUploader(
+            callsign=callsign,
+            grid_square=grid,
+            antenna=antenna,
+            radiod_id=self._radiod_id,
+            use_tcp=use_tcp,
+            spool_dir=spool_dir,
         )
+        logger.info("uploader: %s", type(uploader).__name__)
         uploader.start()
         self._uploaders.append(uploader)
 
@@ -602,7 +585,7 @@ class PskRecorder:
 
         Each tailer watches the same `<radiod_id>-<mode>.log` file
         pskreporter-sender tails, parses new lines, and inserts rows
-        into `psk.spots` via `sigmond.hamsci_ch.Writer.from_env()` —
+        into `psk.spots` via `sigmond.hamsci_sink.Writer.from_env()` —
         sigmond's local SQLite sink by default.  Failure to import /
         start is non-fatal: the existing PSKReporter upload path is
         unaffected.

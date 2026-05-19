@@ -37,7 +37,7 @@ pytestmark = pytest.mark.skipif(
 
 def _make_sink(path):
     """Create an empty `pending_uploads` queue table — the shape
-    `sigmond.hamsci_ch.SqliteWriter` materialises on its first flush."""
+    `sigmond.hamsci_sink.Writer` materialises on its first flush."""
     conn = sqlite3.connect(path)
     conn.execute(
         "CREATE TABLE pending_uploads ("
@@ -212,7 +212,7 @@ def test_sqlite_source_picked_when_sigmond_sqlite_path_set(monkeypatch, tmp_path
     """`SIGMOND_SQLITE_PATH` set → shim picks SqliteSource.
 
     Mirrors the standard sigmond host shape: the producer's
-    hamsci_ch.SqliteWriter has written rows to the queue table, and
+    hamsci_sink.Writer has written rows to the queue table, and
     the shim drains them via SqliteSource → PskReporterTcp.
     """
     monkeypatch.setenv("HS_UPLOADER_STATE_DIR", str(tmp_path))
