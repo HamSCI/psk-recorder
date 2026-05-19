@@ -607,23 +607,27 @@ class PskRecorder:
         start is non-fatal: the existing PSKReporter upload path is
         unaffected.
 
-        Gated by PSK_DELIVERY_MODE (default `server`):
-          * `server` / `both` → tailers run; every row carries
-            `forward_to_pskreporter` derived from the mode
-            (server=True, both=False — the latter avoids the server
-            double-posting on top of our own direct upload).
-          * `direct`           → tailers do NOT start; no rows reach
-            the local sink, so hs-uploader's tar transport ships
-            nothing FT-side and the wsprdaemon-server path is bypassed.
+        ChTailer runs in ALL three PSK_DELIVERY_MODE values.  The mode
+        affects only the per-row ``forward_to_pskreporter`` flag, NOT
+        whether tailers run:
+
+          * ``server`` → forward=True   (server forwards on our behalf)
+          * ``direct`` → forward=False  (we POST directly; server must
+                          not double-post if it ever sees the row)
+          * ``both``   → forward=False  (we POST directly AND ship to
+                          wd as a redundant copy; server won't re-post)
+
+        Originally PR 3 disabled tailers in ``direct`` mode under the
+        theory that "direct = no wsprdaemon path".  That broke the
+        direct PSKReporter delivery — the HsPskReporterUploader's
+        SqliteSource reads from the SAME sink the tailer writes to, so
+        with the tailer off the uploader pumped every 30s, found zero
+        work, and silently delivered nothing.  Discovered during the
+        2026-05-18 B4-100 cutover when ~2h of decodes failed to reach
+        PSKReporter.  See feedback_psk_delivery_mode_direct_breaks_uploader.
         """
         mode = _resolve_delivery_mode()
-        if mode == "direct":
-            logger.info(
-                "PSK_DELIVERY_MODE=direct: ch_tailers disabled; "
-                "no spots will be staged for wsprdaemon-server delivery"
-            )
-            return
-        forward_flag = (mode == "server")  # both → False
+        forward_flag = (mode == "server")  # direct / both → False
         log_dir = Path(self._paths.get("log_dir", "/var/log/psk-recorder"))
         callsign = self._station.get("callsign", "")
         grid = self._station.get("grid_square", "")
