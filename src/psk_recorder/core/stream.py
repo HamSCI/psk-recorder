@@ -75,7 +75,6 @@ class ChannelSink:
         keep_wav: bool = False,
         authority_reader: Optional[AuthorityReader] = None,
         decoder_kind: str = "decode_ft8",
-        decoder_depth: int = 3,
         spool_spots: bool = False,
     ):
         self._mode = mode
@@ -100,7 +99,6 @@ class ChannelSink:
             log_fd=log_fd,
             decoder_path=decoder_path,
             decoder_kind=decoder_kind,
-            decoder_depth=decoder_depth,
             keep_wav=keep_wav,
             spool_spots=spool_spots,
         )

@@ -53,7 +53,6 @@ class SlotWorker:
         decoder_path: str,
         keep_wav: bool = False,
         decoder_kind: str = DECODER_FT8_LIB,
-        decoder_depth: int = 3,
         spool_spots: bool = False,
     ):
         if decoder_kind not in VALID_DECODER_KINDS:
@@ -69,7 +68,6 @@ class SlotWorker:
         self._log_fd = log_fd
         self._decoder_path = decoder_path
         self._decoder_kind = decoder_kind
-        self._decoder_depth = decoder_depth
         self._keep_wav = keep_wav
         self._spool_spots = spool_spots
         self._running = False

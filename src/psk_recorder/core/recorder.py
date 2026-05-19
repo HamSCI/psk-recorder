@@ -397,7 +397,6 @@ class PskRecorder:
                 "decoder", "/usr/local/bin/decode_ft8",
             ),
         )
-        decoder_depth = int(self._paths.get("decoder_depth", 3))
         keep_wav = self._paths.get("keep_wav", False)
         # Tee per-slot decoder output into <wav>.spots.txt files only
         # when the hs-uploader is on AND there is no SQLite sink for it
@@ -411,8 +410,8 @@ class PskRecorder:
             and not _sqlite_sink_available()
         )
         logger.info(
-            "decoder_kind=%s path=%s depth=%d spool_spots=%s",
-            decoder_kind, decoder, decoder_depth, spool_spots,
+            "decoder_kind=%s path=%s spool_spots=%s",
+            decoder_kind, decoder, spool_spots,
         )
 
         multi_by_group: dict[tuple, object] = {}
@@ -452,7 +451,6 @@ class PskRecorder:
                     log_fd=self._log_fds[mode],
                     decoder_path=decoder,
                     decoder_kind=decoder_kind,
-                    decoder_depth=decoder_depth,
                     keep_wav=keep_wav,
                     spool_spots=spool_spots,
                 )
