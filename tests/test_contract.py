@@ -98,8 +98,8 @@ class InventoryV03Tests(unittest.TestCase):
         kinds = {s["kind"] for s in sinks}
         # File sinks always declared (spool + log dir).
         self.assertIn("file", kinds)
-        # CH sink only appears when SIGMOND_CLICKHOUSE_URL is set;
-        # tests run without it, so absence is the expected default.
+        # psk-recorder writes to the local SQLite sink (file-based);
+        # there is no ClickHouse sink.
         self.assertNotIn("clickhouse", kinds)
         for sink in sinks:
             self.assertIn("kind", sink)

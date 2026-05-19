@@ -44,21 +44,18 @@ src/psk_recorder/
     ring.py           # Ring: process-local audio + timestamp deque
     slot.py           # SlotWorker: cadence math, WAV write, fork decoder
     wav.py            # write_wav(): 16-bit PCM RIFF writer
-    uploader.py       # PskReporterUploader: long-running pskreporter subprocess
-    hs_uploader_shim.py  # HsPskReporterUploader: opt-in hs-uploader Pipeline path
-    ch_tailer.py      # ChTailer: tails spot logs → psk.spots via hamsci_ch.Writer
+    hs_uploader_shim.py  # HsPskReporterUploader: hs-uploader Pipeline upload path
+    ch_tailer.py      # ChTailer: tails spot logs → psk.spots via hamsci_sink.Writer
 ```
 
-The default PSK Reporter path is `PskReporterUploader` (the
-`pskreporter-sender` subprocess). `HsPskReporterUploader` is an opt-in
-alternative behind the `PSK_USE_HS_UPLOADER` env var: it ships rows via
-the `hs-uploader` library's `Pipeline` + `PskReporterTcp` transport,
+The PSK Reporter upload path is `HsPskReporterUploader`: it ships rows
+via the `hs-uploader` library's `Pipeline` + `PskReporterTcp` transport,
 sourcing from sigmond's local SQLite sink (`SqliteSource`) or, when no
 sink is present, the per-slot `.spots.txt` spool (`FileTreeSource`).
 
 `ChTailer` is the producer for the SQLite sink: one thread per
 `(radiod, mode)` tails the same spot log, parses each line, and inserts
-into `psk.spots` via `sigmond.hamsci_ch.Writer.from_env()` — sigmond's
+into `psk.spots` via `sigmond.hamsci_sink.Writer.from_env()` — sigmond's
 local SQLite sink (`/var/lib/sigmond/sink.db`) by default. It resolves
 to a no-op when the sink path is unwritable, so psk-recorder still runs
 standalone with no sigmond present.
@@ -124,13 +121,13 @@ Minimal 16-bit signed PCM RIFF writer. Takes a `np.float32` array,
 clamps to `[-1, 1]`, scales to int16, writes the standard 44-byte
 header. No external dependency on `scipy`/`soundfile`.
 
-### `core/uploader.py` — `PskReporterUploader`
+### `core/hs_uploader_shim.py` — `HsPskReporterUploader`
 
-Supervises one long-running `pskreporter-sender` subprocess that
-tails the spot log for one mode. Drains stderr in a thread to avoid
-pipe-buffer deadlock. Restarts on exit with backoff. Logs the
-sender's stderr as `INFO` lines tagged `[pskreporter-<mode>]` so the
-sender's own logs show up in the recorder's process log.
+The PSK Reporter upload path. Runs a daemon thread that pumps
+`psk.spots` rows through the `hs-uploader` library's `Pipeline` +
+`PskReporterTcp` transport, sourcing from sigmond's local SQLite sink
+(`SqliteSource`) or, when no sink is present, the per-slot
+`.spots.txt` spool (`FileTreeSource`).
 
 ### `cli.py` and `daemon.py`
 

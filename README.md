@@ -15,7 +15,7 @@ psk-recorder daemon (one per radiod)
   │                                                     decode_ft8 (fallback)
   ├─ per-mode log file (WSJT-X-canonical or decode_ft8 native)
   ├─ per-mode: pskreporter-sender (UDP or TCP to pskreporter.info)
-  └─ per-mode: ChTailer → sigmond.hamsci_ch.Writer → psk.spots
+  └─ per-mode: ChTailer → sigmond.hamsci_sink.Writer → psk.spots
 ```
 
 **v0.3 (current)** swaps the default decoder from `decode_ft8` to
@@ -85,7 +85,7 @@ per-mode log files in the decoder's native format (WSJT-X-canonical
 for jt9, decode_ft8-native for the fallback), supervise a long-running
 `pskreporter-sender` per mode that tails those logs and uploads to
 pskreporter.info, and stream parsed rows into `psk.spots` via
-`sigmond.hamsci_ch.Writer` (sigmond's local SQLite sink by default).
+`sigmond.hamsci_sink.Writer` (sigmond's local SQLite sink by default).
 
 **Does not:** reimplement the FT8/FT4 decoder, reimplement the
 pskreporter protocol, or talk to `radiod` over anything but

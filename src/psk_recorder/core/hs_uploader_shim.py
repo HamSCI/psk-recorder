@@ -1,23 +1,17 @@
 """hs-uploader-driven PSK Reporter spot uploader.
 
-Drop-in replacement for ``PskReporterUploader`` (the legacy CH-poll +
-``pskreporter`` library shim) that uses the hs-uploader library's
-``Pipeline`` + ``Uploader`` orchestrator and the ``PskReporterTcp``
-transport (which owns the TCP socket end-to-end — no third-party
-library involvement).
+Uses the hs-uploader library's ``Pipeline`` + ``Uploader`` orchestrator
+and the ``PskReporterTcp`` transport (which owns the TCP socket
+end-to-end — no third-party library involvement).
 
-Behind the ``PSK_USE_HS_UPLOADER`` env var feature flag for now;
-becomes the default once the legacy path can be retired.
-
-The lifecycle interface (``start`` / ``stop`` / ``is_active``) matches
-the legacy class so ``recorder.PskRecorder._start_uploaders`` can pick
-between the two without conditional plumbing downstream of construction.
+This is the sole PSK Reporter upload path; ``recorder.PskRecorder.
+_start_uploaders`` constructs it unconditionally.
 
 Source selection:
 
 * ``SqliteSource`` — reads sigmond's local SQLite sink
   (``/var/lib/sigmond/sink.db`` by default, or ``SIGMOND_SQLITE_PATH``),
-  the queue ``sigmond.hamsci_ch.SqliteWriter`` fills.  ``extra_where``
+  the queue ``sigmond.hamsci_sink.Writer`` fills.  ``extra_where``
   filters scope the queue to this daemon's ``radiod_id`` so multi-
   instance is safe by construction.
 * No SQLite sink → fall back to ``FileTreeSource`` reading per-slot
@@ -251,7 +245,7 @@ class HsPskReporterUploader:
 
         1. ``SIGMOND_SQLITE_PATH`` set, OR the default sink
            ``/var/lib/sigmond/sink.db`` exists → ``SqliteSource``
-           (producer-side is ``sigmond.hamsci_ch.SqliteWriter``).
+           (producer-side is ``sigmond.hamsci_sink.Writer``).
         2. Else fall through to the per-slot ``FileTreeSource`` — the
            SlotWorker populates that spool when no local SQLite sink
            is configured.
@@ -289,7 +283,7 @@ class HsPskReporterUploader:
             delete_on_commit=False,
         )
 
-        # SQLite path — sigmond.hamsci_ch.SqliteWriter is the producer
+        # SQLite path — sigmond.hamsci_sink.Writer is the producer
         # half; this shim is the consumer.  Try construction
         # unconditionally; SqliteSource.from_env returns a no-op source
         # when neither SIGMOND_SQLITE_PATH nor the default file exists.
