@@ -21,6 +21,7 @@ if str(SRC_DIR) not in sys.path:
 from psk_recorder.core.ch_tailer import (
     ChTailer,
     parse_decode_ft8_line,
+    parse_decoder_line,
     _parse_message,
 )
 
@@ -32,6 +33,16 @@ from psk_recorder.core.ch_tailer import (
 
 LINE_GROUPED = "2026/05/07 12:34:56 -15 +0.50 14,074,131.2 ~ K1ABC W1XYZ EM26"
 LINE_PLAIN   = "2026/05/07 12:34:56 -15 +0.50 14074131.2 ~ K1ABC W1XYZ EM26"
+LINE_DECODE_FT8 = "2026/05/07 12:34:56 -15 +0.50 14074131.2 ~ K1ABC W1XYZ EM26"
+
+# Every row dict the decode_ft8 parser emits carries this fixed key
+# set, so the psk.spots schema columns map to stable keys.
+EXPECTED_ROW_KEYS = {
+    "time", "mode", "decoder_kind",
+    "score", "snr_db", "spectral_width_hz",
+    "dt", "frequency", "frequency_mhz",
+    "message", "tx_call", "rx_call", "grid", "report",
+}
 
 
 class TestLineParser(unittest.TestCase):
@@ -126,6 +137,37 @@ class TestMessageParser(unittest.TestCase):
     def test_call_with_slash_suffix(self):
         out = _parse_message("K1ABC/QRP W1XYZ FN42")
         self.assertEqual(out["rx_call"], "K1ABC/QRP")
+
+
+class TestDecoderLineRouter(unittest.TestCase):
+    """`parse_decoder_line` routes decode_ft8 lines and rejects junk."""
+
+    def test_routes_decode_ft8_format(self):
+        row = parse_decoder_line(LINE_DECODE_FT8, mode="ft8")
+        self.assertIsNotNone(row)
+        self.assertEqual(row["decoder_kind"], "decode_ft8")
+
+    def test_unrecognised_returns_none(self):
+        self.assertIsNone(parse_decoder_line("hello world"))
+        self.assertIsNone(parse_decoder_line(""))
+        # 4-digit numeric prefix but not the YYYY/MM/DD shape — also rejected.
+        self.assertIsNone(parse_decoder_line("1234 something else"))
+
+
+class TestDecodeFt8RowShape(unittest.TestCase):
+    """The decode_ft8 parser populates the fixed psk.spots key set."""
+
+    def test_decode_ft8_row_has_all_keys(self):
+        row = parse_decode_ft8_line(LINE_DECODE_FT8, mode="ft8")
+        self.assertEqual(set(row.keys()), EXPECTED_ROW_KEYS)
+
+    def test_decode_ft8_snr_is_none(self):
+        """decode_ft8 reports an internal "score"; snr_db and
+        spectral_width_hz are the documented sentinels (None)."""
+        ft8 = parse_decode_ft8_line(LINE_DECODE_FT8, mode="ft8")
+        self.assertIsNone(ft8["snr_db"])             # nullable column
+        self.assertIsNone(ft8["spectral_width_hz"])
+        self.assertEqual(ft8["score"], -15)          # decode_ft8's internal metric
 
 
 # ── ChTailer with a fake writer ─────────────────────────────────────────────

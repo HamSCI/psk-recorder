@@ -74,7 +74,7 @@ class ChannelSink:
         decoder_path: str,
         keep_wav: bool = False,
         authority_reader: Optional[AuthorityReader] = None,
-        decoder_kind: str = "jt9",
+        decoder_kind: str = "decode_ft8",
         decoder_depth: int = 3,
         spool_spots: bool = False,
     ):

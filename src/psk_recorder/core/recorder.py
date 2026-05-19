@@ -387,25 +387,16 @@ class PskRecorder:
         log_dir = Path(self._paths.get(
             "log_dir", "/var/log/psk-recorder"
         ))
-        # CONTRACT v0.6 — `decoder_kind` selects between WSJT-X jt9
-        # (default, calibrated dB SNR + spectral width) and ka9q/
-        # ft8_lib's decode_ft8 (fallback, internal "score" only).  The
-        # paths are looked up per-kind: `paths.decoder_jt9` falls back
-        # to `paths.decoder` for old configs that pre-date the swap.
-        # See SlotWorker for output-format details.
+        # CONTRACT v0.6 — `decoder_kind` selects the decoder backend.
+        # Only ka9q/ft8_lib's `decode_ft8` is supported.  The path
+        # falls back from `paths.decoder_decode_ft8` to `paths.decoder`
+        # for older configs.  See SlotWorker for output-format details.
         decoder_kind = str(self._paths.get("decoder_kind", "decode_ft8")).lower()
-        if decoder_kind == "jt9":
-            decoder = self._paths.get(
-                "decoder_jt9", self._paths.get(
-                    "decoder", "/usr/local/bin/jt9",
-                ),
-            )
-        else:
-            decoder = self._paths.get(
-                "decoder_decode_ft8", self._paths.get(
-                    "decoder", "/usr/local/bin/decode_ft8",
-                ),
-            )
+        decoder = self._paths.get(
+            "decoder_decode_ft8", self._paths.get(
+                "decoder", "/usr/local/bin/decode_ft8",
+            ),
+        )
         decoder_depth = int(self._paths.get("decoder_depth", 3))
         keep_wav = self._paths.get("keep_wav", False)
         # Tee per-slot decoder output into <wav>.spots.txt files only
@@ -440,8 +431,8 @@ class PskRecorder:
             log_path = log_dir / f"{self._radiod_id}-{mode}.log"
             if mode not in self._log_fds:
                 log_path.parent.mkdir(parents=True, exist_ok=True)
-                # Text mode (not binary) — _materialise_jt9_output and other
-                # writers feed Python str through this fd.  Opening in "ab"
+                # Text mode (not binary) — the decoder-output writers
+                # feed Python str through this fd.  Opening in "ab"
                 # raised TypeError("a bytes-like object is required, not
                 # 'str'") and silently dropped every decode on the floor.
                 self._log_fds[mode] = open(log_path, "a", encoding="utf-8")

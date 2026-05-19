@@ -55,21 +55,16 @@ _CALL_RE = re.compile(
 _GRID_RE = re.compile(r"^[A-R]{2}[0-9]{2}(?:[A-Xa-x]{2})?$")
 _REPORT_RE = re.compile(r"^R?([+-]?\d+)$")
 
-# Format-detection regexes for the dual-decoder router.
+# Format-detection regex for the decoder line router.
 _DECODE_FT8_PREFIX = re.compile(r"^\d{4}/\d{2}/\d{2}\s")     # YYYY/MM/DD …
-# YYMMDD HHMMSS BAND_FREQ_HZ … — slot.py prepends the slot's date,
-# 6-digit HHMMSS, and the band's tuned frequency in Hz so the parser
-# can compute absolute receive frequency = BAND_FREQ_HZ + jt9 offset.
-_JT9_PREFIX        = re.compile(r"^\d{6}\s\d{6}\s\d+\s")     # YYMMDD HHMMSS BAND_HZ …
 
 
 def parse_decoder_line(line: str, *, mode: Optional[str] = None) -> Optional[dict]:
-    """Auto-detect decoder format and parse.
+    """Detect the ``decode_ft8`` line format and parse.
 
-    The per-mode log file (`<radiod_id>-<mode>.log`) may carry lines
-    from either ``decode_ft8`` (legacy fallback) or ``jt9`` (current
-    default; canonical WSJT-X-ish format with date prefix added by
-    SlotWorker).  We look at the leading byte run to pick a parser.
+    The per-mode log file (`<radiod_id>-<mode>.log`) carries lines from
+    ``decode_ft8``.  We look at the leading byte run to confirm the
+    structure before parsing.
 
     Returns ``None`` on unrecognised structure (header line, blank,
     junk).  Caller should skip silently.
@@ -77,8 +72,6 @@ def parse_decoder_line(line: str, *, mode: Optional[str] = None) -> Optional[dic
     stripped = line.strip()
     if not stripped:
         return None
-    if _JT9_PREFIX.match(stripped):
-        return parse_jt9_line(stripped, mode=mode)
     if _DECODE_FT8_PREFIX.match(stripped):
         # decode_ft8 emits its own mode-agnostic format; if we don't
         # know the mode (router called without a hint), we leave it
@@ -134,106 +127,6 @@ def parse_decode_ft8_line(line: str, *, mode: str) -> Optional[dict]:
     }
 
 
-def parse_jt9_line(line: str, *, mode: Optional[str] = None) -> Optional[dict]:
-    """Parse one native jt9 line into a psk.spots row.
-
-    Format emitted by ``slot.SlotWorker._materialise_jt9_output``::
-
-        YYMMDD HHMMSS BAND_FREQ_HZ SYNC SNR DT FREQ_OFFSET_HZ MARKER MESSAGE... MODE
-
-    Where::
-
-        YYMMDD              decimal date (UTC, 6 digits)
-        HHMMSS              slot start time (UTC, 6 digits)
-        BAND_FREQ_HZ        the radiod channel's tuned frequency (integer Hz);
-                            absolute receive freq = BAND_FREQ_HZ + FREQ_OFFSET_HZ
-        SYNC                sync confidence (0..~100; jt9-internal score)
-        SNR                 calibrated dB SNR (signed integer)
-        DT                  time-offset within slot (signed float, seconds)
-        FREQ_OFFSET_HZ      baseband frequency offset (float, trailing ``.``)
-        MARKER              packet-quality / hash-resolution flag
-                            ('0', '?', '~') — not stored
-        MESSAGE             one or more whitespace-separated tokens
-        MODE                "FT8" or "FT4" — emitted by jt9 itself
-
-    Field mapping into ``psk.spots``:
-
-        SYNC                  → score        (Int16; jt9 sync confidence)
-        SNR                   → snr_db       (Float32; calibrated dB)
-        DT                    → dt           (Float32)
-        BAND_FREQ + OFFSET    → frequency    (Int64; absolute Hz)
-        MSG                   → message      (raw String)
-        MODE                  → mode
-
-    Returns ``None`` on any parse failure.
-    """
-    parts = line.strip().split()
-    # 10 = YYMMDD HHMMSS BAND SYNC SNR DT FREQ MARKER MSG_ONE_TOKEN MODE
-    # — minimum plausible row with a single-token message.
-    if len(parts) < 10:
-        return None
-
-    # Date + time → UTC datetime (slot HHMMSS has full second resolution).
-    # slot.py emits these in UTC; tag tz-aware so the sink writer
-    # doesn't reinterpret them in a local timezone.
-    try:
-        ts = datetime.strptime(
-            parts[0] + parts[1], "%y%m%d%H%M%S"
-        ).replace(tzinfo=timezone.utc)
-    except ValueError:
-        return None
-    try:
-        band_freq_hz = int(parts[2])
-        sync_score = int(parts[3])
-        snr_db = int(parts[4])
-        dt = float(parts[5])
-        # jt9 emits frequency offset with trailing ``.`` ("1397.").
-        freq_offset_hz = int(float(parts[6]))
-    except (ValueError, IndexError):
-        return None
-
-    abs_freq_hz = band_freq_hz + freq_offset_hz
-
-    # parts[7] is the MARKER ('0' / '?' / '~') — skip; not in schema.
-    # Last token is the MODE tag; everything from parts[8] up to (but
-    # not including) MODE is the message.
-    last = parts[-1]
-    if last.upper() in ("FT8", "FT4"):
-        detected_mode = last.lower()
-        message_end = len(parts) - 1
-    else:
-        # Mode token missing — use caller's hint if any; treat full tail
-        # as message text.
-        detected_mode = ""
-        message_end = len(parts)
-
-    message_tokens = parts[8:message_end]
-    if not message_tokens:
-        return None
-    message = " ".join(message_tokens)
-    parsed = _parse_message(message)
-
-    return {
-        "time":               ts,
-        "mode":               detected_mode or (mode or ""),
-        "decoder_kind":       "jt9",
-        "score":              sync_score,
-        "snr_db":             snr_db,
-        "spectral_width_hz":  None,
-        "dt":                 dt,
-        # frequency is ABSOLUTE Hz (band + offset) — matches the
-        # original 001_create_spots.sql schema intent and is what
-        # PSK Reporter / wsprnet need.
-        "frequency":          abs_freq_hz,
-        "frequency_mhz":      abs_freq_hz / 1_000_000.0,
-        "message":            message,
-        "tx_call":            parsed.get("tx_call", ""),
-        "rx_call":            parsed.get("rx_call", ""),
-        "grid":               parsed.get("grid", ""),
-        "report":             parsed.get("report"),
-    }
-
-
 def _parse_message(message: str) -> dict:
     """Best-effort parse of a decoded FT8/FT4 message body.
 
@@ -272,9 +165,9 @@ def _parse_message(message: str) -> dict:
     else:
         # <rx_call> <tx_call> [grid|report|RR73|73]
         # Compound callsigns may appear bracketed (`<K1ABC/QRP>`) — that's
-        # what jt9 / wsprd substitute when they resolved a hash from
-        # their session table.  Strip the brackets before matching so
-        # the call lands in the row instead of being dropped.
+        # what a WSJT-X-protocol decoder substitutes when it resolved a
+        # hash from its session table.  Strip the brackets before
+        # matching so the call lands in the row instead of being dropped.
         rx_candidate = _strip_call_brackets(tokens[0])
         if rx_candidate is not None and _CALL_RE.match(rx_candidate):
             out["rx_call"] = rx_candidate
