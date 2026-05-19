@@ -14,34 +14,13 @@ log_dir     = "/var/log/psk-recorder"
 pskreporter = "/usr/local/bin/pskreporter-sender"
 keep_wav    = false
 
-# Decoder selection.  Two backends are supported:
-#
-#   "decode_ft8" — ka9q/ft8_lib's decoder.  *Default.*  Streams to
-#                  stdout, reports an ft8_lib-internal "score" rather
-#                  than a calibrated dB SNR.  ~0.05 s of CPU per slot
-#                  per band, ~4 MB RSS — for the standard 19-channel
-#                  layout this is essentially invisible at idle.
-#
-#   "jt9"        — WSJT-X's canonical FT4/FT8 decoder.  Reports
-#                  calibrated dB SNR, time-offset, frequency-offset,
-#                  decoded message text, and a spectral-width metric.
-#                  Substantially heavier: ~1-2 s CPU and ~60 MB RSS
-#                  per slot per band — a 19-channel cycle peaks at
-#                  ~12 cores busy for ~3 s and triggers swap on hosts
-#                  with <8 GB RAM.  Worth the cost when you need
-#                  calibrated SNR or maximum weak-signal depth.
-#                  Provided by Debian's `wsjtx` package.
-#
-# Both decoders coexist in the schema — rows self-identify via
-# `decoder_kind` in `psk.spots`.  Switch by changing the value below.
+# Decoder.  psk-recorder decodes with ka9q/ft8_lib's `decode_ft8`: it
+# streams to stdout, reports an ft8_lib-internal "score" rather than a
+# calibrated dB SNR, and costs ~0.05 s CPU / ~4 MB RSS per slot per
+# band — essentially invisible at idle for the standard 19-channel
+# layout.  Rows self-identify via `decoder_kind` in `psk.spots`.
 decoder_kind        = "decode_ft8"
-decoder_jt9         = "/opt/psk-recorder/bin/decoders/jt9"
 decoder_decode_ft8  = "/usr/local/bin/decode_ft8"
-
-# jt9 decode depth (1–3).  3 is "deep decode" — best results, ~3×
-# slower than depth 1.  Per the WSJT-X docs the time cost is well
-# below FT8's 15 s slot cadence so depth 3 is safe.
-decoder_depth       = 3
 
 # Optional standalone fallback for chain-delay correction (contract v0.3 §8).
 # Overridden by RADIOD_<id>_CHAIN_DELAY_NS in coordination.env when present.

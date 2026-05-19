@@ -49,41 +49,13 @@ dst  = "/var/log/psk-recorder"
 owner = "pskrec:pskrec"
 mode  = "0755"
 
-# Bundled jt9 binaries (per-arch).  scripts/install.sh adds the
-# arch-specific symlink to `jt9` after this copy lands; the symlink
-# step is not yet expressible as a sigmond install kind, so operators
-# using `smd install psk-recorder` should run the install.sh manually
-# (or wait for the smd-install symlink-with-arch enhancement).
-[[install.steps]]
-kind = "copy"
-src  = "bin/decoders"
-dst  = "/opt/psk-recorder/bin/decoders"
-
 [systemd]
 units = ["psk-recorder@.service"]
-
-[deps]
-# jt9 (default FT4/FT8 decoder) is bundled per-arch under
-# bin/decoders/jt9-{x86,arm64,arm32}-v27 and installed by scripts/install.sh
-# to /opt/psk-recorder/bin/decoders/.  We deliberately do NOT pull in the
-# `wsjtx` package — it brings ~150 MB of Qt5Gui + sample sounds we don't
-# need.  Only the minimum runtime shared libs jt9 dlopens are required:
-[[deps.apt]]
-name = "libqt5core5a"
-note = "Qt5 core runtime — jt9's only Qt dep (no GUI libs needed)"
-
-[[deps.apt]]
-name = "libfftw3-single3"
-note = "FFTW single-precision (libfftw3f) — jt9's FFT backend"
-
-[[deps.apt]]
-name = "libgfortran5"
-note = "Fortran runtime — jt9 is built in Fortran"
 
 [[deps.git]]
 name       = "ft8_lib"
 url        = "https://github.com/ka9q/ft8_lib.git"
-note       = "provides /usr/local/bin/decode_ft8 (decoder_kind=decode_ft8 fallback)"
+note       = "provides /usr/local/bin/decode_ft8 — psk-recorder's FT4/FT8 decoder"
 
 [[deps.git]]
 name       = "ftlib-pskreporter"
