@@ -36,7 +36,8 @@ from psk_recorder.config import (
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:  # pragma: no cover
     from psk_recorder.core.stream import ChannelSink
-from psk_recorder.core.ch_tailer import ChTailer
+from psk_recorder.core.ch_tailer import ChTailer, _default_writer_factory
+from psk_recorder.core.cycle_batcher import PskCycleBatcher
 from psk_recorder.core.uploader import PskReporterUploader
 from psk_recorder.core.hs_uploader_shim import HsPskReporterUploader
 from psk_recorder.core.receiver_manager import (
@@ -206,6 +207,11 @@ class PskRecorder:
         self._lifetime_entries: list[tuple[object, int]] = []
         self._lifetime_thread: Optional[threading.Thread] = None
 
+        # Phase C: one PskCycleBatcher per process; all
+        # ReceiverManagers' ChTailers feed it.  Started in run()
+        # before tailers spawn; stopped in _shutdown() after them.
+        self._cycle_batcher: Optional[PskCycleBatcher] = None
+
     # --- Per-source iteration helpers ---------------------------------
 
     @property
@@ -364,12 +370,25 @@ class PskRecorder:
         # See class docstring + the original _start_ch_tailers comment
         # for the mode→forward mapping rationale.
         forward_flag = (mode == "server")
+
+        # Phase C: lazily construct + start the shared cycle batcher
+        # once we know there is at least one tailer about to feed it.
+        # Each ReceiverManager's tailers all receive the same batcher
+        # reference so cross-rx spots collapse into one batch per
+        # (cycle, source).
+        if self._cycle_batcher is None:
+            self._cycle_batcher = PskCycleBatcher(
+                writer_factory=_default_writer_factory,
+            )
+            self._cycle_batcher.start()
+
         for rx in self._receivers:
             rx.start_ch_tailers(
                 callsign=callsign,
                 host_grid=grid,
                 proc_version=proc_version,
                 forward_flag=forward_flag,
+                cycle_batcher=self._cycle_batcher,
             )
 
     def _wait_for_chrony_settled(self) -> bool:
@@ -741,6 +760,8 @@ class PskRecorder:
                 logger.exception("Error stopping uploader")
         # Stop each ReceiverManager — handles its own ChTailers,
         # MultiStreams, sinks, log fds, and RadiodControl close.
+        # Stopping tailers first ensures no new rows hit the batcher
+        # while it's draining.
         for rx in self._receivers:
             try:
                 rx.stop()
@@ -748,6 +769,14 @@ class PskRecorder:
                 logger.exception(
                     "Error stopping ReceiverManager %s", rx.radiod_id,
                 )
+        # Drain + stop the cycle batcher last so any spots already
+        # queued in its pending batches make it to psk.spots before
+        # the process exits.
+        if self._cycle_batcher is not None:
+            try:
+                self._cycle_batcher.stop()
+            except Exception:
+                logger.exception("Error stopping cycle batcher")
         logger.info("Shutdown complete")
 
 

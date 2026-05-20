@@ -342,6 +342,7 @@ class ChTailer:
         callhash_path: Optional[Path] = None,
         forward_to_pskreporter: bool = True,
         rx_source: str = "",
+        cycle_batcher: Optional[object] = None,
     ) -> None:
         self._log_path = Path(log_path)
         self._mode = mode
@@ -358,6 +359,14 @@ class ChTailer:
         # without the caller having to supply one.  Phase A plumbing for
         # the multi-source pipeline planned in psk-recorder.
         self._rx_source = rx_source or f"radiod:{radiod_id}"
+        # Optional :class:`PskCycleBatcher` reference (Phase C).  When
+        # set, rows flow through the batcher (cycle-aligned commit, log
+        # line in WSPR-parity format, foundation for cross-rx dedup in
+        # Phase D) and the local writer is unused.  When None, this
+        # tailer owns its own writer and inserts directly — legacy
+        # Phase A/B behaviour, kept so single-tailer tests don't need
+        # to spin up a batcher.
+        self._cycle_batcher = cycle_batcher
         # Tags every row written to the local sink so the wsprdaemon
         # server's gw1-elected pskreporter_forwarder knows whether to
         # POST it to pskreporter.info. Controlled by PSK_DELIVERY_MODE
@@ -388,14 +397,22 @@ class ChTailer:
         observable via `is_active`.  Failure to import the writer
         package is logged and the thread exits.
         """
-        try:
-            self._writer = self._writer_factory(self._batch_rows)
-        except Exception as e:
-            logger.warning("ch_tailer disabled (%s): %s", self._mode, e)
-            return
-        if self._writer.is_noop:
-            logger.debug("ch_tailer %s: sink writer is a no-op "
-                         "(sink path unwritable)", self._mode)
+        # Skip the local writer construction when a batcher will own
+        # the SQLite path.  The batcher's writer thread builds its own
+        # connection (matches sqlite3 thread-affinity).
+        if self._cycle_batcher is None:
+            try:
+                self._writer = self._writer_factory(self._batch_rows)
+            except Exception as e:
+                logger.warning(
+                    "ch_tailer disabled (%s): %s", self._mode, e,
+                )
+                return
+            if self._writer.is_noop:
+                logger.debug(
+                    "ch_tailer %s: sink writer is a no-op "
+                    "(sink path unwritable)", self._mode,
+                )
         # Skip historical content — only tail from current end.
         if self._log_path.exists():
             try:
@@ -434,6 +451,12 @@ class ChTailer:
 
     @property
     def health(self) -> str:
+        # Batcher-backed tailers don't own a writer; the batcher's
+        # writer is what reports up health-status.  Surface "ok" here
+        # so the tailer's own thread liveness is the only signal we
+        # gate on at this layer.
+        if self._cycle_batcher is not None:
+            return "ok"
         if self._writer is None:
             return "noop"
         return self._writer.health
@@ -448,7 +471,9 @@ class ChTailer:
             logger.exception("ch_tailer %s: unhandled error in poll loop", self._mode)
 
     def _poll_once(self) -> None:
-        if self._writer is None:
+        # Only the legacy direct-write path needs a writer; the
+        # batcher path has its own writer thread upstream.
+        if self._writer is None and self._cycle_batcher is None:
             return
         try:
             stat = self._log_path.stat()
@@ -470,8 +495,14 @@ class ChTailer:
             self._consume(chunk.decode(errors="replace"))
 
         # Periodic flush even if no new data, so a partial batch
-        # doesn't sit indefinitely.
-        if (time.monotonic() - self._last_flush) > self.FLUSH_INTERVAL_SEC:
+        # doesn't sit indefinitely.  Only applies to the legacy
+        # direct-write path — the batcher's writer thread runs its
+        # own deadline-based flushes.
+        if (
+            self._writer is not None
+            and (time.monotonic() - self._last_flush)
+                > self.FLUSH_INTERVAL_SEC
+        ):
             try:
                 self._writer.flush()
             except Exception as e:
@@ -505,11 +536,33 @@ class ChTailer:
             row["forward_to_pskreporter"] = self._forward_to_pskreporter
             rows.append(row)
         if rows:
-            try:
-                self._writer.insert(rows)
-            except Exception as e:
-                logger.warning("ch_tailer %s: insert failed (%d rows): %s",
-                               self._mode, len(rows), e)
+            if self._cycle_batcher is not None:
+                # Phase C: dispatch to the shared batcher.  It handles
+                # cycle bucketing, the SQLite write, and the
+                # cycle-commit log line.  The batcher's own writer
+                # thread owns the SQLite connection.
+                try:
+                    self._cycle_batcher.add(
+                        rows,
+                        rx_source=self._rx_source,
+                        radiod_id=self._radiod_id,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "ch_tailer %s: batcher add failed (%d rows): %s",
+                        self._mode, len(rows), e,
+                    )
+            else:
+                # Legacy direct-write path — kept for single-tailer
+                # tests + any deployment that hasn't been migrated to
+                # the batcher yet.
+                try:
+                    self._writer.insert(rows)
+                except Exception as e:
+                    logger.warning(
+                        "ch_tailer %s: insert failed (%d rows): %s",
+                        self._mode, len(rows), e,
+                    )
 
         # Periodic callhash persistence.  CALLHASH_SAVE_INTERVAL_SEC is
         # generous (5 min) to amortise the JSON write across many

@@ -326,14 +326,17 @@ class ReceiverManager:
         host_grid: str,
         proc_version: str,
         forward_flag: bool,
+        cycle_batcher: Optional[object] = None,
     ) -> None:
         """Start one ChTailer per (radiod, mode) — CONTRACT v0.6 §17.
 
         Each tailer watches the same ``<radiod_id>-<mode>.log`` file
-        pskreporter-sender tails, parses new lines, and inserts rows
-        into ``psk.spots`` via ``sigmond.hamsci_ch.Writer.from_env()``.
-        Failure to import / start is non-fatal: the existing PSKReporter
-        upload path is unaffected.
+        pskreporter-sender tails, parses new lines, and forwards rows
+        to ``cycle_batcher`` (Phase C — cycle-aligned commit, log
+        line in WSPR-parity format, foundation for cross-rx dedup).
+        When ``cycle_batcher`` is None the tailer falls back to the
+        legacy direct-to-sink Writer — kept so tests don't have to
+        spin up a batcher.
 
         ChTailer runs in ALL three PSK_DELIVERY_MODE values — the mode
         affects only ``forward_to_pskreporter``, not whether tailers
@@ -355,6 +358,7 @@ class ReceiverManager:
                     processing_version=proc_version,
                     callhash_path=callhash_path,
                     forward_to_pskreporter=forward_flag,
+                    cycle_batcher=cycle_batcher,
                 )
                 tailer.start()
                 self._ch_tailers.append(tailer)
