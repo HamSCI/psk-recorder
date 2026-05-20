@@ -51,6 +51,26 @@ logger = logging.getLogger(__name__)
 PUMP_INTERVAL_SEC = 30.0
 
 
+def _short_rx(rx_source: str) -> str:
+    """Render the multi-rx source key compactly for log lines.
+
+    ``radiod:bee1-status.local`` → ``bee1``; falls back to the raw
+    string for any unexpected form so we never silently lose info.
+    Mirrors the rendering ``smd watch wspr`` uses on its per-cycle
+    output for the same kind of tag.
+    """
+    base = rx_source or "?"
+    for prefix in ("radiod:",):
+        if base.startswith(prefix):
+            base = base[len(prefix):]
+            break
+    for suffix in ("-status.local", ".local"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+            break
+    return base or "?"
+
+
 class HsPskReporterUploader:
     """Pump psk.spots → PSK Reporter via hs-uploader's Pipeline."""
 
@@ -90,6 +110,14 @@ class HsPskReporterUploader:
         # so the journal log line reports just this cycle's deltas.
         self._pump_ft8 = 0
         self._pump_ft4 = 0
+        # Phase D Cut 1: per-rx_source per-pump ship counts, populated
+        # from the on_batch_outcome callback so the per-pump log line
+        # can break "shipped ft8=N ft4=M" down by which receiver each
+        # spot came from — mirrors how ``smd watch wspr`` surfaces
+        # per-rx contribution.  Keyed by the row's ``rx_source`` field
+        # (e.g. ``radiod:bee1-status.local``); blank-source rows fall
+        # into a ``"?"`` bucket so they don't get silently dropped.
+        self._pump_by_rx: dict[str, dict[str, int]] = {}
 
     # ----- lifecycle -----
 
@@ -200,24 +228,29 @@ class HsPskReporterUploader:
                 # Works across SqliteSource / file sources uniformly.
                 self._pump_ft8 = 0
                 self._pump_ft4 = 0
+                self._pump_by_rx = {}
 
                 if self._uploader is not None and self._uploader.pump():
                     self._work_count += 1
                     self._uploaded_ft8 += self._pump_ft8
                     self._uploaded_ft4 += self._pump_ft4
-                    # INFO so `smd psk-watch` (sigmond) has something
-                    # to display.  Quiet pumps (no work) stay silent
-                    # so the log doesn't churn every 30 s on a dead
-                    # band.  Per-mode counts give the operator the
-                    # signal they actually want: "shipping 50 ft8 and
-                    # 5 ft4 per cycle" reads at a glance, "work=N
-                    # pumps=N" doesn't.
+                    # Render per-rx breakdown when more than one source
+                    # contributed this pump — keeps single-rx logs
+                    # unchanged, surfaces multi-rx visibility when it
+                    # matters.  Operators reading ``smd watch psk`` see
+                    # which receivers are actually contributing spots.
+                    rx_part = ""
+                    if len(self._pump_by_rx) > 1:
+                        rx_part = " by_rx=[" + " ".join(
+                            f"{_short_rx(rx)}:{counts.get('ft8', 0)}/{counts.get('ft4', 0)}"
+                            for rx, counts in sorted(self._pump_by_rx.items())
+                        ) + "]"
                     logger.info(
                         "psk-uploader-hs: shipped ft8=%d ft4=%d "
-                        "(total ft8=%d ft4=%d, work=%d)",
+                        "(total ft8=%d ft4=%d, work=%d)%s",
                         self._pump_ft8, self._pump_ft4,
                         self._uploaded_ft8, self._uploaded_ft4,
-                        self._work_count,
+                        self._work_count, rx_part,
                     )
             except Exception:
                 logger.exception(
@@ -243,6 +276,12 @@ class HsPskReporterUploader:
                 self._pump_ft8 += 1
             elif mode == "ft4":
                 self._pump_ft4 += 1
+            # Phase D Cut 1: per-rx tally so the pump-log line can
+            # surface per-receiver contribution in multi-source mode.
+            rx = str(cols.get("rx_source", "")) or "?"
+            by = self._pump_by_rx.setdefault(rx, {"ft8": 0, "ft4": 0})
+            if mode in ("ft8", "ft4"):
+                by[mode] = by.get(mode, 0) + 1
 
     # ----- source selection -----
 
@@ -267,9 +306,22 @@ class HsPskReporterUploader:
             select_columns=[
                 "time", "frequency", "mode", "snr_db", "tx_call",
                 "grid", "score", "message",
+                # Phase D Cut 1: surface the per-spot receiver tag so
+                # the on_batch_outcome callback can count ships per
+                # rx_source (operator visibility — "bee1 contributed
+                # 40 FT8, bee2 contributed 35, local contributed 38")
+                # and so Cut 2's cross-rx dedup picker has the input
+                # it needs without re-reading the row from sqlite.
+                "rx_source",
             ],
             extra_where=[
-                ("radiod_id", "=", self._radiod_id),
+                # Phase D Cut 1: dropped the radiod_id filter.  In
+                # single-process / multi-source mode (Phase B), one
+                # uploader pumps spots from EVERY receiver — filtering
+                # to a single radiod_id would silently drop bee1 / bee2
+                # spots on the floor.  The legacy single-source case
+                # is unaffected: the queue only contains one radiod's
+                # rows anyway.
                 ("tx_call", "!=", ""),
                 ("mode", "IN", ["ft8", "ft4"]),
             ],
