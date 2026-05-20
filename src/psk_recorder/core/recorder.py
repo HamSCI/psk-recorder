@@ -87,35 +87,117 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-# PSK_DELIVERY_MODE — how spots reach PSKReporter.
+# PSK_DELIVERY_PIPELINES — how spots reach PSKReporter / wsprdaemon.
 #
-#   server (default): client only ships to wsprdaemon servers; the
-#                     gw1-elected pskreporter_forwarder service POSTs
-#                     to pskreporter.info on the client's behalf.
-#                     Spots are tagged forward_to_pskreporter=True in
-#                     the local sink → tar → psk.spots.
-#   direct          : client POSTs directly to pskreporter.info (today's
-#                     behavior). No wsprdaemon-server path: the
-#                     ch_tailer that feeds the local SQLite sink is
-#                     not started, so nothing ships to wsprdaemon.
-#   both            : client POSTs directly AND ships to wsprdaemon.
-#                     Spots are tagged forward_to_pskreporter=False so
-#                     the server does NOT re-post (avoids duplicates).
-_VALID_DELIVERY_MODES = ("server", "direct", "both")
+# Comma-separated list of pipeline names; order doesn't matter.
+#
+#   direct        client POSTs directly to pskreporter.info (cross-rx
+#                 dedup applies — see HsPskReporterUploader / Phase D
+#                 Cut 2).  No server involvement on the upload side.
+#   server-merge  ship every receiver's row to wsprdaemon-server with
+#                 ``forward_to_pskreporter=True`` so the server's
+#                 gw1-elected pskreporter_forwarder service POSTs to
+#                 pskreporter.info on the client's behalf.  Server-
+#                 side cross-rx dedup is up to the server.
+#   server-raw    ship every receiver's row to wsprdaemon-server with
+#                 ``forward_to_pskreporter=False`` so the server
+#                 stores per-rx but does NOT post to pskreporter.
+#                 Use with ``direct`` so the server has a raw archive
+#                 while the client owns the dedup + upload path.
+#
+# The two server-* pipelines control the per-row
+# ``forward_to_pskreporter`` flag; only one can win.  Conflict
+# resolution: if BOTH ``direct`` and ``server-merge`` are enabled,
+# ``server-merge`` downgrades to ``server-raw`` (forward=False) so
+# the server doesn't double-post.
+#
+# Legacy ``PSK_DELIVERY_MODE`` is still honoured and translates:
+#   server  →  server-merge
+#   direct  →  direct
+#   both    →  direct,server-raw
+#
+_VALID_DELIVERY_PIPELINES = ("direct", "server-merge", "server-raw")
+
+# Legacy → new mapping.  Symmetric so a host that already had
+# ``PSK_DELIVERY_MODE`` set keeps the same effective behaviour
+# after a deploy that swaps to PSK_DELIVERY_PIPELINES.
+_LEGACY_MODE_TO_PIPELINES = {
+    "server": ("server-merge",),
+    "direct": ("direct",),
+    "both":   ("direct", "server-raw"),
+}
 
 
-def _resolve_delivery_mode() -> str:
-    """Read + validate PSK_DELIVERY_MODE; fall back to 'server' on
-    anything bogus. We log the choice once at startup so an operator
-    typo doesn't silently disable direct delivery."""
-    raw = (os.environ.get("PSK_DELIVERY_MODE") or "server").strip().lower()
-    if raw not in _VALID_DELIVERY_MODES:
+def _resolve_delivery_pipelines() -> tuple[str, ...]:
+    """Read + validate PSK_DELIVERY_PIPELINES.
+
+    Precedence:
+
+      1. ``PSK_DELIVERY_PIPELINES`` (comma-separated list).  Unknown
+         tokens are dropped with a WARNING but the rest of the list
+         is honoured.
+      2. ``PSK_DELIVERY_MODE`` (legacy single value) — translated via
+         ``_LEGACY_MODE_TO_PIPELINES``.
+      3. Default: ``server-merge`` — matches today's default,
+         server-side forwarding to pskreporter.info.
+
+    Returns a deterministic, deduplicated tuple in canonical order
+    (``direct``, ``server-merge``, ``server-raw``) so the rest of
+    the recorder can iterate it without worrying about formatting.
+    The order matters for the rendered log line but not for the
+    behaviour — each pipeline is independent.
+    """
+    raw_pipes = (os.environ.get("PSK_DELIVERY_PIPELINES") or "").strip().lower()
+    if raw_pipes:
+        requested = [
+            t.strip() for t in raw_pipes.split(",") if t.strip()
+        ]
+        valid, dropped = [], []
+        for t in requested:
+            if t in _VALID_DELIVERY_PIPELINES and t not in valid:
+                valid.append(t)
+            elif t not in _VALID_DELIVERY_PIPELINES:
+                dropped.append(t)
+        if dropped:
+            logger.warning(
+                "PSK_DELIVERY_PIPELINES: dropping unknown pipeline(s) %s "
+                "(valid: %s)",
+                dropped, _VALID_DELIVERY_PIPELINES,
+            )
+        if valid:
+            return _canonicalise_pipelines(valid)
+        # Fall through to legacy/default — empty after filtering means
+        # operator typed nothing valid, treat as if unset.
+
+    raw_mode = (os.environ.get("PSK_DELIVERY_MODE") or "").strip().lower()
+    if raw_mode:
+        if raw_mode in _LEGACY_MODE_TO_PIPELINES:
+            translated = _LEGACY_MODE_TO_PIPELINES[raw_mode]
+            logger.info(
+                "PSK_DELIVERY_MODE=%r (legacy) → pipelines %s",
+                raw_mode, list(translated),
+            )
+            return _canonicalise_pipelines(translated)
         logger.warning(
-            "PSK_DELIVERY_MODE=%r is not one of %s; defaulting to 'server'",
-            raw, _VALID_DELIVERY_MODES,
+            "PSK_DELIVERY_MODE=%r is not one of %s; defaulting to "
+            "server-merge",
+            raw_mode, tuple(_LEGACY_MODE_TO_PIPELINES.keys()),
         )
-        return "server"
-    return raw
+
+    return ("server-merge",)
+
+
+def _canonicalise_pipelines(pipes) -> tuple[str, ...]:
+    """Return ``pipes`` in canonical order with duplicates removed."""
+    seen: set = set()
+    out: list = []
+    for p in _VALID_DELIVERY_PIPELINES:
+        if p in pipes and p not in seen:
+            out.append(p)
+            seen.add(p)
+    return tuple(out)
+
+
 
 
 def _sqlite_sink_available() -> bool:
@@ -366,10 +448,28 @@ class PskRecorder:
             ver = "0.1.0"
         proc_version = f"{ver}+{short}" if short else ver
 
-        mode = _resolve_delivery_mode()
-        # See class docstring + the original _start_ch_tailers comment
-        # for the mode→forward mapping rationale.
-        forward_flag = (mode == "server")
+        pipelines = _resolve_delivery_pipelines()
+        # forward_to_pskreporter is True only when ``server-merge`` is
+        # the ONLY way spots reach pskreporter.  If ``direct`` is also
+        # enabled, both paths would post and the server would
+        # double-deliver — flip the flag to False so the server stores
+        # but doesn't forward.  ``server-raw`` alone means the
+        # operator explicitly wants the server to NOT forward; same
+        # flag.
+        if "direct" in pipelines and "server-merge" in pipelines:
+            logger.info(
+                "PSK_DELIVERY_PIPELINES: ``direct`` + ``server-merge`` "
+                "both enabled — downgrading ``server-merge`` to "
+                "``server-raw`` for this run (forward_to_pskreporter=False) "
+                "so the server doesn't double-post",
+            )
+        forward_flag = (
+            "server-merge" in pipelines and "direct" not in pipelines
+        )
+        logger.info(
+            "PSK pipelines active: %s (forward_to_pskreporter=%s)",
+            list(pipelines), forward_flag,
+        )
 
         # Phase C: lazily construct + start the shared cycle batcher
         # once we know there is at least one tailer about to feed it.
@@ -523,12 +623,20 @@ class PskRecorder:
         # opts into the new path; default is legacy.  The hs path reads
         # SqliteSource when sigmond's SQLite sink is present, else
         # FileTreeSource over the per-slot spool.
-        mode = _resolve_delivery_mode()
-        if mode == "server":
+        #
+        # The direct uploader only runs when ``direct`` is in the
+        # active pipelines set (see PSK_DELIVERY_PIPELINES at the top
+        # of this module).  Server-side pipelines (``server-merge`` /
+        # ``server-raw``) are driven from the SQLite sink → wsprdaemon-
+        # tar transport in a separate process (sigmond / wd-upload-hs)
+        # and need no work here.
+        pipelines = _resolve_delivery_pipelines()
+        if "direct" not in pipelines:
             logger.info(
-                "PSK_DELIVERY_MODE=server: direct PSKReporter uploader "
-                "disabled; spots will reach PSKReporter via wsprdaemon "
-                "server forwarding"
+                "PSK pipelines %s — direct PSKReporter uploader "
+                "disabled; spots reach pskreporter.info via "
+                "wsprdaemon-server forwarding (if ``server-merge`` is on)",
+                list(pipelines),
             )
             return
         callsign = self._station.get("callsign", "")
