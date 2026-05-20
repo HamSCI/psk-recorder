@@ -37,6 +37,7 @@ Other notes:
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from pathlib import Path
 from typing import Optional
@@ -49,6 +50,23 @@ logger = logging.getLogger(__name__)
 # upload cadence.  30 s aligns with the FT4/FT8 slot rate; same value
 # as the legacy PSKREPORTER_INTERVAL.
 PUMP_INTERVAL_SEC = 30.0
+
+
+def _cross_rx_dedup_enabled() -> bool:
+    """Phase D Cut 2: cross-rx dedup is ON by default for the direct
+    PSKReporter pipeline.  Multi-rx hosts otherwise post the same
+    spot once per receiver — PSKReporter rejects the duplicates
+    server-side, but that's wasted bandwidth + log noise on both
+    ends.
+
+    Override with ``PSK_DIRECT_DEDUP=0`` for the diagnostic case
+    where an operator wants every receiver's row to reach PSKReporter
+    independently (e.g. testing why one receiver's decodes never
+    win — usually a calibration issue) — or to opt out entirely on
+    a single-source host where the dedup overhead isn't justified.
+    """
+    raw = (os.environ.get("PSK_DIRECT_DEDUP") or "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
 
 
 def _short_rx(rx_source: str) -> str:
@@ -313,6 +331,12 @@ class HsPskReporterUploader:
                 # and so Cut 2's cross-rx dedup picker has the input
                 # it needs without re-reading the row from sqlite.
                 "rx_source",
+                # Phase D Cut 2: 100 Hz bucket of the decode frequency,
+                # populated by ChTailer at row-write time.  Needed in
+                # the SELECT so the SqliteSource window-function
+                # dedup can partition on it (the json_extract goes
+                # into the SQL — see ``dedup_partition_by`` below).
+                "frequency_bucket_hz",
             ],
             extra_where=[
                 # Phase D Cut 1: dropped the radiod_id filter.  In
@@ -340,6 +364,47 @@ class HsPskReporterUploader:
             # (PSK_RETENTION_MIN, default 60 min, 30-min floor).
             delete_on_commit=False,
         )
+
+        # Phase D Cut 2: cross-rx dedup at the SQL layer.  The same TX
+        # decoded by multiple receivers produces N near-identical rows
+        # in the queue (one per rx); without dedup we'd post all of
+        # them to PSKReporter, which rejects duplicates server-side
+        # and wastes bandwidth.  The dedup picks the highest-``score``
+        # row per ``(time, tx_call, frequency_bucket_hz)`` partition
+        # so each cycle's TX surfaces once, from the receiver that
+        # heard it best.
+        #
+        # Frequency bucketing (100 Hz, stamped by ChTailer at write
+        # time) absorbs the ~1-5 Hz inter-receiver clock jitter so
+        # the same TX clusters correctly across radiods.
+        #
+        # Order field is ``score`` (sync confidence for jt9, internal
+        # score for decode_ft8); both decoders populate it.
+        # ``snr_db`` would be the more meaningful ranker for jt9-only
+        # hosts but decode_ft8 leaves it null, so the partition
+        # would drop all-NULL groups silently.
+        #
+        # NOTE: this dedup only affects the direct PSKReporter path
+        # via this SqliteSource.  The same queue feeds the wsprdaemon
+        # raw-tar transport (Phase D Cut 4) WITHOUT dedup — diversity
+        # of per-rx spots is the whole point of the server-side
+        # delivery.  Different consumers, different SqliteSource
+        # instances, different dedup policies, same queue.
+        if _cross_rx_dedup_enabled():
+            sqlite_kwargs["dedup_partition_by"] = (
+                "time", "tx_call", "frequency_bucket_hz",
+            )
+            sqlite_kwargs["dedup_order_by_desc"] = "score"
+            logger.info(
+                "psk-uploader-hs: cross-rx dedup ENABLED "
+                "(partition by time+tx_call+freq_bucket, order by score)",
+            )
+        else:
+            logger.info(
+                "psk-uploader-hs: cross-rx dedup DISABLED "
+                "(PSK_DIRECT_DEDUP=0); every receiver's row will be "
+                "POSTed to PSKReporter independently",
+            )
 
         # SQLite path — sigmond.hamsci_ch.SqliteWriter is the producer
         # half; this shim is the consumer.  Try construction

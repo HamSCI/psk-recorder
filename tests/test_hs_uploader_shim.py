@@ -326,3 +326,66 @@ def test_per_rx_tally_skips_non_acked_outcomes(monkeypatch, tmp_path):
     u._on_batch_outcome(None, _Batch(), _Outcome())
     assert u._pump_ft8 == 0
     assert u._pump_by_rx == {}
+
+
+# ── Phase D Cut 2: cross-rx dedup at the SQL layer ─────────────────────────
+
+def test_dedup_enabled_by_default(monkeypatch, tmp_path):
+    """SqliteSource construction sets the dedup window-function args
+    so the same TX heard by multiple receivers collapses to one row
+    per (time, tx_call, freq_bucket) before reaching PskReporterTcp."""
+    monkeypatch.setenv("HS_UPLOADER_STATE_DIR", str(tmp_path))
+    monkeypatch.delenv("PSK_DIRECT_DEDUP", raising=False)  # default = on
+    sink = tmp_path / "sink.db"
+    _make_sink(sink)
+    monkeypatch.setenv("SIGMOND_SQLITE_PATH", str(sink))
+
+    u = HsPskReporterUploader(
+        callsign="AC0G", grid_square="EM38ww", radiod_id="local",
+    )
+    src = u._build_source()  # noqa: SLF001
+    assert src.dedup_partition_by == ("time", "tx_call", "frequency_bucket_hz")
+    assert src.dedup_order_by_desc == "score"
+    # The partition column must be in the projection so the window
+    # function can read it.
+    assert "frequency_bucket_hz" in src.select_columns
+
+
+def test_dedup_disabled_via_env(monkeypatch, tmp_path):
+    """``PSK_DIRECT_DEDUP=0`` opts out so every receiver's row reaches
+    PSKReporter independently — diagnostic mode, normally not used."""
+    monkeypatch.setenv("HS_UPLOADER_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("PSK_DIRECT_DEDUP", "0")
+    sink = tmp_path / "sink.db"
+    _make_sink(sink)
+    monkeypatch.setenv("SIGMOND_SQLITE_PATH", str(sink))
+
+    u = HsPskReporterUploader(
+        callsign="AC0G", grid_square="EM38ww", radiod_id="local",
+    )
+    src = u._build_source()  # noqa: SLF001
+    assert src.dedup_partition_by is None
+    assert src.dedup_order_by_desc is None
+    # frequency_bucket_hz is still projected — Cut 4 (wsprdaemon-tar
+    # raw path) might want it for server-side dedup metadata even
+    # when the direct path doesn't.
+    assert "frequency_bucket_hz" in src.select_columns
+
+
+def test_dedup_env_falsy_variants(monkeypatch, tmp_path):
+    """Common false-ish strings should all disable dedup so
+    operators don't get surprised by ``no`` / ``off`` / ``false``."""
+    monkeypatch.setenv("HS_UPLOADER_STATE_DIR", str(tmp_path))
+    sink = tmp_path / "sink.db"
+    _make_sink(sink)
+    monkeypatch.setenv("SIGMOND_SQLITE_PATH", str(sink))
+
+    for val in ("0", "false", "False", "No", "off"):
+        monkeypatch.setenv("PSK_DIRECT_DEDUP", val)
+        u = HsPskReporterUploader(
+            callsign="AC0G", grid_square="EM38ww", radiod_id="local",
+        )
+        src = u._build_source()  # noqa: SLF001
+        assert src.dedup_partition_by is None, (
+            f"PSK_DIRECT_DEDUP={val!r} should disable dedup"
+        )

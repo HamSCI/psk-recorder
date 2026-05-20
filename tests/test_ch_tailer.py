@@ -232,6 +232,14 @@ class TestChTailer(unittest.TestCase):
                 # PSK_DELIVERY_MODE=server, the new default — wsprdaemon
                 # server is responsible for posting to PSKReporter).
                 self.assertEqual(row["forward_to_pskreporter"], True)
+                # Phase D Cut 2: 100 Hz bucket of the absolute decode
+                # frequency for cross-rx dedup partitioning.  Both
+                # sample lines decode at 14_074_131 Hz, so bucket = 14_074_100.
+                self.assertEqual(row["frequency_bucket_hz"], 14_074_100)
+                self.assertEqual(row["frequency_bucket_hz"] % 100, 0)
+                self.assertLessEqual(
+                    row["frequency_bucket_hz"], row["frequency"],
+                )
 
     def test_forward_to_pskreporter_false_when_constructed_false(self):
         """PSK_DELIVERY_MODE=both → constructor receives forward=False,

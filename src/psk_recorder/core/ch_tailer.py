@@ -532,6 +532,23 @@ class ChTailer:
             row["radiod_id"] = self._radiod_id
             row["instance"] = self._radiod_id
             row["rx_source"] = self._rx_source
+            # Phase D Cut 2: 100 Hz bucket of the absolute decode
+            # frequency.  PSKReporter's own dedup tolerance, and large
+            # enough to collapse the ~1-5 Hz inter-receiver jitter we
+            # see when the same TX is decoded by multiple radiod
+            # instances (different host PPS / clock disciplines).
+            # ``SqliteSource.dedup_partition_by`` keys on this so
+            # cross-rx duplicates pick a single winner per
+            # (time, tx_call, freq_bucket) before reaching
+            # PskReporterTcp.  Missing/invalid frequency falls to 0
+            # so the dedup partition treats it as a single group
+            # (any malformed rows lose to a valid duplicate).
+            try:
+                row["frequency_bucket_hz"] = (
+                    int(row.get("frequency") or 0) // 100 * 100
+                )
+            except (TypeError, ValueError):
+                row["frequency_bucket_hz"] = 0
             row["processing_version"] = self._processing_version
             row["forward_to_pskreporter"] = self._forward_to_pskreporter
             rows.append(row)
