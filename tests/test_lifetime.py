@@ -1,12 +1,16 @@
 """Tests for radiod channel-lifetime keep-alive (ka9q-python ≥3.13.0).
 
-psk-recorder opts into ka9q-python / radiod's LIFETIME tag so a crashed
-or killed recorder can't leave channels lingering on radiod beyond
-~`radiod_lifetime_frames / 50` seconds (≈2 min at the default).
+psk-recorder can opt into ka9q-python / radiod's LIFETIME tag via
+``processing.radiod_lifetime_frames``.  Default is 0 (infinite, no
+LIFETIME tag) because a positive value triggers a keepalive-vs-
+expiry race in radiod that wedges channels at Template defaults —
+see the docstring on ``DEFAULTS["processing"]["radiod_lifetime_frames"]``
+in ``psk_recorder.config`` for the full diagnosis.
 
 Two surfaces under test:
-  * config: ``processing.radiod_lifetime_frames`` defaults to 6000,
-    validates non-negative int, sentinel 0 = "no LIFETIME tag".
+  * config: ``processing.radiod_lifetime_frames`` defaults to 0,
+    validates non-negative int, accepts positive overrides for hosts
+    that want crash-cleanup more than they want wedge-avoidance.
   * keep-alive thread: refreshes every (frames/50/4) seconds against
     every (MultiStream, ssrc) the provisioner registered; survives
     individual `set_channel_lifetime` failures (radiod restart etc.).
@@ -36,9 +40,9 @@ from psk_recorder.config import DEFAULTS, load_config
 
 class ConfigDefaultsTests(unittest.TestCase):
 
-    def test_default_is_6000_frames(self):
+    def test_default_is_zero_frames(self):
         self.assertEqual(
-            DEFAULTS["processing"]["radiod_lifetime_frames"], 6000,
+            DEFAULTS["processing"]["radiod_lifetime_frames"], 0,
         )
 
     def _write_config(self, body: str) -> Path:
@@ -53,14 +57,15 @@ class ConfigDefaultsTests(unittest.TestCase):
         return path
 
     def test_missing_section_falls_back_to_default(self):
-        # No [processing] section at all — should default to 6000.
+        # No [processing] section at all — should default to 0
+        # (the wedge-safe default).
         path = self._write_config(
             '[paths]\nspool_dir = "/tmp/x"\n'
             '[[radiod]]\nid = "x"\nradiod_status = "host"\n'
         )
         cfg = load_config(path)
         self.assertEqual(
-            cfg["processing"]["radiod_lifetime_frames"], 6000,
+            cfg["processing"]["radiod_lifetime_frames"], 0,
         )
 
     def test_explicit_value_honored(self):

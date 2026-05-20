@@ -27,12 +27,37 @@ DEFAULTS: dict[str, Any] = {
         # Channels self-destruct after this many radiod main-loop frames
         # (~50 Hz at the default 20 ms blocktime, so 6000 ≈ 2 min).  The
         # recorder refreshes lifetime every (frames / 4) seconds while
-        # running, so a crashed/killed recorder leaves no residual
-        # channels on radiod within ~2 min.
-        # 0 = infinite (no LIFETIME tag, no keep-alive — radiod owns the
-        # channel for its full template default).  Use only when you
-        # truly want a channel to outlive the recorder.
-        "radiod_lifetime_frames": 6000,
+        # running.
+        #
+        # Default is 0 (infinite — no LIFETIME tag, no keep-alive) to
+        # avoid a keepalive-vs-expiry race in radiod that wedges
+        # channels at Template defaults:
+        #
+        #   * Under load (multi-source, big channel counts), the
+        #     keepalive thread can slip past the channel idle window.
+        #   * When a finite-lifetime channel expires before its
+        #     keepalive arrives, ``set_channel_lifetime`` sends an
+        #     18-byte packet with only OUTPUT_SSRC + COMMAND_TAG +
+        #     LIFETIME + EOL — no freq / samprate / dest TLVs.
+        #   * Radiod's ``radio_status.c`` new-SSRC branch (lookup_chan
+        #     returns NULL for the destroyed channel) calls
+        #     ``create_chan`` to clone from Template defaults, then
+        #     runs ``decode_radio_commands`` on the bare packet —
+        #     which has nothing but LIFETIME to apply.
+        #   * The channel sticks at Template defaults forever
+        #     (samprate=24000, freq=0, default advertised data group).
+        #
+        # Verified on B4-100 (2026-05-20): a single-source psk-recorder
+        # plus a 3-source wspr-recorder on the same local radiod
+        # produced the wedge cascade within seconds of any multi-source
+        # psk-recorder restart attempt at the legacy ``6000`` default.
+        # Same fix that wspr-recorder shipped earlier the same day —
+        # keep them aligned.
+        #
+        # Use a positive value only when the trade-off of a crashed
+        # recorder leaking residual channels (until manual ``tune`` or
+        # radiod restart) is worth more than the wedge risk.
+        "radiod_lifetime_frames": 0,
     },
 }
 
