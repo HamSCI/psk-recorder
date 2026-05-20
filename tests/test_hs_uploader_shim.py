@@ -77,11 +77,17 @@ def test_no_grid_is_clean_noop(caplog):
     assert u.is_active is False
 
 
-def test_sqlite_pipeline_scopes_to_radiod_id(monkeypatch, tmp_path):
-    """The shim wires this daemon's radiod_id — plus the tx_call / mode
-    filters — into the SqliteSource extra_where, so a multi-instance
-    host scopes each pipeline to its own producer.  It also tags the
-    accepted schema version and the start_at anchor."""
+def test_sqlite_pipeline_filters_and_columns(monkeypatch, tmp_path):
+    """The shim wires the schema-version + tx_call / mode filters into
+    the SqliteSource, projects every column the dedup picker + per-rx
+    counter need (Phase D Cut 1: ``rx_source`` is included), and
+    anchors the watermark at ``now``.
+
+    Phase D Cut 1 also DROPPED the ``radiod_id`` filter — a single-
+    process / multi-source psk-recorder (Phase B) feeds spots from
+    every receiver through one uploader, so scoping to one radiod_id
+    would silently drop the others on the floor.
+    """
     monkeypatch.setenv("HS_UPLOADER_STATE_DIR", str(tmp_path))
     sink = tmp_path / "sink.db"
     _make_sink(sink)
@@ -93,9 +99,16 @@ def test_sqlite_pipeline_scopes_to_radiod_id(monkeypatch, tmp_path):
     )
     src = u._build_source()  # noqa: SLF001
     assert type(src).__name__ == "SqliteSource"
-    assert ("radiod_id", "=", "my-rx888") in src.extra_where
+    # tx_call / mode filters still anchored, but radiod_id filter is gone.
     assert ("tx_call", "!=", "") in src.extra_where
     assert ("mode", "IN", ["ft8", "ft4"]) in src.extra_where
+    assert not any(c == "radiod_id" for (c, _, _) in src.extra_where), (
+        "radiod_id filter must NOT scope the SqliteSource — multi-rx "
+        "deployments need every receiver's spots through one uploader"
+    )
+    # rx_source projection is Phase D Cut 1's per-rx visibility +
+    # Cut 2's dedup input.
+    assert "rx_source" in src.select_columns
     assert src.accepted_schema_versions == [2]
     # Fresh-watermark anchor: start at now, not epoch — no historical
     # re-ship (see the start_at note in the shim).
@@ -230,3 +243,149 @@ def test_sqlite_source_picked_when_sigmond_sqlite_path_set(monkeypatch, tmp_path
     src = u._build_source()  # noqa: SLF001
     assert type(src).__name__ == "SqliteSource"
     assert src.source_id() == "sqlite:psk.spots"
+
+
+# ── Phase D Cut 1: per-rx ship tally + _short_rx helper ────────────────────
+
+def test_short_rx_renders_canonical_form():
+    """``radiod:bee1-status.local`` should render as ``bee1`` for the
+    log line tag; this keeps the multi-rx pump log readable.  The
+    helper must be exact about the prefix / suffix it strips so a
+    custom source key (e.g. ``radiod:my-rx888.local``) renders sanely
+    too."""
+    from psk_recorder.core.hs_uploader_shim import _short_rx
+    assert _short_rx("radiod:bee1-status.local") == "bee1"
+    assert _short_rx("radiod:B4-100-rx888mk2-status.local") == "B4-100-rx888mk2"
+    assert _short_rx("radiod:custom.local") == "custom"
+    assert _short_rx("") == "?"
+    assert _short_rx("?") == "?"
+    # Unfamiliar shape — passed through so we don't silently lose info.
+    assert _short_rx("kiwi:bee1.local") == "kiwi:bee1"
+
+
+def test_per_rx_tally_in_on_batch_outcome(monkeypatch, tmp_path):
+    """The on_batch_outcome callback must tally shipped spots per
+    ``rx_source`` so the per-pump log line can break down which
+    receivers contributed in multi-source mode.  Mirrors how
+    ``smd watch wspr`` surfaces per-rx contribution."""
+    monkeypatch.setenv("HS_UPLOADER_STATE_DIR", str(tmp_path))
+    u = HsPskReporterUploader(
+        callsign="AC0G", grid_square="EM38ww", radiod_id="local",
+    )
+    # Stub records: hs-uploader's Record has .columns mapping field
+    # names to values.  We only need .columns for the tally code.
+    class _R:
+        def __init__(self, mode, rx):
+            self.columns = {"mode": mode, "rx_source": rx}
+
+    class _Batch:
+        records = [
+            _R("ft8", "radiod:bee1-status.local"),
+            _R("ft8", "radiod:bee1-status.local"),
+            _R("ft4", "radiod:bee2-status.local"),
+            _R("ft8", "radiod:B4-100-rx888mk2-status.local"),
+            _R("ft8", ""),  # bare row — falls into "?" bucket
+        ]
+
+    class _Outcome:
+        kind = "acked"
+
+    u._on_batch_outcome(None, _Batch(), _Outcome())
+
+    # Mode totals
+    assert u._pump_ft8 == 4
+    assert u._pump_ft4 == 1
+    # Per-rx tally — each receiver shows up with its FT8/FT4 split
+    assert u._pump_by_rx["radiod:bee1-status.local"] == {"ft8": 2, "ft4": 0}
+    assert u._pump_by_rx["radiod:bee2-status.local"] == {"ft8": 0, "ft4": 1}
+    assert u._pump_by_rx["radiod:B4-100-rx888mk2-status.local"] == {
+        "ft8": 1, "ft4": 0,
+    }
+    # Empty rx_source bucketed under "?" so it's not silently lost.
+    assert u._pump_by_rx["?"] == {"ft8": 1, "ft4": 0}
+
+
+def test_per_rx_tally_skips_non_acked_outcomes(monkeypatch, tmp_path):
+    """``retry_later`` / ``permanent`` outcomes mean the records did
+    NOT reach PSKReporter — the per-rx tally must stay zero so the
+    operator's log isn't lying about delivery."""
+    monkeypatch.setenv("HS_UPLOADER_STATE_DIR", str(tmp_path))
+    u = HsPskReporterUploader(
+        callsign="AC0G", grid_square="EM38ww", radiod_id="local",
+    )
+
+    class _R:
+        columns = {"mode": "ft8", "rx_source": "radiod:bee1-status.local"}
+
+    class _Batch:
+        records = [_R(), _R()]
+
+    class _Outcome:
+        kind = "retry_later"
+
+    u._on_batch_outcome(None, _Batch(), _Outcome())
+    assert u._pump_ft8 == 0
+    assert u._pump_by_rx == {}
+
+
+# ── Phase D Cut 2: cross-rx dedup at the SQL layer ─────────────────────────
+
+def test_dedup_enabled_by_default(monkeypatch, tmp_path):
+    """SqliteSource construction sets the dedup window-function args
+    so the same TX heard by multiple receivers collapses to one row
+    per (time, tx_call, freq_bucket) before reaching PskReporterTcp."""
+    monkeypatch.setenv("HS_UPLOADER_STATE_DIR", str(tmp_path))
+    monkeypatch.delenv("PSK_DIRECT_DEDUP", raising=False)  # default = on
+    sink = tmp_path / "sink.db"
+    _make_sink(sink)
+    monkeypatch.setenv("SIGMOND_SQLITE_PATH", str(sink))
+
+    u = HsPskReporterUploader(
+        callsign="AC0G", grid_square="EM38ww", radiod_id="local",
+    )
+    src = u._build_source()  # noqa: SLF001
+    assert src.dedup_partition_by == ("time", "tx_call", "frequency_bucket_hz")
+    assert src.dedup_order_by_desc == "score"
+    # The partition column must be in the projection so the window
+    # function can read it.
+    assert "frequency_bucket_hz" in src.select_columns
+
+
+def test_dedup_disabled_via_env(monkeypatch, tmp_path):
+    """``PSK_DIRECT_DEDUP=0`` opts out so every receiver's row reaches
+    PSKReporter independently — diagnostic mode, normally not used."""
+    monkeypatch.setenv("HS_UPLOADER_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("PSK_DIRECT_DEDUP", "0")
+    sink = tmp_path / "sink.db"
+    _make_sink(sink)
+    monkeypatch.setenv("SIGMOND_SQLITE_PATH", str(sink))
+
+    u = HsPskReporterUploader(
+        callsign="AC0G", grid_square="EM38ww", radiod_id="local",
+    )
+    src = u._build_source()  # noqa: SLF001
+    assert src.dedup_partition_by is None
+    assert src.dedup_order_by_desc is None
+    # frequency_bucket_hz is still projected — Cut 4 (wsprdaemon-tar
+    # raw path) might want it for server-side dedup metadata even
+    # when the direct path doesn't.
+    assert "frequency_bucket_hz" in src.select_columns
+
+
+def test_dedup_env_falsy_variants(monkeypatch, tmp_path):
+    """Common false-ish strings should all disable dedup so
+    operators don't get surprised by ``no`` / ``off`` / ``false``."""
+    monkeypatch.setenv("HS_UPLOADER_STATE_DIR", str(tmp_path))
+    sink = tmp_path / "sink.db"
+    _make_sink(sink)
+    monkeypatch.setenv("SIGMOND_SQLITE_PATH", str(sink))
+
+    for val in ("0", "false", "False", "No", "off"):
+        monkeypatch.setenv("PSK_DIRECT_DEDUP", val)
+        u = HsPskReporterUploader(
+            callsign="AC0G", grid_square="EM38ww", radiod_id="local",
+        )
+        src = u._build_source()  # noqa: SLF001
+        assert src.dedup_partition_by is None, (
+            f"PSK_DIRECT_DEDUP={val!r} should disable dedup"
+        )

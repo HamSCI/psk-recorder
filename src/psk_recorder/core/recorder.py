@@ -1,8 +1,16 @@
-"""PskRecorder: orchestrates one radiod's FT4/FT8 channels.
+"""PskRecorder: orchestrates one or more radiod sources.
 
-One PskRecorder per radiod instance (= one systemd unit).
-Creates ChannelStream objects for each frequency, manages log
-file descriptors, and supervises HsPskReporterUploaders.
+A single PskRecorder process drives one ``ReceiverManager`` per
+source (= one radiod control plane).  Legacy single-radiod
+deployments pass a one-element list and behavior is unchanged.
+Multi-source deployments pass several blocks and the same process
+talks to a local radiod plus remote radiods over the LAN — mirrors
+wspr-recorder's multi-source pattern.
+
+PskRecorder remains responsible for the process-global concerns
+(chrony settle gate, HsPskReporterUploader, lifetime keepalive
+thread, stats aggregator, main loop, watchdog, signal handling).
+Per-radiod provisioning lives in :class:`ReceiverManager`.
 """
 
 from __future__ import annotations
@@ -13,18 +21,32 @@ import signal
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 from psk_recorder.config import (
     FT4_CADENCE_SEC,
     FT8_CADENCE_SEC,
+    derive_source_key,
     get_freqs,
-    get_mode_params,
-    resolve_radiod_status,
 )
-from psk_recorder.core.stream import ChannelSink
-from psk_recorder.core.ch_tailer import ChTailer
+# ChannelSink imports numpy via psk_recorder.core.stream — kept under
+# TYPE_CHECKING so this module imports cleanly in lightweight test
+# environments without numpy.  The real instantiation lives in
+# ReceiverManager.provision_channels which lazy-imports stream.
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:  # pragma: no cover
+    from psk_recorder.core.stream import ChannelSink
+from psk_recorder.core.ch_tailer import ChTailer, _default_writer_factory
+from psk_recorder.core.cycle_batcher import PskCycleBatcher
+# PskReporterUploader (legacy subprocess shim) was removed on main
+# during the ClickHouse-removal sweep; HsPskReporterUploader is the
+# only upload path now.  Phase B kept the import for back-compat
+# but with the file gone we drop it cleanly.
 from psk_recorder.core.hs_uploader_shim import HsPskReporterUploader
+from psk_recorder.core.receiver_manager import (
+    ReceiverManager,
+    _resolve_encoding,  # re-exported for any external importer
+)
 
 logger = logging.getLogger(__name__)
 
@@ -68,35 +90,117 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-# PSK_DELIVERY_MODE — how spots reach PSKReporter.
+# PSK_DELIVERY_PIPELINES — how spots reach PSKReporter / wsprdaemon.
 #
-#   server (default): client only ships to wsprdaemon servers; the
-#                     gw1-elected pskreporter_forwarder service POSTs
-#                     to pskreporter.info on the client's behalf.
-#                     Spots are tagged forward_to_pskreporter=True in
-#                     the local sink → tar → psk.spots.
-#   direct          : client POSTs directly to pskreporter.info (today's
-#                     behavior). No wsprdaemon-server path: the
-#                     ch_tailer that feeds the local SQLite sink is
-#                     not started, so nothing ships to wsprdaemon.
-#   both            : client POSTs directly AND ships to wsprdaemon.
-#                     Spots are tagged forward_to_pskreporter=False so
-#                     the server does NOT re-post (avoids duplicates).
-_VALID_DELIVERY_MODES = ("server", "direct", "both")
+# Comma-separated list of pipeline names; order doesn't matter.
+#
+#   direct        client POSTs directly to pskreporter.info (cross-rx
+#                 dedup applies — see HsPskReporterUploader / Phase D
+#                 Cut 2).  No server involvement on the upload side.
+#   server-merge  ship every receiver's row to wsprdaemon-server with
+#                 ``forward_to_pskreporter=True`` so the server's
+#                 gw1-elected pskreporter_forwarder service POSTs to
+#                 pskreporter.info on the client's behalf.  Server-
+#                 side cross-rx dedup is up to the server.
+#   server-raw    ship every receiver's row to wsprdaemon-server with
+#                 ``forward_to_pskreporter=False`` so the server
+#                 stores per-rx but does NOT post to pskreporter.
+#                 Use with ``direct`` so the server has a raw archive
+#                 while the client owns the dedup + upload path.
+#
+# The two server-* pipelines control the per-row
+# ``forward_to_pskreporter`` flag; only one can win.  Conflict
+# resolution: if BOTH ``direct`` and ``server-merge`` are enabled,
+# ``server-merge`` downgrades to ``server-raw`` (forward=False) so
+# the server doesn't double-post.
+#
+# Legacy ``PSK_DELIVERY_MODE`` is still honoured and translates:
+#   server  →  server-merge
+#   direct  →  direct
+#   both    →  direct,server-raw
+#
+_VALID_DELIVERY_PIPELINES = ("direct", "server-merge", "server-raw")
+
+# Legacy → new mapping.  Symmetric so a host that already had
+# ``PSK_DELIVERY_MODE`` set keeps the same effective behaviour
+# after a deploy that swaps to PSK_DELIVERY_PIPELINES.
+_LEGACY_MODE_TO_PIPELINES = {
+    "server": ("server-merge",),
+    "direct": ("direct",),
+    "both":   ("direct", "server-raw"),
+}
 
 
-def _resolve_delivery_mode() -> str:
-    """Read + validate PSK_DELIVERY_MODE; fall back to 'server' on
-    anything bogus. We log the choice once at startup so an operator
-    typo doesn't silently disable direct delivery."""
-    raw = (os.environ.get("PSK_DELIVERY_MODE") or "server").strip().lower()
-    if raw not in _VALID_DELIVERY_MODES:
+def _resolve_delivery_pipelines() -> tuple[str, ...]:
+    """Read + validate PSK_DELIVERY_PIPELINES.
+
+    Precedence:
+
+      1. ``PSK_DELIVERY_PIPELINES`` (comma-separated list).  Unknown
+         tokens are dropped with a WARNING but the rest of the list
+         is honoured.
+      2. ``PSK_DELIVERY_MODE`` (legacy single value) — translated via
+         ``_LEGACY_MODE_TO_PIPELINES``.
+      3. Default: ``server-merge`` — matches today's default,
+         server-side forwarding to pskreporter.info.
+
+    Returns a deterministic, deduplicated tuple in canonical order
+    (``direct``, ``server-merge``, ``server-raw``) so the rest of
+    the recorder can iterate it without worrying about formatting.
+    The order matters for the rendered log line but not for the
+    behaviour — each pipeline is independent.
+    """
+    raw_pipes = (os.environ.get("PSK_DELIVERY_PIPELINES") or "").strip().lower()
+    if raw_pipes:
+        requested = [
+            t.strip() for t in raw_pipes.split(",") if t.strip()
+        ]
+        valid, dropped = [], []
+        for t in requested:
+            if t in _VALID_DELIVERY_PIPELINES and t not in valid:
+                valid.append(t)
+            elif t not in _VALID_DELIVERY_PIPELINES:
+                dropped.append(t)
+        if dropped:
+            logger.warning(
+                "PSK_DELIVERY_PIPELINES: dropping unknown pipeline(s) %s "
+                "(valid: %s)",
+                dropped, _VALID_DELIVERY_PIPELINES,
+            )
+        if valid:
+            return _canonicalise_pipelines(valid)
+        # Fall through to legacy/default — empty after filtering means
+        # operator typed nothing valid, treat as if unset.
+
+    raw_mode = (os.environ.get("PSK_DELIVERY_MODE") or "").strip().lower()
+    if raw_mode:
+        if raw_mode in _LEGACY_MODE_TO_PIPELINES:
+            translated = _LEGACY_MODE_TO_PIPELINES[raw_mode]
+            logger.info(
+                "PSK_DELIVERY_MODE=%r (legacy) → pipelines %s",
+                raw_mode, list(translated),
+            )
+            return _canonicalise_pipelines(translated)
         logger.warning(
-            "PSK_DELIVERY_MODE=%r is not one of %s; defaulting to 'server'",
-            raw, _VALID_DELIVERY_MODES,
+            "PSK_DELIVERY_MODE=%r is not one of %s; defaulting to "
+            "server-merge",
+            raw_mode, tuple(_LEGACY_MODE_TO_PIPELINES.keys()),
         )
-        return "server"
-    return raw
+
+    return ("server-merge",)
+
+
+def _canonicalise_pipelines(pipes) -> tuple[str, ...]:
+    """Return ``pipes`` in canonical order with duplicates removed."""
+    seen: set = set()
+    out: list = []
+    for p in _VALID_DELIVERY_PIPELINES:
+        if p in pipes and p not in seen:
+            out.append(p)
+            seen.add(p)
+    return tuple(out)
+
+
 
 
 def _sqlite_sink_available() -> bool:
@@ -114,33 +218,99 @@ def _sqlite_sink_available() -> bool:
 
 
 class PskRecorder:
-    """Manages all FT4/FT8 channels for a single radiod."""
+    """Orchestrates one or more ReceiverManagers from a single process.
 
-    def __init__(self, config: dict, radiod_block: dict):
+    Accepts either a single ``radiod_block`` (legacy single-source
+    deployments via ``--radiod-id``) or a list of blocks (multi-source
+    deployments where the same process drives several radiods).
+    """
+
+    def __init__(
+        self,
+        config: dict,
+        radiod_blocks: Union[dict, list[dict]],
+    ):
         self._config = config
-        self._radiod = radiod_block
-        self._radiod_id = radiod_block.get("id", "default")
+        # Accept dict (legacy single-source) or list (multi-source).
+        # Internal storage is always a list for uniform iteration.
+        if isinstance(radiod_blocks, dict):
+            self._radiod_blocks: list[dict] = [radiod_blocks]
+        else:
+            self._radiod_blocks = list(radiod_blocks)
+        if not self._radiod_blocks:
+            raise ValueError(
+                "PskRecorder requires at least one [[radiod]] block"
+            )
+        # Convenience handles for code that pre-dated multi-source.
+        # ``_radiod`` / ``_radiod_id`` refer to the FIRST block — only
+        # safe for fields that are global across sources (e.g. station
+        # info lives at config root, not the block).  Per-source state
+        # — including the canonical ``rx_source`` tag — belongs in
+        # the corresponding ReceiverManager.
+        self._radiod = self._radiod_blocks[0]
+        self._radiod_id = self._radiod.get("id", "default")
         self._paths = config.get("paths", {})
         self._station = config.get("station", {})
 
-        self._sinks: list[ChannelSink] = []
-        self._multi_streams: list = []
-        # (MultiStream, ssrc) pairs — populated as channels are provisioned,
-        # used by the keep-alive thread to refresh radiod's LIFETIME timer.
-        self._lifetime_entries: list[tuple[object, int]] = []
-        self._uploaders: list[HsPskReporterUploader] = []
-        self._ch_tailers: list[ChTailer] = []
-        self._log_fds: dict[str, object] = {}
-        self._running = False
+        spool_root = Path(
+            self._paths.get("spool_dir", "/var/lib/psk-recorder"),
+        )
+        log_dir = Path(self._paths.get("log_dir", "/var/log/psk-recorder"))
 
         # radiod LIFETIME tag (ka9q-python ≥3.13.0).  0 = no LIFETIME tag
-        # sent + no keep-alive; >0 = self-destruct after N frames, refreshed
-        # at frames/4 cadence while we're alive.  See DEFAULTS in config.py.
+        # sent + no keep-alive; >0 = self-destruct after N frames,
+        # refreshed at frames/4 cadence while we're alive.  See DEFAULTS
+        # in config.py.  Phase A of the WSPR fix proved the keepalive-
+        # vs-expiry race wedges channels at Template defaults under
+        # multi-source load; PSK_DELIVERY_PIPELINES-style multi-source
+        # deployments should leave this at 0.
         proc = config.get("processing", {})
         self._radiod_lifetime_frames: int = int(
             proc.get("radiod_lifetime_frames", 0)
         )
+
+        # One ReceiverManager per radiod_block; process-global state
+        # (uploaders, lifetime thread, stats thread) lives below.
+        self._receivers: list[ReceiverManager] = [
+            ReceiverManager(
+                config=config,
+                radiod_block=block,
+                spool_root=spool_root,
+                log_dir=log_dir,
+                radiod_lifetime_frames=self._radiod_lifetime_frames,
+            )
+            for block in self._radiod_blocks
+        ]
+
+        # PskReporterUploader (legacy subprocess shim) was removed
+        # from main; HsPskReporterUploader is the only path now.
+        self._uploaders: list[HsPskReporterUploader] = []
+        self._running = False
+
+        # Aggregate of every ReceiverManager's lifetime entries —
+        # populated after ``provision_channels`` and refreshed by the
+        # single process-global keepalive thread so we don't spawn
+        # N threads for N sources.
+        self._lifetime_entries: list[tuple[object, int]] = []
         self._lifetime_thread: Optional[threading.Thread] = None
+
+        # Phase C: one PskCycleBatcher per process; all
+        # ReceiverManagers' ChTailers feed it.  Started in run()
+        # before tailers spawn; stopped in _shutdown() after them.
+        self._cycle_batcher: Optional[PskCycleBatcher] = None
+
+    # --- Per-source iteration helpers ---------------------------------
+
+    @property
+    def receivers(self) -> list[ReceiverManager]:
+        """Read-only access to the per-source ReceiverManagers."""
+        return list(self._receivers)
+
+    def _iter_sinks(self):
+        """Yield every ChannelSink across every ReceiverManager."""
+        for rx in self._receivers:
+            for sink in rx.sinks:
+                yield sink
 
     # Settled-capture gate (V1 fix per
     # docs/TIMING-PIPELINE-WIRING.md §6.6 / §10.3).  Block on
@@ -193,11 +363,13 @@ class PskRecorder:
         try:
             # V1 fix layer 1: gate ensure_channel() on chrony being
             # settled.  See docs/TIMING-PIPELINE-WIRING.md §6.6.
+            # One gate, not per-source — when chrony is settled it's
+            # settled for all radiods this process talks to.
             self._wait_for_chrony_settled()
-            self._provision_channels()
-            self._start_streams()
+            self._provision_all_receivers()
+            self._start_all_streams()
             self._start_uploaders()
-            self._start_ch_tailers()
+            self._start_all_ch_tailers()
             self._start_stats_thread()
             self._start_lifetime_keepalive()
             self._notify_ready()
@@ -206,6 +378,112 @@ class PskRecorder:
             logger.exception("Fatal error in recorder")
         finally:
             self._shutdown()
+
+    # --- Per-source orchestration -------------------------------------
+
+    def _provision_all_receivers(self) -> None:
+        """Drive each ReceiverManager's provision_channels.
+
+        Decoder / spool config is process-global (one ka9q-radio binary,
+        one decoder binary, one spool root), so resolve it once here and
+        hand it to every manager.  Lifetime entries are gathered across
+        managers for the single process-global keepalive thread.
+        """
+        decoder_kind = str(
+            self._paths.get("decoder_kind", "decode_ft8"),
+        ).lower()
+        # jt9 decoder + decoder_depth were removed on main during the
+        # ClickHouse-removal sweep; only ka9q/ft8_lib's decode_ft8 is
+        # supported.
+        decoder = self._paths.get(
+            "decoder_decode_ft8", self._paths.get(
+                "decoder", "/usr/local/bin/decode_ft8",
+            ),
+        )
+        keep_wav = self._paths.get("keep_wav", False)
+        # Tee per-slot decoder output into <wav>.spots.txt files only
+        # when there is no SQLite sink for the uploader's shim to read
+        # — that's the file-fallback mode FileTreeSource picks up.
+        spool_spots = not _sqlite_sink_available()
+        logger.info(
+            "decoder_kind=%s path=%s spool_spots=%s sources=%d",
+            decoder_kind, decoder, spool_spots,
+            len(self._receivers),
+        )
+
+        for rx in self._receivers:
+            rx.provision_channels(
+                decoder=decoder,
+                decoder_kind=decoder_kind,
+                keep_wav=keep_wav,
+                spool_spots=spool_spots,
+            )
+            # Gather this manager's lifetime entries for the global
+            # keepalive thread.  Each manager's list is stable after
+            # provision_channels returns.
+            self._lifetime_entries.extend(rx.lifetime_entries)
+
+    def _start_all_streams(self) -> None:
+        for rx in self._receivers:
+            rx.start_streams()
+
+    def _start_all_ch_tailers(self) -> None:
+        callsign = self._station.get("callsign", "")
+        grid = self._station.get("grid_square", "")
+        try:
+            from psk_recorder.version import GIT_INFO
+            short = (GIT_INFO or {}).get("short", "")
+        except Exception:
+            short = ""
+        try:
+            from importlib.metadata import version as pkg_version
+            ver = pkg_version("psk-recorder")
+        except Exception:
+            ver = "0.1.0"
+        proc_version = f"{ver}+{short}" if short else ver
+
+        pipelines = _resolve_delivery_pipelines()
+        # forward_to_pskreporter is True only when ``server-merge`` is
+        # the ONLY way spots reach pskreporter.  If ``direct`` is also
+        # enabled, both paths would post and the server would
+        # double-deliver — flip the flag to False so the server stores
+        # but doesn't forward.  ``server-raw`` alone means the
+        # operator explicitly wants the server to NOT forward; same
+        # flag.
+        if "direct" in pipelines and "server-merge" in pipelines:
+            logger.info(
+                "PSK_DELIVERY_PIPELINES: ``direct`` + ``server-merge`` "
+                "both enabled — downgrading ``server-merge`` to "
+                "``server-raw`` for this run (forward_to_pskreporter=False) "
+                "so the server doesn't double-post",
+            )
+        forward_flag = (
+            "server-merge" in pipelines and "direct" not in pipelines
+        )
+        logger.info(
+            "PSK pipelines active: %s (forward_to_pskreporter=%s)",
+            list(pipelines), forward_flag,
+        )
+
+        # Phase C: lazily construct + start the shared cycle batcher
+        # once we know there is at least one tailer about to feed it.
+        # Each ReceiverManager's tailers all receive the same batcher
+        # reference so cross-rx spots collapse into one batch per
+        # (cycle, source).
+        if self._cycle_batcher is None:
+            self._cycle_batcher = PskCycleBatcher(
+                writer_factory=_default_writer_factory,
+            )
+            self._cycle_batcher.start()
+
+        for rx in self._receivers:
+            rx.start_ch_tailers(
+                callsign=callsign,
+                host_grid=grid,
+                proc_version=proc_version,
+                forward_flag=forward_flag,
+                cycle_batcher=self._cycle_batcher,
+            )
 
     def _wait_for_chrony_settled(self) -> bool:
         """Block until chrony's Last offset has been below
@@ -330,218 +608,26 @@ class PskRecorder:
                     return None
         return None
 
-    def _provision_channels(self) -> None:
-        """Create ChannelSinks and register them with MultiStream(s).
-
-        One MultiStream per unique multicast group, keyed on the
-        (mcast_addr, port) returned by ensure_channel(). In the common
-        case (FT8+FT4 share preset/sample_rate/encoding) all channels
-        land on one group and we end up with a single MultiStream.
-        """
-        from ka9q import MultiStream, RadiodControl
-
-        status = resolve_radiod_status(self._radiod)
-        logger.info("Connecting to radiod at %s", status)
-        # client_id makes ka9q-python derive a per-(client, radiod)
-        # multicast destination so this recorder's channels never share
-        # a multicast group with peer clients on the same radiod
-        # (wspr-recorder, hfdl-recorder, hf-timestd, etc.).  CONTRACT
-        # v0.3 §7 / ka9q-python ≥ 3.14.0.
-        self._control = RadiodControl(status, client_id="psk-recorder")
-
-        # Surface the Fusion governor identity at startup so the journal
-        # record makes multi-radiod attribution clear. See
-        # hf-timestd/docs/METROLOGY.md §4.5.1: when Fusion's governor
-        # radiod differs from the one this recorder subscribes to, the
-        # per-host clock-skew between the two radiods' hosts adds to
-        # uncertainty. With a single-radiod station the two will match.
-        try:
-            from psk_recorder.core.authority_reader import AuthorityReader
-            snap = AuthorityReader().read()
-            governor = snap.governor_radiod if snap is not None else None
-        except Exception as e:
-            logger.debug("authority.json read at startup failed: %s", e)
-            governor = None
-        if governor and governor != status:
-            logger.info(
-                "Timing attribution: client_radiod=%s, fusion_governor_radiod=%s "
-                "(differ — per-host clock-skew uncertainty applies to all spots)",
-                status, governor,
-            )
-        elif governor:
-            logger.info(
-                "Timing attribution: client_radiod=fusion_governor_radiod=%s",
-                status,
-            )
-        else:
-            logger.info(
-                "Timing attribution: client_radiod=%s, fusion_governor_radiod=<none> "
-                "(hf-timestd authority not published — recorder will anchor via "
-                "wall clock at stream start)",
-                status,
-            )
-
-        spool_root = Path(self._paths.get(
-            "spool_dir", "/var/lib/psk-recorder"
-        )) / self._radiod_id
-        log_dir = Path(self._paths.get(
-            "log_dir", "/var/log/psk-recorder"
-        ))
-        # CONTRACT v0.6 — `decoder_kind` selects the decoder backend.
-        # Only ka9q/ft8_lib's `decode_ft8` is supported.  The path
-        # falls back from `paths.decoder_decode_ft8` to `paths.decoder`
-        # for older configs.  See SlotWorker for output-format details.
-        decoder_kind = str(self._paths.get("decoder_kind", "decode_ft8")).lower()
-        decoder = self._paths.get(
-            "decoder_decode_ft8", self._paths.get(
-                "decoder", "/usr/local/bin/decode_ft8",
-            ),
-        )
-        keep_wav = self._paths.get("keep_wav", False)
-        # Tee per-slot decoder output into <wav>.spots.txt files only
-        # when the hs-uploader is on AND there is no SQLite sink for it
-        # to read — that's the file-fallback mode the shim's
-        # FileTreeSource picks up.  With a sink present the shim reads
-        # SqliteSource and the spool files would only pile up
-        # unconsumed; with the legacy uploader in use they're unused
-        # either way.  Skipping the write keeps the spool dir clean.
-        spool_spots = bool(
-            os.environ.get("PSK_USE_HS_UPLOADER")
-            and not _sqlite_sink_available()
-        )
-        logger.info(
-            "decoder_kind=%s path=%s spool_spots=%s",
-            decoder_kind, decoder, spool_spots,
-        )
-
-        multi_by_group: dict[tuple, object] = {}
-
-        for mode in ("ft8", "ft4"):
-            freqs = get_freqs(self._radiod, mode)
-            if not freqs:
-                continue
-
-            params = get_mode_params(self._radiod, mode)
-            sample_rate = params["sample_rate"]
-            preset = params["preset"]
-            encoding_str = params.get("encoding", "s16be")
-            encoding_int = _resolve_encoding(encoding_str)
-
-            log_path = log_dir / f"{self._radiod_id}-{mode}.log"
-            if mode not in self._log_fds:
-                log_path.parent.mkdir(parents=True, exist_ok=True)
-                # Text mode (not binary) — the decoder-output writers
-                # feed Python str through this fd.  Opening in "ab"
-                # raised TypeError("a bytes-like object is required, not
-                # 'str'") and silently dropped every decode on the floor.
-                self._log_fds[mode] = open(log_path, "a", encoding="utf-8")
-
-            for freq_hz in freqs:
-                logger.info(
-                    "Provisioning %s %d Hz (sr=%d, preset=%s, enc=%s)",
-                    mode.upper(), freq_hz, sample_rate, preset, encoding_str,
-                )
-                sink = ChannelSink(
-                    mode=mode,
-                    frequency_hz=freq_hz,
-                    sample_rate=sample_rate,
-                    preset=preset,
-                    encoding=encoding_int,
-                    spool_dir=spool_root,
-                    log_fd=self._log_fds[mode],
-                    decoder_path=decoder,
-                    decoder_kind=decoder_kind,
-                    keep_wav=keep_wav,
-                    spool_spots=spool_spots,
-                )
-                self._add_sink_to_multi(sink, multi_by_group)
-                self._sinks.append(sink)
-
-        self._multi_streams = list(multi_by_group.values())
-        logger.info(
-            "Provisioned %d channels across %d multicast group(s) on radiod %s",
-            len(self._sinks), len(self._multi_streams), self._radiod_id,
-        )
-
-    def _add_sink_to_multi(
-        self, sink: ChannelSink, multi_by_group: dict,
-    ) -> None:
-        """Attach sink to the MultiStream for its multicast group.
-
-        Resolves the multicast group up-front via ensure_channel() so
-        we can pick the right MultiStream (or create one) by
-        (mcast_addr, port). MultiStream.add_channel() calls ensure_channel
-        again internally — idempotent, one extra cheap status probe —
-        but this keeps the grouping deterministic instead of relying on
-        ValueError as control flow.
-        """
-        from ka9q import MultiStream
-
-        # `lifetime=None` when configured to 0 — distinguishes "no LIFETIME
-        # tag at all" (radiod template default applies) from "finite N
-        # frames" (self-destruct timer enabled).
-        lifetime_arg: Optional[int] = (
-            self._radiod_lifetime_frames
-            if self._radiod_lifetime_frames > 0 else None
-        )
-
-        info = self._control.ensure_channel(
-            frequency_hz=float(sink.frequency_hz),
-            preset=sink.preset,
-            sample_rate=sink.sample_rate,
-            encoding=sink.encoding,
-            lifetime=lifetime_arg,
-        )
-        key = (info.multicast_address, info.port)
-        multi = multi_by_group.get(key)
-        if multi is None:
-            multi = MultiStream(control=self._control)
-            multi_by_group[key] = multi
-
-        ch_info = multi.add_channel(
-            frequency_hz=float(sink.frequency_hz),
-            preset=sink.preset,
-            sample_rate=sink.sample_rate,
-            encoding=sink.encoding,
-            on_samples=sink.on_samples,
-            on_stream_dropped=sink.on_stream_dropped,
-            on_stream_restored=sink.on_stream_restored,
-            lifetime=lifetime_arg,
-        )
-        # Hand the freshly-discovered ChannelInfo (with GPS_TIME /
-        # RTP_TIMESNAP / chain_delay_correction populated) to the sink
-        # so on_samples can use rtp_to_wallclock as the UTC source.
-        sink.set_channel_info(ch_info)
-        if lifetime_arg is not None:
-            self._lifetime_entries.append((multi, ch_info.ssrc))
-
-    def _start_streams(self) -> None:
-        for sink in self._sinks:
-            try:
-                sink.start()
-            except Exception:
-                logger.exception(
-                    "Failed to start sink %s %d Hz",
-                    sink.mode, sink.frequency_hz,
-                )
-        for multi in self._multi_streams:
-            try:
-                multi.start()
-            except Exception:
-                logger.exception("Failed to start MultiStream")
-
     def _start_uploaders(self) -> None:
         # Spot uploader: a single thread feeds psk.spots rows upstream
-        # to PSKReporter via the hs-uploader-driven `HsPskReporterUploader`
-        # (Pipeline + PskReporterTcp transport).  It reads SqliteSource
-        # when sigmond's SQLite sink is present, else FileTreeSource over
-        # the per-slot spool.
-        mode = _resolve_delivery_mode()
-        if mode == "server":
+        # to PSKReporter via the hs-uploader-driven
+        # ``HsPskReporterUploader`` (Pipeline + PskReporterTcp
+        # transport).  Reads SqliteSource when sigmond's SQLite sink
+        # is present, else FileTreeSource over the per-slot spool.
+        #
+        # The direct uploader only runs when ``direct`` is in the
+        # active pipelines set (see PSK_DELIVERY_PIPELINES at the top
+        # of this module).  Server-side pipelines (``server-merge`` /
+        # ``server-raw``) are driven from the SQLite sink → wsprdaemon-
+        # tar transport in wspr-recorder's upload orchestrator and
+        # need no work here.
+        pipelines = _resolve_delivery_pipelines()
+        if "direct" not in pipelines:
             logger.info(
-                "PSK_DELIVERY_MODE=server: direct PSKReporter uploader "
-                "disabled; spots will reach PSKReporter via wsprdaemon "
-                "server forwarding"
+                "PSK pipelines %s — direct PSKReporter uploader "
+                "disabled; spots reach pskreporter.info via "
+                "wsprdaemon-server forwarding (if ``server-merge`` is on)",
+                list(pipelines),
             )
             return
         callsign = self._station.get("callsign", "")
@@ -568,84 +654,6 @@ class PskRecorder:
         logger.info("uploader: %s", type(uploader).__name__)
         uploader.start()
         self._uploaders.append(uploader)
-
-    def _start_ch_tailers(self) -> None:
-        """Start one ChTailer per (radiod, mode) — CONTRACT v0.6 §17.
-
-        Each tailer watches the same `<radiod_id>-<mode>.log` file
-        pskreporter-sender tails, parses new lines, and inserts rows
-        into `psk.spots` via `sigmond.hamsci_sink.Writer.from_env()` —
-        sigmond's local SQLite sink by default.  Failure to import /
-        start is non-fatal: the existing PSKReporter upload path is
-        unaffected.
-
-        ChTailer runs in ALL three PSK_DELIVERY_MODE values.  The mode
-        affects only the per-row ``forward_to_pskreporter`` flag, NOT
-        whether tailers run:
-
-          * ``server`` → forward=True   (server forwards on our behalf)
-          * ``direct`` → forward=False  (we POST directly; server must
-                          not double-post if it ever sees the row)
-          * ``both``   → forward=False  (we POST directly AND ship to
-                          wd as a redundant copy; server won't re-post)
-
-        Originally PR 3 disabled tailers in ``direct`` mode under the
-        theory that "direct = no wsprdaemon path".  That broke the
-        direct PSKReporter delivery — the HsPskReporterUploader's
-        SqliteSource reads from the SAME sink the tailer writes to, so
-        with the tailer off the uploader pumped every 30s, found zero
-        work, and silently delivered nothing.  Discovered during the
-        2026-05-18 B4-100 cutover when ~2h of decodes failed to reach
-        PSKReporter.  See feedback_psk_delivery_mode_direct_breaks_uploader.
-        """
-        mode = _resolve_delivery_mode()
-        forward_flag = (mode == "server")  # direct / both → False
-        log_dir = Path(self._paths.get("log_dir", "/var/log/psk-recorder"))
-        callsign = self._station.get("callsign", "")
-        grid = self._station.get("grid_square", "")
-
-        try:
-            from psk_recorder.version import GIT_INFO
-            short = (GIT_INFO or {}).get("short", "")
-        except Exception:
-            short = ""
-        try:
-            from importlib.metadata import version as pkg_version
-            ver = pkg_version("psk-recorder")
-        except Exception:
-            ver = "0.1.0"
-        proc_version = f"{ver}+{short}" if short else ver
-
-        # Per-radiod compound-callsign hash table.  Lives under the
-        # spool dir (state, not log) and is shared across both modes
-        # because the same compound calls show up on FT8 and FT4.
-        spool_root = Path(self._paths.get(
-            "spool_dir", "/var/lib/psk-recorder",
-        )) / self._radiod_id
-        callhash_path = spool_root / "callhash.json"
-
-        for tailer_mode in ("ft8", "ft4"):
-            if not get_freqs(self._radiod, tailer_mode):
-                continue
-            log_path = log_dir / f"{self._radiod_id}-{tailer_mode}.log"
-            try:
-                tailer = ChTailer(
-                    log_path=log_path,
-                    mode=tailer_mode,
-                    radiod_id=self._radiod_id,
-                    host_call=callsign,
-                    host_grid=grid,
-                    processing_version=proc_version,
-                    callhash_path=callhash_path,
-                    forward_to_pskreporter=forward_flag,
-                )
-                tailer.start()
-                self._ch_tailers.append(tailer)
-            except Exception:
-                logger.exception(
-                    "ch_tailer %s startup failed; PSKReporter path unaffected",
-                    tailer_mode,
-                )
 
     def _notify_ready(self) -> None:
         """Send sd_notify READY=1 if running under systemd."""
@@ -738,12 +746,28 @@ class PskRecorder:
         # window isn't a partial-minute artifact.
         time.sleep(60.0)
 
+        # Per-(radiod, mode) line-count tracking — keys "<rid>:<mode>".
+        # Spot-log file is per-radiod so multi-source aggregation must
+        # sum the deltas, not point at one file.
+
         while self._running:
-            snapshots = [s.stats_snapshot() for s in self._sinks]
-            by_mode: dict[str, dict] = {}
-            for snap in snapshots:
+            # Aggregate per (radiod, mode) so the multi-source case
+            # surfaces each source's contribution.  Single-source
+            # deployments emit one line per mode exactly like before.
+            by_key: dict[tuple[str, str], dict] = {}
+            for sink in self._iter_sinks():
+                snap = sink.stats_snapshot()
                 m = snap["mode"]
-                agg = by_mode.setdefault(m, {
+                rid = getattr(sink, "radiod_id", "") or ""
+                # Some sinks predate the radiod_id attribute; fall
+                # back to the rx that owns them.
+                if not rid:
+                    for rx in self._receivers:
+                        if sink in rx.sinks:
+                            rid = rx.radiod_id
+                            break
+                key = (rid, m)
+                agg = by_key.setdefault(key, {
                     "freqs": 0, "decodes_ok": 0, "decodes_fail": 0,
                     "slots_empty": 0,
                 })
@@ -752,24 +776,32 @@ class PskRecorder:
                 agg["decodes_fail"] += snap["decodes_fail"]
                 agg["slots_empty"] += snap["slots_empty"]
 
-            for mode, agg in by_mode.items():
-                spot_log = log_dir / f"{self._radiod_id}-{mode}.log"
+            for (rid, mode), agg in by_key.items():
+                spot_log = log_dir / f"{rid}-{mode}.log"
                 spot_lines_total = count_lines(spot_log)
-                spots_delta = spot_lines_total - prev_spot_lines.get(mode, spot_lines_total)
-                ok_delta = agg["decodes_ok"] - prev_ok.get(mode, 0)
-                fail_delta = agg["decodes_fail"] - prev_fail.get(mode, 0)
-                empty_delta = agg["slots_empty"] - prev_empty.get(mode, 0)
+                prev_key = f"{rid}:{mode}"
+                spots_delta = spot_lines_total - prev_spot_lines.get(
+                    prev_key, spot_lines_total,
+                )
+                ok_delta = agg["decodes_ok"] - prev_ok.get(prev_key, 0)
+                fail_delta = agg["decodes_fail"] - prev_fail.get(prev_key, 0)
+                empty_delta = agg["slots_empty"] - prev_empty.get(prev_key, 0)
 
+                # Include the radiod_id tag so multi-source operators
+                # can tell which source is producing what; single-
+                # source readers can still grep ``stats FT8`` etc.
                 logger.info(
-                    "stats %s: spots=%d decodes=%d/%d slots_empty=%d freqs=%d (60s window)",
-                    mode.upper(), spots_delta, ok_delta, ok_delta + fail_delta,
+                    "stats %s rx=%s: spots=%d decodes=%d/%d "
+                    "slots_empty=%d freqs=%d (60s window)",
+                    mode.upper(), rid, spots_delta,
+                    ok_delta, ok_delta + fail_delta,
                     empty_delta, agg["freqs"],
                 )
 
-                prev_ok[mode] = agg["decodes_ok"]
-                prev_fail[mode] = agg["decodes_fail"]
-                prev_empty[mode] = agg["slots_empty"]
-                prev_spot_lines[mode] = spot_lines_total
+                prev_ok[prev_key] = agg["decodes_ok"]
+                prev_fail[prev_key] = agg["decodes_fail"]
+                prev_empty[prev_key] = agg["slots_empty"]
+                prev_spot_lines[prev_key] = spot_lines_total
 
             time.sleep(60.0)
 
@@ -808,39 +840,33 @@ class PskRecorder:
     def _shutdown(self) -> None:
         logger.info("Shutting down...")
         for uploader in self._uploaders:
-            uploader.stop()
-        for tailer in self._ch_tailers:
             try:
-                tailer.stop()
+                uploader.stop()
             except Exception:
-                logger.exception("Error stopping ch_tailer")
-        for multi in self._multi_streams:
+                logger.exception("Error stopping uploader")
+        # Stop each ReceiverManager — handles its own ChTailers,
+        # MultiStreams, sinks, log fds, and RadiodControl close.
+        # Stopping tailers first ensures no new rows hit the batcher
+        # while it's draining.
+        for rx in self._receivers:
             try:
-                multi.stop()
+                rx.stop()
             except Exception:
-                logger.exception("Error stopping MultiStream")
-        for sink in self._sinks:
-            sink.stop()
-        for fd in self._log_fds.values():
+                logger.exception(
+                    "Error stopping ReceiverManager %s", rx.radiod_id,
+                )
+        # Drain + stop the cycle batcher last so any spots already
+        # queued in its pending batches make it to psk.spots before
+        # the process exits.
+        if self._cycle_batcher is not None:
             try:
-                fd.close()
+                self._cycle_batcher.stop()
             except Exception:
-                pass
-        if hasattr(self, "_control"):
-            try:
-                self._control.close()
-            except Exception:
-                pass
+                logger.exception("Error stopping cycle batcher")
         logger.info("Shutdown complete")
 
 
-def _resolve_encoding(enc_str: str) -> int:
-    """Map config encoding string to ka9q.Encoding integer."""
-    mapping = {
-        "s16be": 2,
-        "s16le": 1,
-        "f32": 4,
-        "f32le": 4,
-        "f32be": 8,
-    }
-    return mapping.get(enc_str.lower(), 2)
+# ``_resolve_encoding`` is re-exported from ``receiver_manager`` at
+# the top of this module so existing ``from psk_recorder.core.recorder
+# import _resolve_encoding`` lines keep working.  No new definition
+# here — single source of truth lives in receiver_manager.py.

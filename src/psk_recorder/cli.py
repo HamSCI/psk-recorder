@@ -258,21 +258,49 @@ def _handle_daemon(args):
     _install_sighup_handler()
     logger = logging.getLogger("psk_recorder.daemon")
 
-    from psk_recorder.config import DEFAULT_CONFIG_PATH, load_config, resolve_radiod_block
+    from psk_recorder.config import (
+        DEFAULT_CONFIG_PATH,
+        ensure_sources,
+        load_config,
+        resolve_radiod_block,
+    )
     from psk_recorder.core.recorder import PskRecorder
 
     config_path = args.config or Path(
         os.environ.get("PSK_RECORDER_CONFIG", str(DEFAULT_CONFIG_PATH))
     )
     config = load_config(config_path)
-    radiod_block = resolve_radiod_block(config, args.radiod_id)
 
-    logger.info(
-        "Starting psk-recorder daemon for radiod %s (config=%s)",
-        radiod_block.get("id", "default"), config_path,
-    )
+    if args.radiod_id is not None:
+        # Legacy single-source mode — operator explicitly selected one
+        # block; honor it exactly even if the config has more.  Used
+        # by ``psk-recorder@<radiod-id>.service`` template units.
+        radiod_block = resolve_radiod_block(config, args.radiod_id)
+        blocks = [radiod_block]
+        logger.info(
+            "Starting psk-recorder daemon for radiod %s "
+            "(config=%s, single-source mode)",
+            radiod_block.get("id", "default"), config_path,
+        )
+    else:
+        # Multi-source mode — drive every [[radiod]] block in the
+        # config from a single process.  Mirrors wspr-recorder's
+        # single-process / multi-source pattern.
+        sources = ensure_sources(config)
+        if not sources:
+            raise SystemExit(
+                f"No usable [[radiod]] blocks in {config_path}",
+            )
+        blocks = [s["radiod_block"] for s in sources]
+        logger.info(
+            "Starting psk-recorder daemon for %d radiod source(s): %s "
+            "(config=%s)",
+            len(blocks),
+            ", ".join(s["radiod_id"] for s in sources),
+            config_path,
+        )
 
-    recorder = PskRecorder(config, radiod_block)
+    recorder = PskRecorder(config, blocks)
     recorder.run()
 
 
