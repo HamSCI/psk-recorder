@@ -222,6 +222,10 @@ class TestChTailer(unittest.TestCase):
                 self.assertEqual(row["host_call"], "AC0G")
                 self.assertEqual(row["host_grid"], "EM38ww")
                 self.assertEqual(row["radiod_id"], "test-rx888")
+                # rx_source defaults to ``radiod:<radiod_id>`` when the
+                # caller doesn't supply one — Phase A plumbing for the
+                # multi-source pipeline.
+                self.assertEqual(row["rx_source"], "radiod:test-rx888")
                 self.assertEqual(row["processing_version"], "0.1.0+abc")
                 self.assertEqual(row["mode"], "ft8")
                 # PR 3: forward_to_pskreporter defaults to True (matches

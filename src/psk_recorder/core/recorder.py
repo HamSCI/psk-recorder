@@ -18,6 +18,7 @@ from typing import Optional
 from psk_recorder.config import (
     FT4_CADENCE_SEC,
     FT8_CADENCE_SEC,
+    derive_source_key,
     get_freqs,
     get_mode_params,
     resolve_radiod_status,
@@ -121,6 +122,14 @@ class PskRecorder:
         self._config = config
         self._radiod = radiod_block
         self._radiod_id = radiod_block.get("id", "default")
+        # Canonical multi-rx source key, e.g. ``radiod:bee1-status.local``.
+        # Resolved lazily — radiod_status env override may not be set
+        # at __init__ in some test paths; tolerate that and fall back
+        # to ``radiod:<radiod_id>`` so the field is always populated.
+        try:
+            self._rx_source = derive_source_key(radiod_block)
+        except ValueError:
+            self._rx_source = f"radiod:{self._radiod_id}"
         self._paths = config.get("paths", {})
         self._station = config.get("station", {})
 
@@ -661,6 +670,7 @@ class PskRecorder:
                     log_path=log_path,
                     mode=tailer_mode,
                     radiod_id=self._radiod_id,
+                    rx_source=self._rx_source,
                     host_call=callsign,
                     host_grid=grid,
                     processing_version=proc_version,

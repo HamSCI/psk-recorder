@@ -341,6 +341,7 @@ class ChTailer:
         writer_factory=None,
         callhash_path: Optional[Path] = None,
         forward_to_pskreporter: bool = True,
+        rx_source: str = "",
     ) -> None:
         self._log_path = Path(log_path)
         self._mode = mode
@@ -351,6 +352,12 @@ class ChTailer:
         self._batch_rows = batch_rows
         self._writer_factory = writer_factory or _default_writer_factory
         self._writer = None
+        # Canonical multi-rx source identifier — ``radiod:<status_address>``
+        # for radiod-backed sources.  Defaults to ``radiod:<radiod_id>`` so
+        # single-rx deployments and tests get a sensible non-empty value
+        # without the caller having to supply one.  Phase A plumbing for
+        # the multi-source pipeline planned in psk-recorder.
+        self._rx_source = rx_source or f"radiod:{radiod_id}"
         # Tags every row written to the local sink so the wsprdaemon
         # server's gw1-elected pskreporter_forwarder knows whether to
         # POST it to pskreporter.info. Controlled by PSK_DELIVERY_MODE
@@ -493,6 +500,7 @@ class ChTailer:
             row["host_grid"] = self._host_grid
             row["radiod_id"] = self._radiod_id
             row["instance"] = self._radiod_id
+            row["rx_source"] = self._rx_source
             row["processing_version"] = self._processing_version
             row["forward_to_pskreporter"] = self._forward_to_pskreporter
             rows.append(row)

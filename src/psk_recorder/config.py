@@ -139,3 +139,57 @@ def resolve_radiod_status(radiod_block: dict) -> str:
             f"{env_key} is not set in the environment"
         )
     return status
+
+
+def derive_source_key(radiod_block: dict) -> str:
+    """Canonical source identifier for a radiod block.
+
+    Returns ``radiod:<resolved_status_address>`` — matches
+    ``sigmond.sources.SourceKey`` string form and wspr-recorder's
+    ``SourceConfig.key`` so a spot's ``rx_source`` tag is comparable
+    across clients.
+
+    Status resolution follows ``resolve_radiod_status`` precedence
+    (env override → ``radiod_status`` field), so the key reflects what
+    the recorder is actually talking to at runtime, not a static
+    config field.
+    """
+    return f"radiod:{resolve_radiod_status(radiod_block)}"
+
+
+def ensure_sources(config: dict) -> list[dict]:
+    """Normalise ``[[radiod]]`` blocks into a list of source descriptors.
+
+    Foundation for multi-source psk-recorder (Phase B).  Today each
+    daemon process still serves one radiod via ``--radiod-id`` /
+    ``resolve_radiod_block``; this helper just synthesises the
+    Phase-B-shaped list so other code can be written against the
+    final shape now.
+
+    Each entry has:
+      ``key``               — ``radiod:<status_address>`` (matches
+                              ``derive_source_key``)
+      ``radiod_id``         — short id from the ``[[radiod]]`` block
+      ``status_address``    — resolved mDNS hostname
+      ``radiod_block``      — the original block (freqs, lifetime, etc.)
+    """
+    blocks = config.get("radiod", [])
+    if isinstance(blocks, dict):
+        blocks = [blocks]
+
+    sources: list[dict] = []
+    for block in blocks:
+        try:
+            status = resolve_radiod_status(block)
+        except ValueError:
+            # Skip blocks that haven't been wired up yet — same shape
+            # ``resolve_radiod_block`` would reject; callers should
+            # not assume every entry resolves.
+            continue
+        sources.append({
+            "key": f"radiod:{status}",
+            "radiod_id": block.get("id", "default"),
+            "status_address": status,
+            "radiod_block": block,
+        })
+    return sources
