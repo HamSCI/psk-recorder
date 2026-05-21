@@ -47,9 +47,16 @@ def _install_sighup_handler() -> None:
 
 
 def main():
+    # "Quiet" surfaces emit clean stdout (JSON or shell-parseable) and
+    # must not get the "psk-recorder starting" log line on top.
+    # config show / config apply join inventory / validate / version
+    # here because the whiptail wizard parses their stdout.
     _contract_quiet = any(
         arg in ("inventory", "validate", "version")
         for arg in sys.argv[1:3]
+    ) or (
+        len(sys.argv) >= 3 and sys.argv[1] == "config"
+        and sys.argv[2] in ("show", "apply")
     )
 
     root = logging.getLogger()
@@ -143,6 +150,13 @@ def main():
                           help="focus edits on a specific [[radiod]] block")
     _add_common(sub_edit)
 
+    # `config show` / `config apply` exist for the whiptail wizard
+    # (scripts/config-wizard.sh) and any other tooling that wants to
+    # round-trip the config as JSON through the same validator the
+    # daemon uses.
+    from psk_recorder import configurator as _cfg
+    _cfg.add_show_apply_subparsers(cfg_sub, common=_add_common)
+
     args = parser.parse_args()
 
     if args.log_level and not _contract_quiet:
@@ -175,7 +189,11 @@ def _handle_config(args):
         sys.exit(configurator.cmd_config_init(args))
     if sub == "edit":
         sys.exit(configurator.cmd_config_edit(args))
-    print("usage: psk-recorder config {init|edit} [--non-interactive]")
+    if sub == "show":
+        sys.exit(configurator.cmd_config_show(args))
+    if sub == "apply":
+        sys.exit(configurator.cmd_config_apply(args))
+    print("usage: psk-recorder config {init|edit|show|apply} [...]")
     sys.exit(2)
 
 

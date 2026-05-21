@@ -1,0 +1,104 @@
+# psk-recorder operator-help sidecar.
+#
+# Same schema as mag-recorder's help.toml: per-key title / help body /
+# example / validator_hint / required.  Loaded by
+# scripts/config-wizard.sh for each whiptail dialog.
+#
+# Sections covered: [station], [paths], [processing].  [[radiod]]
+# arrays-of-tables are NOT modifiable via the wizard -- the wizard's
+# main menu has an "Edit raw TOML in $EDITOR" item that opens the
+# config file directly for the rare cases (multi-radiod, custom
+# freqs_hz lists) where TOML hand-editing is the right answer.
+
+# --- Station -------------------------------------------------------
+
+[station.callsign]
+title          = "Amateur callsign"
+help           = """Your amateur radio callsign (uppercase).
+
+Used as the PSKReporter reporter identity for every spot uploaded.
+If sigmond's coordination.env already records a callsign for this
+host, that value is pre-filled."""
+example        = "AC0G"
+validator_hint = "1-9 letters/digits/slashes"
+required       = true
+
+[station.grid_square]
+title          = "Maidenhead grid square (6-10 chars)"
+help           = """Your Maidenhead locator -- 6 characters minimum,
+up to 10 characters supported by PSKReporter for fine-grained location.
+
+Pre-filled from coordination.env STATION_GRID if available.
+Online converters: https://www.giangrandi.org/electronics/radio/qthloccalc.shtml"""
+example        = "EM38ww40pk"
+validator_hint = "2 letters + 2 digits + 2-8 alphanumeric chars"
+required       = true
+
+# --- Paths ---------------------------------------------------------
+
+[paths.spool_dir]
+title          = "WAV spool directory"
+help           = """Where psk-recorder writes raw FT8/FT4 audio slices
+before decoding.  One sub-directory per radiod ID and mode, e.g.
+``/var/lib/psk-recorder/<radiod_id>/{ft8,ft4}/``.
+
+Files are deleted after decode unless keep_wav = true (below)."""
+example        = "/var/lib/psk-recorder"
+required       = false
+
+[paths.log_dir]
+title          = "Spot-log directory"
+help           = """Where psk-recorder writes per-radiod, per-mode spot
+logs (``<radiod_id>-{ft8,ft4}.log``).  These are append-only text logs
+with one line per decoded spot."""
+example        = "/var/log/psk-recorder"
+required       = false
+
+[paths.decoder]
+title          = "decode_ft8 binary path"
+help           = """Absolute path to the ``decode_ft8`` binary from
+https://github.com/ka9q/ft8_lib -- the FT8/FT4 decoder psk-recorder
+invokes once per slot.  Must be on PATH or absolute."""
+example        = "/usr/local/bin/decode_ft8"
+validator_hint = "absolute path to an executable file"
+required       = false
+
+[paths.pskreporter]
+title          = "pskreporter binary path"
+help           = """Absolute path to the ``pskreporter`` binary (or
+the local ``pskreporter-sender`` wrapper) from
+https://github.com/pjsg/ftlib-pskreporter -- the long-running
+subprocess psk-recorder feeds spots to.  Must be on PATH or absolute."""
+example        = "/usr/local/bin/pskreporter-sender"
+validator_hint = "absolute path to an executable file"
+required       = false
+
+[paths.keep_wav]
+title          = "Keep WAV slices after decode?"
+help           = """Default false: WAV files are deleted right after
+decode to keep the spool dir bounded.  Set true for debugging or
+offline re-decode, but accept that the spool grows ~30 MB/hour per
+band per mode at the default 12 kHz sample rate."""
+example        = "false"
+validator_hint = "true or false"
+required       = false
+
+# --- Processing (advanced) -----------------------------------------
+
+[processing.radiod_lifetime_frames]
+title          = "radiod LIFETIME tag (frames)"
+help           = """How many radiod main-loop frames a psk-recorder
+channel survives without a keep-alive (ka9q-python ≥3.13.0,
+ka9q-radio ≥0f8b622).  Channels self-destruct after this many
+frames so a crashed recorder leaves no residual channels on radiod.
+
+Default 6000 ≈ 2 minutes at radiod's default 20 ms blocktime
+(~50 Hz).  The recorder refreshes the lifetime every (frames / 4)
+seconds while running.
+
+Special value: 0 = infinite (no LIFETIME tag, no keep-alive --
+radiod owns the channel for its full template default).  Use only
+when you truly want a channel to outlive the recorder."""
+example        = "6000"
+validator_hint = "non-negative integer (frames; 0 = infinite)"
+required       = false

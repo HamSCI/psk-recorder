@@ -37,10 +37,53 @@ Then:
 ```bash
 git clone https://github.com/mijahauan/psk-recorder /opt/git/sigmond/psk-recorder
 sudo /opt/git/sigmond/psk-recorder/scripts/install.sh   # creates user, venv, config, units
-sudoedit /etc/psk-recorder/psk-recorder-config.toml   # set callsign, grid, freqs, [[radiod]]
+sudo psk-recorder config edit                           # interactive wizard (whiptail) -- see below
 sudo systemctl start psk-recorder@<radiod_id>
 journalctl -fu psk-recorder@<radiod_id>
 ```
+
+### Configuration
+
+The daemon reads `/etc/psk-recorder/psk-recorder-config.toml`.  Three
+ways to populate it:
+
+1. **Interactive whiptail wizard (default)** — when stdout is a TTY
+   and `whiptail` is installed, `psk-recorder config init` (first
+   time) and `psk-recorder config edit` (subsequent) launch a
+   menu-driven wizard with sections for Station, Paths, Processing,
+   plus an "Edit raw TOML" item that drops to `$EDITOR` for the
+   `[[radiod]]` arrays-of-tables and per-band `freqs_hz` lists that
+   whiptail can't naturally express.  Inside a section, Cancel drops
+   back to the menu — effective "back" navigation.  Per-key help
+   lives in `config/help.toml`; pre-fills come from
+   `/etc/sigmond/coordination.env` (`STATION_CALL`, `STATION_GRID`).
+
+   Same UI pattern mag-recorder uses; see that repo's README for the
+   shape.
+
+2. **Headless / scripted**: `psk-recorder config init --non-interactive`
+   renders the template with `STATION_CALL` / `SIGMOND_INSTANCE` /
+   `SIGMOND_RADIOD_STATUS` env-bag substitutions, no prompts.
+
+3. **Hand-edit**: `sudoedit /etc/psk-recorder/psk-recorder-config.toml`.
+   Operator who values inline comments / formatting should pick this
+   path; the wizard's `config apply` rewrites the TOML cleanly and
+   doesn't preserve them.
+
+The two JSON entry points the wizard uses are stable surfaces for
+sigmond and other tooling:
+
+```bash
+psk-recorder config show --json [--defaults]   # → stdout JSON
+psk-recorder config apply --json -             # ← stdin JSON, validated, atomic write
+```
+
+`config apply` writes only `[station]`, `[paths]`, `[processing]`.
+`[[radiod]]` blocks pass through unchanged but cannot be set this way
+(whiptail can't express array-of-tables, and `tomllib` can't preserve
+comments across a round-trip).  Operators who need multi-radiod or
+custom frequency lists use the "Edit raw TOML" menu item or
+`sudoedit` directly.
 
 For ongoing development on a checked-out repo:
 

@@ -1,29 +1,68 @@
 """Interactive `config init` and `config edit` for psk-recorder.
 
-Implements CONTRACT-v0.5 §14: sigmond invokes these via
-`smd config init|edit psk-recorder [<instance>]`, passing
-`STATION_CALL`, `STATION_GRID`, `SIGMOND_INSTANCE`, and
-`SIGMOND_RADIOD_STATUS` as advisory defaults.  The script honors them
-as prompt defaults, never as overrides.
+Three operator-facing paths:
 
-Standalone usage works too (env vars unset → empty defaults).
+1. **Interactive whiptail wizard (default)** — when stdout is a TTY
+   and ``whiptail`` is available, exec ``scripts/config-wizard.sh``.
+   The wizard talks to this module via ``config show --json
+   --defaults`` and ``config apply --json -``; same UI shape as
+   the mag-recorder pilot (sigmond-integration HEAD 5b02db1, see
+   that repo's scripts/config-wizard.sh).
+
+2. **Legacy stdin prompts** — original ``_prompt()``-based flow.
+   Runs when whiptail isn't installed, or when the operator passes
+   ``--non-interactive``, or when stdout isn't a TTY.  Implements
+   CONTRACT-v0.5 §14: sigmond invokes via ``smd config init|edit
+   psk-recorder [<instance>]``, passing ``STATION_CALL``,
+   ``STATION_GRID``, ``SIGMOND_INSTANCE``, and
+   ``SIGMOND_RADIOD_STATUS`` as advisory defaults.
+
+3. **--non-interactive** — same as the legacy fallback, but never
+   prompts (env-bag values land if set, otherwise placeholders
+   stay).  Used by sigmond's scripted first-run interview.
+
+Standalone usage works in all modes (env vars unset → empty defaults).
+
+[[radiod]] arrays-of-tables and per-band ``freqs_hz`` lists are not
+modifiable through ``config apply``.  Whiptail can't express them
+naturally, and ``tomllib`` can't preserve TOML comments / formatting
+across a round-trip.  The wizard offers an "Edit raw TOML in
+\$EDITOR" menu item for the rare cases that need them.
 """
 
 from __future__ import annotations
 
+import argparse
+import copy
+import io
+import json
 import os
 import re
 import shutil
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 try:
     import tomllib
 except ModuleNotFoundError:
     import tomli as tomllib  # type: ignore[no-redef]
 
-from .config import DEFAULT_CONFIG_PATH
+from .config import DEFAULT_CONFIG_PATH, DEFAULTS, load_config
+
+
+# ---------------------------------------------------------------------------
+# Wizard / help-toml paths.  Resolved at import time so the CLI's
+# subprocess.call hands the correct paths to the shell wizard.
+# ---------------------------------------------------------------------------
+
+_WIZARD_PATH = Path(__file__).resolve().parent.parent.parent \
+    / "scripts" / "config-wizard.sh"
+
+_HELP_TOML_PATH = Path(__file__).resolve().parent.parent.parent \
+    / "config" / "help.toml"
 
 
 # Repo-relative location of the template (works for editable installs and
@@ -46,6 +85,33 @@ def _find_template() -> Optional[Path]:
 # ---------------------------------------------------------------------------
 
 def cmd_config_init(args) -> int:
+    """Dispatch `config init` to whiptail wizard or legacy stdin prompts."""
+    if not getattr(args, "non_interactive", False) and _wizard_available():
+        # Make sure something exists for the wizard to load -- if the
+        # operator never ran the legacy template render, write the
+        # template first so `config show --defaults` has a real file
+        # to start from.  Idempotent: respects --reconfig.
+        target = _resolve_target(args)
+        if not target.exists() or getattr(args, "reconfig", False):
+            rv = _legacy_config_init(args)
+            if rv != 0:
+                return rv
+        return _exec_wizard(args, "init")
+    return _legacy_config_init(args)
+
+
+def cmd_config_edit(args) -> int:
+    """Dispatch `config edit` to whiptail wizard or legacy stdin prompts."""
+    target = _resolve_target(args)
+    if not target.exists():
+        _err(f"{target} does not exist.  Run `psk-recorder config init` first.")
+        return 1
+    if not getattr(args, "non_interactive", False) and _wizard_available():
+        return _exec_wizard(args, "edit")
+    return _legacy_config_edit(args)
+
+
+def _legacy_config_init(args) -> int:
     target = _resolve_target(args)
     if target.exists() and not getattr(args, "reconfig", False):
         _err(f"{target} already exists.  Pass --reconfig to overwrite, or "
@@ -76,7 +142,7 @@ def cmd_config_init(args) -> int:
     return 0
 
 
-def cmd_config_edit(args) -> int:
+def _legacy_config_edit(args) -> int:
     target = _resolve_target(args)
     if not target.exists():
         _err(f"{target} does not exist.  Run `psk-recorder config init` first.")
@@ -342,3 +408,342 @@ def _info(msg: str) -> None:
 
 def _err(msg: str) -> None:
     print(f"\033[31m✗\033[0m {msg}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Whiptail wizard dispatcher
+# ---------------------------------------------------------------------------
+
+def _wizard_available() -> bool:
+    """True iff we should exec the shell wizard for this run."""
+    if not _WIZARD_PATH.is_file():
+        return False
+    if not os.access(_WIZARD_PATH, os.X_OK):
+        return False
+    if not sys.stdout.isatty() or not sys.stdin.isatty():
+        return False
+    return shutil.which("whiptail") is not None
+
+
+def _exec_wizard(args, mode: str) -> int:
+    """Hand off to scripts/config-wizard.sh, preserving --config."""
+    cmd = [str(_WIZARD_PATH), mode]
+    config_arg = getattr(args, "config", None)
+    if config_arg:
+        cmd += ["--config", str(config_arg)]
+    env = os.environ.copy()
+    env["PSK_RECORDER_HELP_TOML"] = str(_HELP_TOML_PATH)
+    env["PSK_RECORDER_CLI"] = sys.argv[0]
+    try:
+        return subprocess.call(cmd, env=env)
+    except FileNotFoundError as exc:
+        _err(f"wizard exec failed: {exc}")
+        return 1
+
+
+# ---------------------------------------------------------------------------
+# config show --json [--defaults] / config apply --json -
+# ---------------------------------------------------------------------------
+#
+# These are the only two surfaces the whiptail wizard touches.  Schema
+# knowledge stays in this module + config.DEFAULTS.  Same pattern
+# mag-recorder's configurator.py uses (sigmond-integration HEAD
+# 5b02db1) -- if the per-client wizard pattern proves out across N
+# clients, the show/apply/_serialize_toml machinery is a candidate
+# for extraction into a sigmond-provided library.
+
+def _deep_merge(base: dict, overlay: dict) -> dict:
+    """Return a new dict: ``overlay`` keys win, recursing into nested dicts.
+
+    [[radiod]] is a TOML array-of-tables (list of dicts on the Python
+    side), not a nested dict, so it's never merged -- overlay wins
+    outright when present.  The wizard never sets it, so in practice
+    the existing [[radiod]] blocks in the file pass through untouched.
+    """
+    out = copy.deepcopy(base)
+    for k, v in overlay.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = copy.deepcopy(v)
+    return out
+
+
+def cmd_config_show(args) -> int:
+    """Emit the current config as JSON on stdout.
+
+    With ``--defaults`` the output is ``DEFAULTS`` deep-merged with
+    whatever's in the TOML file, so the wizard sees every key with
+    a sensible value even on a freshly-installed host.  Without
+    ``--defaults`` only the keys actually present in the file appear.
+
+    Note: psk-recorder's DEFAULTS only covers [paths] and [processing];
+    [station] and [[radiod]] aren't defaulted (operators must fill them
+    in).  --defaults still includes the file's [station] / [[radiod]]
+    verbatim.
+    """
+    config_path = Path(getattr(args, "config", None) or DEFAULT_CONFIG_PATH)
+    if getattr(args, "defaults", False):
+        if config_path.is_file():
+            try:
+                effective = load_config(config_path)
+            except (FileNotFoundError, ValueError):
+                effective = copy.deepcopy(DEFAULTS)
+        else:
+            effective = copy.deepcopy(DEFAULTS)
+        out = effective
+    else:
+        if not config_path.is_file():
+            out = {}
+        else:
+            with open(config_path, "rb") as f:
+                out = tomllib.load(f)
+    json.dump(out, sys.stdout, indent=2, sort_keys=True, default=str)
+    sys.stdout.write("\n")
+    return 0
+
+
+# Sections the apply path is allowed to write.  [[radiod]] arrays and
+# per-band freqs_hz lists are deliberately excluded -- whiptail can't
+# express either, and tomllib can't preserve TOML comments across a
+# round-trip rewrite.  The wizard's "Edit raw TOML" escape hatch
+# handles those.
+_APPLY_ALLOWED_SECTIONS = {"station", "paths", "processing"}
+
+
+def cmd_config_apply(args) -> int:
+    """Read a JSON dict on stdin, validate, atomically write the TOML.
+
+    For psk-recorder the apply surface is intentionally smaller than
+    the full schema: only [station], [paths], [processing] can be set
+    here.  [[radiod]] arrays-of-tables are not modifiable through
+    this path -- see _APPLY_ALLOWED_SECTIONS for the rationale.
+
+    Validation:
+      - Only sections in _APPLY_ALLOWED_SECTIONS may appear.
+      - Per-key types are checked against DEFAULTS where defaults
+        exist; [station] is type-loose (everything's a string).
+      - The merged config must pass load_config()'s validators
+        (radiod_lifetime_frames range, etc.) before we write.
+
+    On success the file is rewritten atomically via .part + rename.
+    Comments and formatting are NOT preserved -- the operator who
+    wants comments back can re-run ``config init --reconfig``.
+    """
+    config_path = Path(getattr(args, "config", None) or DEFAULT_CONFIG_PATH)
+
+    try:
+        payload = json.load(sys.stdin)
+    except json.JSONDecodeError as exc:
+        print(f"config apply: stdin is not valid JSON: {exc}", file=sys.stderr)
+        return 2
+
+    if not isinstance(payload, dict):
+        print(f"config apply: top-level JSON must be an object, got {type(payload).__name__}",
+              file=sys.stderr)
+        return 2
+
+    unknown = set(payload.keys()) - _APPLY_ALLOWED_SECTIONS
+    if unknown:
+        print(f"config apply: section(s) not writable via apply: {sorted(unknown)} "
+              f"(allowed: {sorted(_APPLY_ALLOWED_SECTIONS)})",
+              file=sys.stderr)
+        return 2
+
+    for section, fields in payload.items():
+        if not isinstance(fields, dict):
+            print(f"config apply: [{section}] must be a table, got {type(fields).__name__}",
+                  file=sys.stderr)
+            return 2
+        default_section = DEFAULTS.get(section, {})
+        for key, val in fields.items():
+            default = default_section.get(key)
+            if default is None or val is None:
+                continue
+            if isinstance(default, bool):
+                if not isinstance(val, bool):
+                    print(f"config apply: [{section}].{key} expects bool, got {type(val).__name__}",
+                          file=sys.stderr)
+                    return 2
+            elif isinstance(default, int) and not isinstance(default, bool):
+                if not isinstance(val, (int, float)) or isinstance(val, bool):
+                    print(f"config apply: [{section}].{key} expects number, got {type(val).__name__}",
+                          file=sys.stderr)
+                    return 2
+                fields[key] = int(val) if isinstance(default, int) else float(val)
+            elif isinstance(default, str):
+                if not isinstance(val, str):
+                    print(f"config apply: [{section}].{key} expects string, got {type(val).__name__}",
+                          file=sys.stderr)
+                    return 2
+
+    # Deep-merge with the existing file (partial payloads preserve
+    # the operator's other settings).  Missing-file case: start from DEFAULTS
+    # for the keys load_config validates, leave [station] / [[radiod]] empty.
+    if config_path.is_file():
+        with open(config_path, "rb") as f:
+            existing = tomllib.load(f)
+    else:
+        existing = {}
+    merged = _deep_merge(existing, payload)
+
+    # Run merged config through load_config's validators by writing to a
+    # tempfile and round-tripping (since load_config takes a path).  Catches
+    # radiod_lifetime_frames range, etc.  Skip if there's no [[radiod]] yet
+    # (fresh-install case where the wizard runs against the template).
+    if merged.get("radiod"):
+        with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".toml", prefix="psk-recorder-validate.", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        try:
+            tmp_path.write_text(_serialize_toml(merged), encoding="utf-8")
+            try:
+                load_config(tmp_path)
+            except (ValueError, tomllib.TOMLDecodeError) as exc:
+                print(f"config apply: rejected by load_config: {exc}",
+                      file=sys.stderr)
+                return 2
+        finally:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+    text = _serialize_toml(merged)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = config_path.with_suffix(config_path.suffix + ".part")
+    tmp.write_text(text, encoding="utf-8")
+    try:
+        tmp.chmod(0o644)
+    except PermissionError:
+        pass
+    tmp.replace(config_path)
+    print(f"wrote {config_path}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# TOML serialization (hand-emitted; no tomli-w dep).
+#
+# Handles: scalars (str/int/float/bool), nested dicts as [section.child]
+# blocks, and arrays-of-tables as `[[section]]` headers (needed for the
+# [[radiod]] blocks that pass through unchanged from the existing file).
+# Arrays of scalars (freqs_hz) render as inline arrays so they fit on
+# one line per band.
+# ---------------------------------------------------------------------------
+
+def _toml_scalar(v: Any) -> str:
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        s = repr(v)
+        if "." not in s and "e" not in s and "E" not in s:
+            s += ".0"
+        return s
+    if isinstance(v, str):
+        return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    raise TypeError(f"unsupported TOML scalar type: {type(v).__name__}")
+
+
+def _toml_inline_array(arr: list) -> str:
+    """Render a list of scalars as a single-line TOML array."""
+    return "[" + ", ".join(_toml_scalar(x) for x in arr) + "]"
+
+
+def _serialize_toml(d: dict, parent: str = "") -> str:
+    """Serialize ``d`` to a deterministic TOML string.
+
+    Section order matches DEFAULTS where possible (paths, processing)
+    so successive writes diff cleanly; sections not in DEFAULTS
+    (station, radiod) follow.  [[radiod]] blocks render as
+    array-of-tables.
+    """
+    # Stable order: DEFAULTS first, then well-known non-default
+    # sections in a fixed order, then anything else alphabetical.
+    default_keys  = [k for k in DEFAULTS.keys() if k in d]
+    well_known    = [k for k in ("station", "radiod") if k in d and k not in default_keys]
+    extras        = sorted(k for k in d.keys() if k not in default_keys and k not in well_known)
+    ordered_keys  = default_keys + well_known + extras
+
+    out_lines: list[str] = []
+    for section_name in ordered_keys:
+        section = d[section_name]
+        # [[section]] array-of-tables (e.g. [[radiod]]).
+        if isinstance(section, list):
+            header = f"{parent}.{section_name}" if parent else section_name
+            for block in section:
+                if not isinstance(block, dict):
+                    raise TypeError(f"[[{header}]] entries must be tables, got {type(block).__name__}")
+                out_lines.append("")
+                out_lines.append(f"[[{header}]]")
+                out_lines.extend(_serialize_section_body(block, header))
+            continue
+
+        if not isinstance(section, dict):
+            out_lines.append(f"{section_name} = {_toml_scalar(section)}")
+            continue
+
+        header = f"{parent}.{section_name}" if parent else section_name
+        out_lines.append("")
+        out_lines.append(f"[{header}]")
+        out_lines.extend(_serialize_section_body(section, header))
+
+    return "\n".join(out_lines).lstrip("\n") + "\n"
+
+
+def _serialize_section_body(section: dict, header: str) -> list[str]:
+    """Emit one section's body: scalars first, then nested dicts as sub-tables."""
+    lines: list[str] = []
+    scalars  = {k: v for k, v in section.items() if not isinstance(v, dict)}
+    children = {k: v for k, v in section.items() if isinstance(v, dict)}
+
+    # DEFAULTS key order for known sections; alphabetical for the rest.
+    default_section = DEFAULTS.get(header.split(".")[0], {})
+    default_keys = [k for k in default_section.keys() if k in scalars]
+    extra_keys = sorted(k for k in scalars.keys() if k not in default_section)
+    for k in default_keys + extra_keys:
+        v = scalars[k]
+        if isinstance(v, list):
+            lines.append(f"{k} = {_toml_inline_array(v)}")
+        else:
+            lines.append(f"{k} = {_toml_scalar(v)}")
+
+    for child_name, child in children.items():
+        sub_header = f"{header}.{child_name}"
+        lines.append("")
+        lines.append(f"[{sub_header}]")
+        lines.extend(_serialize_section_body(child, sub_header))
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# Argparse wiring (called from cli.py)
+# ---------------------------------------------------------------------------
+
+def add_show_apply_subparsers(cfg_sub: argparse._SubParsersAction,
+                              *, common=None) -> None:
+    """Register `config show` and `config apply` on the config subparser.
+
+    Called from cli.py so the argparse tree stays in one place.
+    ``common`` is the local _add_common(sub) helper from cli.py,
+    hand-passed so we don't import private helpers across modules.
+    """
+    sub_show = cfg_sub.add_parser("show",
+        help="emit the current config as JSON")
+    sub_show.add_argument("--json", action="store_true",
+        help="emit JSON (the only output format today)")
+    sub_show.add_argument("--defaults", action="store_true",
+        help="merge with DEFAULTS so every default key is present")
+    if common:
+        common(sub_show)
+
+    sub_apply = cfg_sub.add_parser("apply",
+        help="apply a JSON dict from stdin to the config file")
+    sub_apply.add_argument("--json", action="store_true",
+        help="read JSON from stdin (the only input format today)")
+    sub_apply.add_argument("path", nargs="?", default="-",
+        help="JSON file path or '-' for stdin (default)")
+    if common:
+        common(sub_apply)
