@@ -47,20 +47,30 @@ PUMP_INTERVAL_SEC = 30.0
 
 
 def _cross_rx_dedup_enabled() -> bool:
-    """Phase D Cut 2: cross-rx dedup is ON by default for the direct
-    PSKReporter pipeline.  Multi-rx hosts otherwise post the same
-    spot once per receiver — PSKReporter rejects the duplicates
-    server-side, but that's wasted bandwidth + log noise on both
-    ends.
+    """Cross-rx dedup for the direct PSKReporter pipeline.  Opt-IN.
 
-    Override with ``PSK_DIRECT_DEDUP=0`` for the diagnostic case
-    where an operator wants every receiver's row to reach PSKReporter
-    independently (e.g. testing why one receiver's decodes never
-    win — usually a calibration issue) — or to opt out entirely on
-    a single-source host where the dedup overhead isn't justified.
+    When ON, the ``SqliteSource`` uses a window-function CTE over
+    ``json_extract(payload_json, '$.time' / '$.tx_call' /
+    '$.frequency_bucket_hz')`` to keep only the best-``score`` copy
+    of each spot across receivers.  Multi-rx hosts benefit because
+    PSKReporter otherwise sees the same spot once per receiver and
+    rejects the duplicates server-side.
+
+    Default is ``OFF`` until the dedup CTE is reworked: on hosts
+    where the shared ``/var/lib/sigmond/sink.db`` is also being
+    written to by ``wspr-recorder``, the CTE materialisation trips
+    ``sqlite3.OperationalError: disk I/O error`` every 30 s and the
+    direct pipeline stalls.  The simple (non-dedup) query used by
+    the gateway tar pipeline is unaffected.  Single-source hosts
+    have nothing to dedup anyway, so OFF-by-default is also the
+    correct default for the common case.
+
+    Set ``PSK_DIRECT_DEDUP=1`` to opt in on a multi-source host that
+    is NOT sharing sink.db with wspr-recorder (or where the IOERR
+    has been verified not to occur).
     """
-    raw = (os.environ.get("PSK_DIRECT_DEDUP") or "1").strip().lower()
-    return raw not in ("0", "false", "no", "off")
+    raw = (os.environ.get("PSK_DIRECT_DEDUP") or "0").strip().lower()
+    return raw in ("1", "true", "yes", "on")
 
 
 def _short_rx(rx_source: str) -> str:

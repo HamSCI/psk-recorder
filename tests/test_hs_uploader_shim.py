@@ -330,12 +330,37 @@ def test_per_rx_tally_skips_non_acked_outcomes(monkeypatch, tmp_path):
 
 # ── Phase D Cut 2: cross-rx dedup at the SQL layer ─────────────────────────
 
-def test_dedup_enabled_by_default(monkeypatch, tmp_path):
-    """SqliteSource construction sets the dedup window-function args
-    so the same TX heard by multiple receivers collapses to one row
-    per (time, tx_call, freq_bucket) before reaching PskReporterTcp."""
+def test_dedup_disabled_by_default(monkeypatch, tmp_path):
+    """Cross-rx dedup is OPT-IN (default off).  The window-function
+    CTE used by the dedup query trips ``sqlite3.OperationalError:
+    disk I/O error`` on shared-sink hosts where wspr-recorder is
+    also writing; until that's reworked, the simple non-dedup query
+    is the safer default.
+    """
     monkeypatch.setenv("HS_UPLOADER_STATE_DIR", str(tmp_path))
-    monkeypatch.delenv("PSK_DIRECT_DEDUP", raising=False)  # default = on
+    monkeypatch.delenv("PSK_DIRECT_DEDUP", raising=False)  # default = off
+    sink = tmp_path / "sink.db"
+    _make_sink(sink)
+    monkeypatch.setenv("SIGMOND_SQLITE_PATH", str(sink))
+
+    u = HsPskReporterUploader(
+        callsign="AC0G", grid_square="EM38ww", radiod_id="local",
+    )
+    src = u._build_source()  # noqa: SLF001
+    assert src.dedup_partition_by is None
+    assert src.dedup_order_by_desc is None
+    # frequency_bucket_hz is still projected — Cut 4 (wsprdaemon-tar
+    # raw path) may want it for server-side dedup metadata even
+    # when the direct path doesn't dedup itself.
+    assert "frequency_bucket_hz" in src.select_columns
+
+
+def test_dedup_enabled_via_env(monkeypatch, tmp_path):
+    """``PSK_DIRECT_DEDUP=1`` opts in to the window-function dedup —
+    appropriate for multi-rx hosts NOT sharing sink.db with
+    wspr-recorder (or where the IOERR has been verified absent)."""
+    monkeypatch.setenv("HS_UPLOADER_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("PSK_DIRECT_DEDUP", "1")
     sink = tmp_path / "sink.db"
     _make_sink(sink)
     monkeypatch.setenv("SIGMOND_SQLITE_PATH", str(sink))
@@ -351,41 +376,20 @@ def test_dedup_enabled_by_default(monkeypatch, tmp_path):
     assert "frequency_bucket_hz" in src.select_columns
 
 
-def test_dedup_disabled_via_env(monkeypatch, tmp_path):
-    """``PSK_DIRECT_DEDUP=0`` opts out so every receiver's row reaches
-    PSKReporter independently — diagnostic mode, normally not used."""
-    monkeypatch.setenv("HS_UPLOADER_STATE_DIR", str(tmp_path))
-    monkeypatch.setenv("PSK_DIRECT_DEDUP", "0")
-    sink = tmp_path / "sink.db"
-    _make_sink(sink)
-    monkeypatch.setenv("SIGMOND_SQLITE_PATH", str(sink))
-
-    u = HsPskReporterUploader(
-        callsign="AC0G", grid_square="EM38ww", radiod_id="local",
-    )
-    src = u._build_source()  # noqa: SLF001
-    assert src.dedup_partition_by is None
-    assert src.dedup_order_by_desc is None
-    # frequency_bucket_hz is still projected — Cut 4 (wsprdaemon-tar
-    # raw path) might want it for server-side dedup metadata even
-    # when the direct path doesn't.
-    assert "frequency_bucket_hz" in src.select_columns
-
-
-def test_dedup_env_falsy_variants(monkeypatch, tmp_path):
-    """Common false-ish strings should all disable dedup so
-    operators don't get surprised by ``no`` / ``off`` / ``false``."""
+def test_dedup_env_truthy_variants(monkeypatch, tmp_path):
+    """Common true-ish strings should all enable dedup so operators
+    don't get surprised by ``yes`` / ``on`` / ``true`` vs ``1``."""
     monkeypatch.setenv("HS_UPLOADER_STATE_DIR", str(tmp_path))
     sink = tmp_path / "sink.db"
     _make_sink(sink)
     monkeypatch.setenv("SIGMOND_SQLITE_PATH", str(sink))
 
-    for val in ("0", "false", "False", "No", "off"):
+    for val in ("1", "true", "True", "Yes", "on"):
         monkeypatch.setenv("PSK_DIRECT_DEDUP", val)
         u = HsPskReporterUploader(
             callsign="AC0G", grid_square="EM38ww", radiod_id="local",
         )
         src = u._build_source()  # noqa: SLF001
-        assert src.dedup_partition_by is None, (
-            f"PSK_DIRECT_DEDUP={val!r} should disable dedup"
+        assert src.dedup_partition_by is not None, (
+            f"PSK_DIRECT_DEDUP={val!r} should enable dedup"
         )
