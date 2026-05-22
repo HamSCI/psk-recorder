@@ -381,54 +381,56 @@ print(json.dumps(d))
 
 # Return a comma-separated summary of [[radiod]] ids (or "(none)").
 # Reads from SCRATCH_JSON first (in-session edits), then disk.
+#
+# All bash <-> Python communication uses env vars (not string
+# interpolation into the python -c source).  Earlier draft had
+# `( and ['--config', ''] or [])` as a Python syntax error when
+# CONFIG_PATH was empty -- env-var passing avoids the whole class
+# of bug.
 radiod_ids_summary() {
-    python3 -c "
-import json
+    SCRATCH="$SCRATCH_JSON" CFG="$CONFIG_PATH" PSK="$PSK_RECORDER" python3 <<'PYEOF' 2>/dev/null
+import json, os, subprocess
 try:
-    scratch = json.loads(r'''$SCRATCH_JSON''')
+    scratch = json.loads(os.environ.get('SCRATCH') or '{}')
 except Exception:
     scratch = {}
 if 'radiod' in scratch:
     blocks = scratch['radiod']
 else:
-    import subprocess
+    args = [os.environ['PSK'], 'config', 'show', '--json', '--defaults']
+    if os.environ.get('CFG'):
+        args += ['--config', os.environ['CFG']]
     try:
-        out = subprocess.check_output(
-            ['$PSK_RECORDER', 'config', 'show', '--json', '--defaults'] +
-            ($CONFIG_PATH and ['--config', '$CONFIG_PATH'] or []),
-            stderr=subprocess.DEVNULL,
-        ).decode()
+        out = subprocess.check_output(args, stderr=subprocess.DEVNULL).decode()
         blocks = json.loads(out).get('radiod', [])
     except Exception:
         blocks = []
 ids = [b.get('id', '?') for b in blocks if isinstance(b, dict)]
 print(','.join(ids) if ids else '(none)')
-" 2>/dev/null
+PYEOF
 }
 
 # Pull the current full [[radiod]] list (from SCRATCH_JSON or disk)
 # as a JSON array on stdout.
 radiod_list_json() {
-    python3 -c "
-import json
+    SCRATCH="$SCRATCH_JSON" CFG="$CONFIG_PATH" PSK="$PSK_RECORDER" python3 <<'PYEOF'
+import json, os, subprocess
 try:
-    scratch = json.loads(r'''$SCRATCH_JSON''')
+    scratch = json.loads(os.environ.get('SCRATCH') or '{}')
 except Exception:
     scratch = {}
 if 'radiod' in scratch:
     print(json.dumps(scratch['radiod']))
 else:
-    import subprocess
+    args = [os.environ['PSK'], 'config', 'show', '--json', '--defaults']
+    if os.environ.get('CFG'):
+        args += ['--config', os.environ['CFG']]
     try:
-        out = subprocess.check_output(
-            ['$PSK_RECORDER', 'config', 'show', '--json', '--defaults'] +
-            ($CONFIG_PATH and ['--config', '$CONFIG_PATH'] or []),
-            stderr=subprocess.DEVNULL,
-        ).decode()
+        out = subprocess.check_output(args, stderr=subprocess.DEVNULL).decode()
         print(json.dumps(json.loads(out).get('radiod', [])))
     except Exception:
         print('[]')
-"
+PYEOF
 }
 
 # Update the SCRATCH_JSON [[radiod]] list at index ``idx`` (or append
@@ -436,42 +438,73 @@ else:
 # existing nested [radiod.ft8] / [radiod.ft4] sub-tables and freqs_hz.
 radiod_block_update() {
     local idx="$1" new_id="$2" new_status="$3"
-    SCRATCH_JSON=$(python3 -c "
-import json
+    local current_blocks
+    current_blocks=$(radiod_list_json)
+    SCRATCH_JSON=$(SCRATCH="$SCRATCH_JSON" BLOCKS="$current_blocks" \
+                   IDX="$idx" NEW_ID="$new_id" NEW_STATUS="$new_status" \
+                   python3 <<'PYEOF'
+import json, os
 try:
-    d = json.loads(r'''$SCRATCH_JSON''')
+    d = json.loads(os.environ.get('SCRATCH') or '{}')
 except Exception:
     d = {}
 blocks = d.get('radiod')
 if blocks is None:
-    blocks = json.loads(r'''$(radiod_list_json)''')
-idx = $idx
+    blocks = json.loads(os.environ.get('BLOCKS') or '[]')
+idx = int(os.environ['IDX'])
+new_id     = os.environ['NEW_ID']
+new_status = os.environ['NEW_STATUS']
 if idx == -1 or idx >= len(blocks):
-    blocks.append({'id': '$new_id', 'radiod_status': '$new_status'})
+    blocks.append({'id': new_id, 'radiod_status': new_status})
 else:
-    blocks[idx]['id']            = '$new_id'
-    blocks[idx]['radiod_status'] = '$new_status'
+    blocks[idx]['id']            = new_id
+    blocks[idx]['radiod_status'] = new_status
 d['radiod'] = blocks
 print(json.dumps(d))
-")
+PYEOF
+)
 }
 
 # Delete the [[radiod]] block at index idx (operator confirmed first).
 radiod_block_delete() {
     local idx="$1"
-    SCRATCH_JSON=$(python3 -c "
-import json
+    local current_blocks
+    current_blocks=$(radiod_list_json)
+    SCRATCH_JSON=$(SCRATCH="$SCRATCH_JSON" BLOCKS="$current_blocks" IDX="$idx" \
+                   python3 <<'PYEOF'
+import json, os
 try:
-    d = json.loads(r'''$SCRATCH_JSON''')
+    d = json.loads(os.environ.get('SCRATCH') or '{}')
 except Exception:
     d = {}
 blocks = d.get('radiod')
 if blocks is None:
-    blocks = json.loads(r'''$(radiod_list_json)''')
-del blocks[$idx]
+    blocks = json.loads(os.environ.get('BLOCKS') or '[]')
+del blocks[int(os.environ['IDX'])]
 d['radiod'] = blocks
 print(json.dumps(d))
-")
+PYEOF
+)
+}
+
+# Look up one field of one [[radiod]] block by index, from the
+# operator-visible block list (SCRATCH first, then disk).  Returns
+# empty string if out of range.  Used by collect_radiod to pre-fill
+# the edit dialogs.
+radiod_block_get_field() {
+    local idx="$1" field="$2"
+    local current_blocks
+    current_blocks=$(radiod_list_json)
+    BLOCKS="$current_blocks" IDX="$idx" FIELD="$field" python3 <<'PYEOF' 2>/dev/null
+import json, os
+try:
+    blocks = json.loads(os.environ.get('BLOCKS') or '[]')
+except Exception:
+    blocks = []
+idx = int(os.environ['IDX'])
+if 0 <= idx < len(blocks):
+    print(blocks[idx].get(os.environ['FIELD'], ''))
+PYEOF
 }
 
 # psk-recorder's radiod id has the same shape as a callsign in spirit
@@ -480,35 +513,47 @@ valid_radiod_id()   { [[ "$1" =~ ^[A-Za-z0-9_-]{1,64}$ ]]; }
 valid_mdns_host()   { [[ "$1" =~ ^[A-Za-z0-9._-]{1,253}$ ]]; }
 
 collect_radiod() {
-    # Build menu of existing blocks + "Add new" + "Done".
     while :; do
         local blocks_json
         blocks_json=$(radiod_list_json)
-        # Whiptail menu items: tag = index (or "new" / "done"),
-        # description = "id (radiod_status, ft8=N freqs_hz, ft4=M freqs_hz)".
-        local menu_args
-        menu_args=$(python3 -c "
-import json
-blocks = json.loads(r'''$blocks_json''')
-items = []
-for i, b in enumerate(blocks):
-    rid = b.get('id', '?')
-    status = b.get('radiod_status', '?')
-    ft8 = len(b.get('ft8', {}).get('freqs_hz', []) or [])
-    ft4 = len(b.get('ft4', {}).get('freqs_hz', []) or [])
-    items += [str(i), f'{rid:<12s} status={status}  ft8={ft8} ft4={ft4}']
-items += ['new',  '(add a new [[radiod]] block)']
-items += ['done', '(back to main menu)']
-import shlex
-print(' '.join(shlex.quote(s) for s in items))
-")
-        # shellcheck disable=SC2086
+
+        # Build menu items as a bash array.  Each block becomes a
+        # (tag, description) pair; tag = index (or "new" / "done").
+        # No `eval` -- the array expands directly into whiptail's argv.
+        local -a menu_items=()
+        local count i rid status ft8 ft4
+        count=$(BLOCKS="$blocks_json" python3 <<'PYEOF' 2>/dev/null
+import json, os
+print(len(json.loads(os.environ.get('BLOCKS') or '[]')))
+PYEOF
+)
+        for ((i = 0; i < count; i++)); do
+            rid=$(BLOCKS="$blocks_json" IDX="$i" python3 <<'PYEOF' 2>/dev/null
+import json, os
+blocks = json.loads(os.environ.get('BLOCKS') or '[]')
+b = blocks[int(os.environ['IDX'])]
+ft8 = len((b.get('ft8') or {}).get('freqs_hz') or [])
+ft4 = len((b.get('ft4') or {}).get('freqs_hz') or [])
+print(f"{b.get('id', '?')}  status={b.get('radiod_status', '?')}  ft8={ft8} ft4={ft4}")
+PYEOF
+)
+            menu_items+=("$i" "$rid")
+        done
+        menu_items+=("new"  "(add a new [[radiod]] block)")
+        menu_items+=("done" "(back to main menu)")
+
         local pick
-        pick=$(eval whiptail --title "'Radiod blocks'" \
-                             --backtitle "'$BACKTITLE'" \
-                             --menu '"Pick a [[radiod]] block to edit, or add a new one.\n\nfreqs_hz lists stay in the raw TOML -- use Edit-TOML from the main menu."' \
-                             "$HEIGHT" "$WIDTH" "$LIST_HEIGHT" \
-                             $menu_args 3>\&1 1>\&2 2>\&3) || return 1
+        if ! pick=$(whiptail \
+                --title "Radiod blocks" \
+                --backtitle "$BACKTITLE" \
+                --menu "Pick a [[radiod]] block to edit, or add a new one.
+
+freqs_hz lists stay in the raw TOML -- use 'Edit-TOML' from the
+main menu for those." \
+                "$HEIGHT" "$WIDTH" "$LIST_HEIGHT" \
+                "${menu_items[@]}" 3>&1 1>&2 2>&3); then
+            return 1
+        fi
 
         case "$pick" in
             done) return 0 ;;
@@ -519,27 +564,22 @@ print(' '.join(shlex.quote(s) for s in items))
                 radiod_block_update -1 "$new_id" "$new_status"
                 ;;
             *)
+                # Numeric pick = index into the block list.
                 local cur_id cur_status
-                cur_id=$(python3 -c "
-import json
-blocks = json.loads(r'''$blocks_json''')
-print(blocks[$pick].get('id', ''))
-")
-                cur_status=$(python3 -c "
-import json
-blocks = json.loads(r'''$blocks_json''')
-print(blocks[$pick].get('radiod_status', ''))
-")
-                # Sub-menu: edit / delete / back
+                cur_id=$(radiod_block_get_field "$pick" id)
+                cur_status=$(radiod_block_get_field "$pick" radiod_status)
                 local subpick
-                subpick=$(whiptail --title "Block '$cur_id'" \
-                                   --backtitle "$BACKTITLE" \
-                                   --menu "Edit or delete this [[radiod]] block?" \
-                                   "$HEIGHT" "$WIDTH" 3 \
-                                   "edit"   "change id / radiod_status" \
-                                   "delete" "remove this block entirely" \
-                                   "back"   "(back to block list)" \
-                                   3>&1 1>&2 2>&3) || continue
+                if ! subpick=$(whiptail \
+                        --title "Block '$cur_id'" \
+                        --backtitle "$BACKTITLE" \
+                        --menu "Edit or delete this [[radiod]] block?" \
+                        "$HEIGHT" "$WIDTH" 3 \
+                        "edit"   "change id / radiod_status" \
+                        "delete" "remove this block entirely" \
+                        "back"   "(back to block list)" \
+                        3>&1 1>&2 2>&3); then
+                    continue
+                fi
                 case "$subpick" in
                     edit)
                         local new_id new_status
@@ -589,10 +629,11 @@ pick_radiod_id_for_env() {
     local blocks_json
     blocks_json=$(radiod_list_json)
     local count
-    count=$(python3 -c "
-import json
-print(len(json.loads(r'''$blocks_json''')))
-")
+    count=$(BLOCKS="$blocks_json" python3 <<'PYEOF' 2>/dev/null
+import json, os
+print(len(json.loads(os.environ.get('BLOCKS') or '[]')))
+PYEOF
+)
     if [[ "$count" == "0" ]]; then
         whiptail --title "No radiod blocks" \
                  --backtitle "$BACKTITLE" \
@@ -602,48 +643,48 @@ print(len(json.loads(r'''$blocks_json''')))
     fi
     if [[ "$count" == "1" ]]; then
         # Single radiod -- no need to prompt.
-        python3 -c "
-import json
-print(json.loads(r'''$blocks_json''')[0].get('id', ''))
-"
+        BLOCKS="$blocks_json" python3 <<'PYEOF' 2>/dev/null
+import json, os
+print(json.loads(os.environ.get('BLOCKS') or '[]')[0].get('id', ''))
+PYEOF
         return 0
     fi
-    # Multi-radiod: present a picker.
-    local menu_args
-    menu_args=$(python3 -c "
-import json, shlex
-blocks = json.loads(r'''$blocks_json''')
-items = []
-for b in blocks:
-    rid    = b.get('id', '?')
-    status = b.get('radiod_status', '?')
-    items += [rid, f'status={status}']
-print(' '.join(shlex.quote(s) for s in items))
-")
-    eval whiptail --title "'Pick instance for env'" \
-                  --backtitle "'$BACKTITLE'" \
-                  --menu '"Which [[radiod]] instance do you want to edit /etc/psk-recorder/env/<id>.env for?"' \
-                  "$HEIGHT" "$WIDTH" "$LIST_HEIGHT" \
-                  $menu_args 3>\&1 1>\&2 2>\&3 || return 1
+    # Multi-radiod: present a picker via a bash array (no eval).
+    local -a menu_items=()
+    local i id status
+    for ((i = 0; i < count; i++)); do
+        id=$(BLOCKS="$blocks_json" IDX="$i" python3 <<'PYEOF' 2>/dev/null
+import json, os
+print(json.loads(os.environ.get('BLOCKS') or '[]')[int(os.environ['IDX'])].get('id', ''))
+PYEOF
+)
+        status=$(BLOCKS="$blocks_json" IDX="$i" python3 <<'PYEOF' 2>/dev/null
+import json, os
+print(json.loads(os.environ.get('BLOCKS') or '[]')[int(os.environ['IDX'])].get('radiod_status', ''))
+PYEOF
+)
+        menu_items+=("$id" "status=$status")
+    done
+    whiptail --title "Pick instance for env" \
+             --backtitle "$BACKTITLE" \
+             --menu "Which [[radiod]] instance do you want to edit /etc/psk-recorder/env/<id>.env for?" \
+             "$HEIGHT" "$WIDTH" "$LIST_HEIGHT" \
+             "${menu_items[@]}" 3>&1 1>&2 2>&3 || return 1
 }
 
 # Summary of pipelines for the first radiod_id's env file, or "(unset)".
 delivery_summary() {
-    local blocks_json first_id env_file pipelines
-    blocks_json=$(radiod_list_json)
-    first_id=$(python3 -c "
-import json
-blocks = json.loads(r'''$blocks_json''')
-print(blocks[0]['id'] if blocks else '')
-" 2>/dev/null)
-    [[ -z "$first_id" ]] && { echo "(no radiod blocks)"; return; }
+    local first_id
+    first_id=$(radiod_ids_summary | cut -d, -f1)
+    [[ -z "$first_id" || "$first_id" == "(none)" ]] && { echo "(no radiod blocks)"; return; }
+    local env_file pipelines
     env_file=$("$PSK_RECORDER" env show --json --instance "$first_id" 2>/dev/null)
-    pipelines=$(python3 -c "
-import json
-d = json.loads(r'''${env_file:-{}}''' or '{}')
-v = d.get('PSK_DELIVERY_PIPELINES') or d.get('PSK_DELIVERY_MODE') or '(unset)'
-print(v)
-" 2>/dev/null)
+    pipelines=$(ENV_JSON="${env_file:-{}}" python3 <<'PYEOF' 2>/dev/null
+import json, os
+d = json.loads(os.environ.get('ENV_JSON') or '{}')
+print(d.get('PSK_DELIVERY_PIPELINES') or d.get('PSK_DELIVERY_MODE') or '(unset)')
+PYEOF
+)
     echo "${pipelines:-(unset)}"
 }
 
@@ -681,50 +722,56 @@ The next screens edit /etc/psk-recorder/env/$instance.env -- the per-instance up
     local current_env
     current_env=$("$PSK_RECORDER" env show --json --instance "$instance" 2>/dev/null)
     local cur_pipelines cur_hs_upload cur_dedup
-    cur_pipelines=$(python3 -c "
-import json
-d = json.loads(r'''${current_env:-{}}''' or '{}')
+    cur_pipelines=$(ENV_JSON="${current_env:-{}}" python3 <<'PYEOF' 2>/dev/null
+import json, os
+d = json.loads(os.environ.get('ENV_JSON') or '{}')
 print(d.get('PSK_DELIVERY_PIPELINES', d.get('PSK_DELIVERY_MODE', 'direct')))
-")
-    cur_hs_upload=$(python3 -c "
-import json
-d = json.loads(r'''${current_env:-{}}''' or '{}')
+PYEOF
+)
+    cur_hs_upload=$(ENV_JSON="${current_env:-{}}" python3 <<'PYEOF' 2>/dev/null
+import json, os
+d = json.loads(os.environ.get('ENV_JSON') or '{}')
 print(d.get('PSK_USE_HS_UPLOADER', '1'))
-")
-    cur_dedup=$(python3 -c "
-import json
-d = json.loads(r'''${current_env:-{}}''' or '{}')
+PYEOF
+)
+    cur_dedup=$(ENV_JSON="${current_env:-{}}" python3 <<'PYEOF' 2>/dev/null
+import json, os
+d = json.loads(os.environ.get('ENV_JSON') or '{}')
 print(d.get('PSK_DIRECT_DEDUP', '0'))
-")
+PYEOF
+)
 
     # PSK_DELIVERY_PIPELINES: checklist of three options.
-    # Build the per-option ON/OFF status from current value.
     local p_direct p_merge p_raw
-    p_direct=$([[ ",$cur_pipelines," == *",direct,"*  ]] && echo "on" || echo "off")
+    p_direct=$([[ ",$cur_pipelines," == *",direct,"*       ]] && echo "on" || echo "off")
     p_merge=$([[  ",$cur_pipelines," == *",server-merge,"* ]] && echo "on" || echo "off")
     p_raw=$([[    ",$cur_pipelines," == *",server-raw,"*   ]] && echo "on" || echo "off")
     local pick
-    pick=$(whiptail --title "$(help_get env.PSK_DELIVERY_PIPELINES title)" \
-                    --backtitle "$BACKTITLE" \
-                    --separate-output \
-                    --checklist "$(help_get env.PSK_DELIVERY_PIPELINES help)" \
-                    "$HEIGHT" "$WIDTH" 3 \
-                    "direct"       "POST direct to pskreporter.info"             "$p_direct" \
-                    "server-merge" "ship to wsprdaemon, server forwards one"     "$p_merge" \
-                    "server-raw"   "ship to wsprdaemon, suppress server forward" "$p_raw" \
-                    3>&1 1>&2 2>&3) || return 1
+    if ! pick=$(whiptail --title "$(help_get env.PSK_DELIVERY_PIPELINES title)" \
+                         --backtitle "$BACKTITLE" \
+                         --separate-output \
+                         --checklist "$(help_get env.PSK_DELIVERY_PIPELINES help)" \
+                         "$HEIGHT" "$WIDTH" 3 \
+                         "direct"       "POST direct to pskreporter.info"             "$p_direct" \
+                         "server-merge" "ship to wsprdaemon, server forwards one"     "$p_merge" \
+                         "server-raw"   "ship to wsprdaemon, suppress server forward" "$p_raw" \
+                         3>&1 1>&2 2>&3); then
+        return 1
+    fi
     # Auto-downgrade: if both 'direct' and 'server-merge' selected,
     # server-merge -> server-raw (per recorder.py).
     local new_pipelines
-    new_pipelines=$(python3 -c "
-selected = set('$pick'.split())
+    new_pipelines=$(PICK="$pick" python3 <<'PYEOF' 2>/dev/null
+import os
+selected = set(os.environ.get('PICK', '').split())
 if 'direct' in selected and 'server-merge' in selected:
     selected.discard('server-merge')
     selected.add('server-raw')
 if not selected:
     selected = {'direct'}    # default fallback
 print(','.join(sorted(selected)))
-")
+PYEOF
+)
 
     # Booleans as yesno.
     local new_hs new_dedup
@@ -744,14 +791,16 @@ print(','.join(sorted(selected)))
     # Write immediately via `psk-recorder env apply` -- env files are
     # cheap to round-trip; no need to defer until the main Apply step.
     local payload
-    payload=$(python3 -c "
-import json
+    payload=$(NEW_PIPES="$new_pipelines" NEW_HS="$new_hs" NEW_DEDUP="$new_dedup" \
+              python3 <<'PYEOF' 2>/dev/null
+import json, os
 print(json.dumps({
-    'PSK_DELIVERY_PIPELINES': '$new_pipelines',
-    'PSK_USE_HS_UPLOADER':    '$new_hs',
-    'PSK_DIRECT_DEDUP':       '$new_dedup',
+    'PSK_DELIVERY_PIPELINES': os.environ['NEW_PIPES'],
+    'PSK_USE_HS_UPLOADER':    os.environ['NEW_HS'],
+    'PSK_DIRECT_DEDUP':       os.environ['NEW_DEDUP'],
 }))
-")
+PYEOF
+)
     if ! printf '%s' "$payload" | \
             "$PSK_RECORDER" env apply --json - --instance "$instance"; then
         whiptail --title "env apply failed" \
@@ -784,26 +833,43 @@ edit_raw_toml() {
     fi
 
     # Apply any pending wizard changes first so $EDITOR sees a consistent file.
+    # Three explicit options here (the old yesno had only Yes/No and
+    # both opened the file -- the operator could not back out without
+    # editing, and "No" was easy to mis-read as "no, don't open at all").
     if [[ "$SCRATCH_JSON" != "{}" ]]; then
-        if ! ask_yesno "Apply pending changes first?" \
-                       "You have pending wizard edits (Station / Paths / Processing).
+        local pre_pick
+        if ! pre_pick=$(whiptail \
+                --title "Pending wizard edits" \
+                --backtitle "$BACKTITLE" \
+                --menu "You have pending wizard edits (Station / Paths / Processing / Timing / Radiod).
 
-Apply them to $target before opening it in \$EDITOR?
-
-Yes  -- write pending edits, then open the file
-No   -- discard pending edits, open the file as-is"; then
-            SCRATCH_JSON='{}'
-        else
-            if ! printf '%s' "$SCRATCH_JSON" | \
-                    "$PSK_RECORDER" config apply --json - ${CONFIG_PATH:+--config "$CONFIG_PATH"}; then
-                whiptail --title "Apply failed" \
-                         --backtitle "$BACKTITLE" \
-                         --msgbox "Couldn't write pending edits.  Aborting open." \
-                         12 "$WIDTH"
-                return 1
-            fi
-            SCRATCH_JSON='{}'
+What should I do before opening $target in \$EDITOR?" \
+                "$HEIGHT" "$WIDTH" 3 \
+                "apply-then-open" "write pending edits, then open the file" \
+                "discard-then-open" "discard pending edits, open the file as-is" \
+                "back"              "(cancel: don't open the file at all)" \
+                3>&1 1>&2 2>&3); then
+            return 0   # Esc/Cancel = back; no open, no write
         fi
+        case "$pre_pick" in
+            back)
+                return 0
+                ;;
+            discard-then-open)
+                SCRATCH_JSON='{}'
+                ;;
+            apply-then-open)
+                if ! printf '%s' "$SCRATCH_JSON" | \
+                        "$PSK_RECORDER" config apply --json - ${CONFIG_PATH:+--config "$CONFIG_PATH"}; then
+                    whiptail --title "Apply failed" \
+                             --backtitle "$BACKTITLE" \
+                             --msgbox "Couldn't write pending edits.  Aborting open." \
+                             12 "$WIDTH"
+                    return 1
+                fi
+                SCRATCH_JSON='{}'
+                ;;
+        esac
     fi
 
     local editor="${EDITOR:-${VISUAL:-nano}}"
