@@ -71,3 +71,7 @@ note       = "provides /usr/local/bin/pskreporter-sender (pip-installable)"
 name    = "ka9q-python"
 version = "3.6.0"
 venv    = "/opt/psk-recorder/venv"
+
+[[deps.apt]]
+name = "whiptail"
+note = "optional UI for `psk-recorder config init|edit` interactive wizard; absent → stdin-prompt fallback in configurator.py"
