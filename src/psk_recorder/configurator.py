@@ -503,12 +503,20 @@ def cmd_config_show(args) -> int:
     return 0
 
 
-# Sections the apply path is allowed to write.  [[radiod]] arrays and
-# per-band freqs_hz lists are deliberately excluded -- whiptail can't
-# express either, and tomllib can't preserve TOML comments across a
-# round-trip rewrite.  The wizard's "Edit raw TOML" escape hatch
-# handles those.
-_APPLY_ALLOWED_SECTIONS = {"station", "paths", "processing"}
+# Sections the apply path is allowed to write.
+#
+# [station] / [paths] / [processing] / [timing] are scalar-only tables,
+# easy to type-check against DEFAULTS, and naturally edited via
+# whiptail inputboxes.
+#
+# [[radiod]] is a TOML array-of-tables.  The wizard's "Radiod" section
+# walks ``id`` + ``radiod_status`` inline for each block (or adds a
+# new one), but per-band ``freqs_hz`` lists are too large for a
+# whiptail dialog -- those still escape to $EDITOR via the menu's
+# "Edit raw TOML" option.  Merge semantics: the operator's full
+# block list REPLACES the file's list (overlay-wins), since deep-merge
+# doesn't compose for arrays-of-tables.
+_APPLY_ALLOWED_SECTIONS = {"station", "paths", "processing", "timing", "radiod"}
 
 
 def cmd_config_apply(args) -> int:
@@ -551,6 +559,35 @@ def cmd_config_apply(args) -> int:
         return 2
 
     for section, fields in payload.items():
+        # [[radiod]] arrives as a JSON list (the operator's full block
+        # list; overlay-wins replaces the file's list since deep-merge
+        # doesn't compose for arrays-of-tables).
+        if section == "radiod":
+            if not isinstance(fields, list):
+                print(f"config apply: [[radiod]] must be a list, got {type(fields).__name__}",
+                      file=sys.stderr)
+                return 2
+            for i, block in enumerate(fields):
+                if not isinstance(block, dict):
+                    print(f"config apply: [[radiod]][{i}] must be a table, got {type(block).__name__}",
+                          file=sys.stderr)
+                    return 2
+                if not block.get("id"):
+                    print(f"config apply: [[radiod]][{i}].id is required",
+                          file=sys.stderr)
+                    return 2
+                if not block.get("radiod_status"):
+                    print(f"config apply: [[radiod]][{i}].radiod_status is required (mDNS hostname)",
+                          file=sys.stderr)
+                    return 2
+            # Reject duplicate ids -- recorder.py keys per-instance state on id.
+            ids = [b["id"] for b in fields]
+            if len(ids) != len(set(ids)):
+                print(f"config apply: [[radiod]] has duplicate ids: {ids}",
+                      file=sys.stderr)
+                return 2
+            continue
+
         if not isinstance(fields, dict):
             print(f"config apply: [{section}] must be a table, got {type(fields).__name__}",
                   file=sys.stderr)
@@ -577,9 +614,12 @@ def cmd_config_apply(args) -> int:
                           file=sys.stderr)
                     return 2
 
-    # Deep-merge with the existing file (partial payloads preserve
-    # the operator's other settings).  Missing-file case: start from DEFAULTS
-    # for the keys load_config validates, leave [station] / [[radiod]] empty.
+    # Merge with the existing file.  Scalar tables deep-merge so a
+    # partial payload preserves untouched fields.  [[radiod]] is a
+    # list-of-dicts; overlay-wins (the operator's edited list
+    # replaces the file's list) because deep-merge doesn't compose
+    # for arrays-of-tables.  _deep_merge already does this: nested
+    # dicts merge, everything else (including lists) is overwritten.
     if config_path.is_file():
         with open(config_path, "rb") as f:
             existing = tomllib.load(f)
@@ -747,3 +787,203 @@ def add_show_apply_subparsers(cfg_sub: argparse._SubParsersAction,
         help="JSON file path or '-' for stdin (default)")
     if common:
         common(sub_apply)
+
+
+# ---------------------------------------------------------------------------
+# env show / env apply -- /etc/psk-recorder/env/<radiod_id>.env
+# ---------------------------------------------------------------------------
+#
+# psk-recorder reads its per-instance env file via systemd's
+# EnvironmentFile=-/etc/psk-recorder/env/%i.env directive (where %i is
+# the radiod_id of the [[radiod]] block this instance serves).  The
+# file holds the upload-destination knobs -- PSK_DELIVERY_PIPELINES,
+# PSK_USE_HS_UPLOADER, PSK_DIRECT_DEDUP -- which the daemon honours
+# at start time.  Sigmond's coordination.env (/etc/sigmond/coordination.env)
+# is host-wide and sigmond-owned; the wizard reads from it (e.g. for
+# the SQLite sink path) but never writes there.
+
+_ENV_DIR = Path("/etc/psk-recorder/env")
+
+# Keys the wizard / `env apply` will write.  Other keys an operator
+# put in by hand pass through unchanged.
+_ENV_WRITABLE_KEYS = {
+    "PSK_DELIVERY_PIPELINES",
+    "PSK_USE_HS_UPLOADER",
+    "PSK_DIRECT_DEDUP",
+    # Legacy fallback: same effective meaning as PSK_DELIVERY_PIPELINES.
+    "PSK_DELIVERY_MODE",
+}
+_VALID_DELIVERY_PIPELINES = {"direct", "server-merge", "server-raw"}
+
+
+def _env_file_path(instance: str) -> Path:
+    return _ENV_DIR / f"{instance}.env"
+
+
+def _parse_env_file(path: Path) -> "dict[str, str]":
+    """Read a systemd-style KEY=VALUE env file.  Skips comments and blanks.
+    Values may be quoted with " or '; we strip them but don't try to
+    handle shell-style escapes."""
+    out: dict[str, str] = {}
+    if not path.is_file():
+        return out
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key = key.strip()
+        val = val.strip()
+        if (val.startswith('"') and val.endswith('"')) or \
+           (val.startswith("'") and val.endswith("'")):
+            val = val[1:-1]
+        out[key] = val
+    return out
+
+
+def _serialize_env_file(d: "dict[str, str]") -> str:
+    """Serialize back to KEY=VALUE lines.  We don't preserve the source
+    file's comments or ordering -- env files are flat and the wizard
+    is the canonical writer."""
+    lines: list[str] = []
+    for key in sorted(d.keys()):
+        val = d[key]
+        # Quote if the value has whitespace, equals sign, or shell metachars.
+        if any(c in val for c in ' \t"\'#=$`'):
+            quoted = '"' + val.replace("\\", "\\\\").replace('"', '\\"') + '"'
+            lines.append(f"{key}={quoted}")
+        else:
+            lines.append(f"{key}={val}")
+    return "\n".join(lines) + "\n"
+
+
+def _validate_env_payload(payload: dict) -> Optional[str]:
+    """Returns an error message, or None if the payload is acceptable.
+
+    Only keys in _ENV_WRITABLE_KEYS may appear; other keys would
+    require us to either delete them or pass them through (we choose
+    to reject so the operator notices typos)."""
+    bad = set(payload.keys()) - _ENV_WRITABLE_KEYS
+    if bad:
+        return (f"env apply: unknown / unmanaged keys: {sorted(bad)} "
+                f"(allowed: {sorted(_ENV_WRITABLE_KEYS)})")
+
+    if "PSK_DELIVERY_PIPELINES" in payload:
+        val = payload["PSK_DELIVERY_PIPELINES"]
+        if not isinstance(val, str):
+            return f"PSK_DELIVERY_PIPELINES must be a string, got {type(val).__name__}"
+        parts = [p.strip() for p in val.split(",") if p.strip()]
+        bad_parts = set(parts) - _VALID_DELIVERY_PIPELINES
+        if bad_parts:
+            return (f"PSK_DELIVERY_PIPELINES contains unknown pipelines: "
+                    f"{sorted(bad_parts)} (valid: {sorted(_VALID_DELIVERY_PIPELINES)})")
+        if not parts:
+            return "PSK_DELIVERY_PIPELINES cannot be empty (set at least one pipeline, or omit the key entirely)"
+
+    for k in ("PSK_USE_HS_UPLOADER", "PSK_DIRECT_DEDUP"):
+        if k in payload:
+            val = payload[k]
+            if val not in ("0", "1"):
+                return f"{k} must be the string '0' or '1', got {val!r}"
+
+    if "PSK_DELIVERY_MODE" in payload:
+        val = payload["PSK_DELIVERY_MODE"]
+        if val not in ("direct", "server", "both"):
+            return (f"PSK_DELIVERY_MODE must be 'direct', 'server', or 'both' "
+                    f"(legacy values); got {val!r}.  Prefer PSK_DELIVERY_PIPELINES.")
+    return None
+
+
+def cmd_env_show(args) -> int:
+    """Emit /etc/psk-recorder/env/<instance>.env as JSON on stdout."""
+    instance = args.instance
+    if not instance:
+        print("env show: --instance <radiod_id> is required", file=sys.stderr)
+        return 2
+    parsed = _parse_env_file(_env_file_path(instance))
+    json.dump(parsed, sys.stdout, indent=2, sort_keys=True)
+    sys.stdout.write("\n")
+    return 0
+
+
+def cmd_env_apply(args) -> int:
+    """Read a JSON dict on stdin, validate, atomically write the env file.
+
+    Merge semantics: keys in the payload OVERRIDE / SET the corresponding
+    entries in the existing file; other keys pass through unchanged.
+    To DELETE a key entirely, the payload may set its value to JSON null.
+    """
+    instance = args.instance
+    if not instance:
+        print("env apply: --instance <radiod_id> is required", file=sys.stderr)
+        return 2
+    try:
+        payload = json.load(sys.stdin)
+    except json.JSONDecodeError as exc:
+        print(f"env apply: stdin is not valid JSON: {exc}", file=sys.stderr)
+        return 2
+    if not isinstance(payload, dict):
+        print(f"env apply: top-level JSON must be an object, got {type(payload).__name__}",
+              file=sys.stderr)
+        return 2
+
+    # Separate deletes (null values) from sets.
+    deletes = {k for k, v in payload.items() if v is None}
+    sets    = {k: v for k, v in payload.items() if v is not None}
+
+    err = _validate_env_payload(sets)
+    if err:
+        print(f"env apply: {err}", file=sys.stderr)
+        return 2
+
+    env_path = _env_file_path(instance)
+    existing = _parse_env_file(env_path)
+    for k in deletes:
+        existing.pop(k, None)
+    existing.update({k: str(v) for k, v in sets.items()})
+
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    text = _serialize_env_file(existing)
+    tmp = env_path.with_suffix(env_path.suffix + ".part")
+    tmp.write_text(text, encoding="utf-8")
+    try:
+        tmp.chmod(0o644)
+    except PermissionError:
+        pass
+    tmp.replace(env_path)
+    print(f"wrote {env_path}")
+    return 0
+
+
+def add_env_subparsers(subparsers: argparse._SubParsersAction,
+                       *, common=None) -> None:
+    """Register top-level `env show` / `env apply` subcommands.
+
+    Called from cli.py.  Lives in configurator.py so all schema-aware
+    env-file machinery is colocated with the TOML show/apply code.
+    """
+    sub_env = subparsers.add_parser("env",
+        help="read or write /etc/psk-recorder/env/<instance>.env")
+    env_sub = sub_env.add_subparsers(dest="env_command")
+
+    sub_env_show = env_sub.add_parser("show",
+        help="emit the per-instance env file as JSON")
+    sub_env_show.add_argument("--json", action="store_true",
+        help="emit JSON (the only output format today)")
+    sub_env_show.add_argument("--instance", required=True,
+        help="radiod_id of the instance to inspect")
+    if common:
+        common(sub_env_show)
+
+    sub_env_apply = env_sub.add_parser("apply",
+        help="apply a JSON dict from stdin to the per-instance env file")
+    sub_env_apply.add_argument("--json", action="store_true",
+        help="read JSON from stdin (the only input format today)")
+    sub_env_apply.add_argument("--instance", required=True,
+        help="radiod_id of the instance to write")
+    sub_env_apply.add_argument("path", nargs="?", default="-",
+        help="JSON file path or '-' for stdin (default)")
+    if common:
+        common(sub_env_apply)

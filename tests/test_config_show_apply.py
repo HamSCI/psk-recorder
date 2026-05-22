@@ -130,11 +130,12 @@ def test_apply_preserves_radiod_blocks(tmp_path: Path) -> None:
     assert loaded["radiod"][0]["ft4"]["freqs_hz"] == [14080000, 7047500]
 
 
-def test_apply_rejects_radiod_writes(tmp_path: Path, capsys) -> None:
-    """The wizard is not allowed to set [[radiod]] blocks."""
-    rv = _apply({"radiod": [{"id": "bogus"}]}, tmp_path)
-    assert rv == 2
-    assert "not writable via apply" in capsys.readouterr().err.lower()
+# NOTE: an earlier version of this test asserted that [[radiod]] was
+# not writable via apply at all.  The wizard now writes radiod
+# blocks (with the inline-edit / pick-a-block flow); the per-block
+# validation (id + radiod_status required, no duplicate ids, must
+# be a list) is covered by test_apply_rejects_radiod_missing_id /
+# missing_status / duplicate_ids / not_a_list below.
 
 
 def test_apply_rejects_unknown_section(tmp_path: Path, capsys) -> None:
@@ -257,3 +258,205 @@ def test_wizard_available_false_without_tty() -> None:
 def test_wizard_available_false_when_script_missing(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(configurator, "_WIZARD_PATH", tmp_path / "nope.sh")
     assert configurator._wizard_available() is False
+
+
+# ---------- [timing] apply -------------------------------------------------
+
+def test_apply_writes_timing_section(tmp_path: Path) -> None:
+    rv = _apply({"timing": {"chain_delay_ns": 12345}},
+                tmp_path, existing=_FIXTURE_WITH_RADIOD)
+    assert rv == 0
+    with open(tmp_path / "c.toml", "rb") as f:
+        loaded = tomllib.load(f)
+    assert loaded["timing"]["chain_delay_ns"] == 12345
+
+
+# ---------- [[radiod]] apply (overlay-wins) --------------------------------
+
+def test_apply_writes_radiod_blocks(tmp_path: Path) -> None:
+    """The operator's full block list replaces the file's list."""
+    rv = _apply({"radiod": [
+                    {"id": "new-rx888",  "radiod_status": "new-status.local"},
+                    {"id": "new2-rx888", "radiod_status": "new2-status.local"},
+                ]}, tmp_path, existing=_FIXTURE_WITH_RADIOD)
+    assert rv == 0
+    with open(tmp_path / "c.toml", "rb") as f:
+        loaded = tomllib.load(f)
+    ids = [b["id"] for b in loaded["radiod"]]
+    assert ids == ["new-rx888", "new2-rx888"]
+    # The original 'test-rx888' block (and its freqs_hz) is GONE because
+    # overlay-wins replaces the whole list.  This is the documented
+    # contract; operators who want to preserve freqs_hz pass them
+    # back in the payload, or use the wizard's "Edit raw TOML" path.
+    assert "test-rx888" not in ids
+
+
+def test_apply_rejects_radiod_missing_id(tmp_path: Path, capsys) -> None:
+    rv = _apply({"radiod": [{"radiod_status": "x.local"}]}, tmp_path)
+    assert rv == 2
+    assert "id is required" in capsys.readouterr().err.lower()
+
+
+def test_apply_rejects_radiod_missing_status(tmp_path: Path, capsys) -> None:
+    rv = _apply({"radiod": [{"id": "x"}]}, tmp_path)
+    assert rv == 2
+    assert "radiod_status is required" in capsys.readouterr().err.lower()
+
+
+def test_apply_rejects_radiod_duplicate_ids(tmp_path: Path, capsys) -> None:
+    rv = _apply({"radiod": [
+                    {"id": "dup", "radiod_status": "a.local"},
+                    {"id": "dup", "radiod_status": "b.local"},
+                ]}, tmp_path)
+    assert rv == 2
+    assert "duplicate ids" in capsys.readouterr().err.lower()
+
+
+def test_apply_rejects_radiod_not_a_list(tmp_path: Path, capsys) -> None:
+    rv = _apply({"radiod": {"id": "x"}}, tmp_path)  # dict, not list
+    assert rv == 2
+    assert "must be a list" in capsys.readouterr().err.lower()
+
+
+# ---------- env show / env apply ------------------------------------------
+
+def _env_ns(**kw) -> argparse.Namespace:
+    base = {"instance": None, "json": True, "log_level": None, "path": "-",
+            "config": None}
+    base.update(kw)
+    return argparse.Namespace(**base)
+
+
+def test_env_show_missing_file_returns_empty(tmp_path: Path, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(configurator, "_ENV_DIR", tmp_path)
+    rv = configurator.cmd_env_show(_env_ns(instance="nope-rx888"))
+    assert rv == 0
+    assert json.loads(capsys.readouterr().out) == {}
+
+
+def test_env_show_parses_existing_file(tmp_path: Path, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(configurator, "_ENV_DIR", tmp_path)
+    (tmp_path / "rx0.env").write_text(
+        '# leading comment\n'
+        'PSK_USE_HS_UPLOADER=1\n'
+        'PSK_DELIVERY_PIPELINES="direct,server-raw"\n'
+        '\n'
+    )
+    rv = configurator.cmd_env_show(_env_ns(instance="rx0"))
+    assert rv == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["PSK_USE_HS_UPLOADER"]      == "1"
+    assert out["PSK_DELIVERY_PIPELINES"]   == "direct,server-raw"
+
+
+def test_env_show_requires_instance(monkeypatch, capsys) -> None:
+    rv = configurator.cmd_env_show(_env_ns(instance=None))
+    assert rv == 2
+    assert "--instance" in capsys.readouterr().err.lower()
+
+
+def _env_apply(payload, tmp_path: Path, monkeypatch, *,
+               instance: str = "rx0", existing: str = "") -> int:
+    monkeypatch.setattr(configurator, "_ENV_DIR", tmp_path)
+    if existing:
+        (tmp_path / f"{instance}.env").write_text(existing)
+    old_stdin = sys.stdin
+    sys.stdin = io.StringIO(json.dumps(payload))
+    try:
+        return configurator.cmd_env_apply(_env_ns(instance=instance))
+    finally:
+        sys.stdin = old_stdin
+
+
+def test_env_apply_writes_new_file(tmp_path: Path, monkeypatch) -> None:
+    rv = _env_apply({"PSK_DELIVERY_PIPELINES": "direct"}, tmp_path, monkeypatch)
+    assert rv == 0
+    text = (tmp_path / "rx0.env").read_text()
+    assert "PSK_DELIVERY_PIPELINES=direct" in text
+
+
+def test_env_apply_merges_with_existing(tmp_path: Path, monkeypatch) -> None:
+    rv = _env_apply({"PSK_DELIVERY_PIPELINES": "direct,server-raw"},
+                    tmp_path, monkeypatch,
+                    existing="PSK_USE_HS_UPLOADER=1\nPSK_DIRECT_DEDUP=0\n")
+    assert rv == 0
+    parsed = configurator._parse_env_file(tmp_path / "rx0.env")
+    assert parsed["PSK_DELIVERY_PIPELINES"] == "direct,server-raw"
+    assert parsed["PSK_USE_HS_UPLOADER"]    == "1"   # preserved
+    assert parsed["PSK_DIRECT_DEDUP"]       == "0"   # preserved
+
+
+def test_env_apply_null_value_deletes_key(tmp_path: Path, monkeypatch) -> None:
+    rv = _env_apply({"PSK_DIRECT_DEDUP": None},
+                    tmp_path, monkeypatch,
+                    existing="PSK_USE_HS_UPLOADER=1\nPSK_DIRECT_DEDUP=1\n")
+    assert rv == 0
+    parsed = configurator._parse_env_file(tmp_path / "rx0.env")
+    assert "PSK_DIRECT_DEDUP" not in parsed
+    assert parsed["PSK_USE_HS_UPLOADER"] == "1"
+
+
+def test_env_apply_rejects_unknown_key(tmp_path: Path, monkeypatch, capsys) -> None:
+    rv = _env_apply({"NOT_MY_KEY": "value"}, tmp_path, monkeypatch)
+    assert rv == 2
+    assert "unknown / unmanaged" in capsys.readouterr().err.lower()
+
+
+def test_env_apply_rejects_bad_pipeline(tmp_path: Path, monkeypatch, capsys) -> None:
+    rv = _env_apply({"PSK_DELIVERY_PIPELINES": "direct,bogus"},
+                    tmp_path, monkeypatch)
+    assert rv == 2
+    assert "unknown pipelines" in capsys.readouterr().err.lower()
+
+
+def test_env_apply_rejects_non_01_bool(tmp_path: Path, monkeypatch, capsys) -> None:
+    rv = _env_apply({"PSK_USE_HS_UPLOADER": "true"},
+                    tmp_path, monkeypatch)
+    assert rv == 2
+    assert "'0' or '1'" in capsys.readouterr().err
+
+
+def test_env_apply_accepts_legacy_delivery_mode(tmp_path: Path, monkeypatch) -> None:
+    rv = _env_apply({"PSK_DELIVERY_MODE": "both"}, tmp_path, monkeypatch)
+    assert rv == 0
+    parsed = configurator._parse_env_file(tmp_path / "rx0.env")
+    assert parsed["PSK_DELIVERY_MODE"] == "both"
+
+
+def test_env_apply_rejects_invalid_legacy_delivery_mode(tmp_path: Path, monkeypatch, capsys) -> None:
+    rv = _env_apply({"PSK_DELIVERY_MODE": "garbage"}, tmp_path, monkeypatch)
+    assert rv == 2
+    err = capsys.readouterr().err.lower()
+    assert "delivery_mode" in err
+
+
+# ---------- env-file serializer / parser ----------------------------------
+
+def test_serialize_env_file_quotes_values_with_whitespace() -> None:
+    text = configurator._serialize_env_file({"K": "value with spaces"})
+    assert text == 'K="value with spaces"\n'
+
+
+def test_serialize_env_file_quotes_values_with_equals() -> None:
+    text = configurator._serialize_env_file({"K": "a=b"})
+    assert text == 'K="a=b"\n'
+
+
+def test_parse_env_file_strips_quotes() -> None:
+    f = Path("/tmp/psk-env-parse-test.env")
+    f.write_text('K1="quoted"\nK2=\'single\'\nK3=plain\n')
+    try:
+        parsed = configurator._parse_env_file(f)
+        assert parsed == {"K1": "quoted", "K2": "single", "K3": "plain"}
+    finally:
+        f.unlink()
+
+
+def test_parse_env_file_skips_comments_and_blanks() -> None:
+    f = Path("/tmp/psk-env-parse-test2.env")
+    f.write_text('# this is a comment\n\n\nKEY=value\n# trailing comment\n')
+    try:
+        parsed = configurator._parse_env_file(f)
+        assert parsed == {"KEY": "value"}
+    finally:
+        f.unlink()

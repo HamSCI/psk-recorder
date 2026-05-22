@@ -44,46 +44,94 @@ journalctl -fu psk-recorder@<radiod_id>
 
 ### Configuration
 
-The daemon reads `/etc/psk-recorder/psk-recorder-config.toml`.  Three
-ways to populate it:
+psk-recorder's operator-facing config spans **three persistence layers**:
 
-1. **Interactive whiptail wizard (default)** — when stdout is a TTY
-   and `whiptail` is installed, `psk-recorder config init` (first
-   time) and `psk-recorder config edit` (subsequent) launch a
-   menu-driven wizard with sections for Station, Paths, Processing,
-   plus an "Edit raw TOML" item that drops to `$EDITOR` for the
-   `[[radiod]]` arrays-of-tables and per-band `freqs_hz` lists that
-   whiptail can't naturally express.  Inside a section, Cancel drops
-   back to the menu — effective "back" navigation.  Per-key help
-   lives in `config/help.toml`; pre-fills come from
-   `/etc/sigmond/coordination.env` (`STATION_CALL`, `STATION_GRID`).
+| Layer | Path | Owner | Holds |
+|---|---|---|---|
+| **TOML config** | `/etc/psk-recorder/psk-recorder-config.toml` | psk-recorder | `[station]`, `[paths]`, `[processing]`, `[timing]`, `[[radiod]]` blocks |
+| **Coordination env** | `/etc/sigmond/coordination.env` | sigmond | `STATION_CALL`, `STATION_GRID`, `SIGMOND_SQLITE_PATH`, host-wide identity |
+| **Per-instance env** | `/etc/psk-recorder/env/<radiod_id>.env` | psk-recorder | `PSK_DELIVERY_PIPELINES`, `PSK_USE_HS_UPLOADER`, `PSK_DIRECT_DEDUP` — the upload destination knobs |
 
-   Same UI pattern mag-recorder uses; see that repo's README for the
-   shape.
+The wizard manages layers 1 and 3; it reads from layer 2 (sigmond's
+coordination env) for pre-fills but never writes there.
 
-2. **Headless / scripted**: `psk-recorder config init --non-interactive`
-   renders the template with `STATION_CALL` / `SIGMOND_INSTANCE` /
-   `SIGMOND_RADIOD_STATUS` env-bag substitutions, no prompts.
+#### Interactive wizard (default)
 
-3. **Hand-edit**: `sudoedit /etc/psk-recorder/psk-recorder-config.toml`.
-   Operator who values inline comments / formatting should pick this
-   path; the wizard's `config apply` rewrites the TOML cleanly and
-   doesn't preserve them.
+When stdout is a TTY and `whiptail` is installed, `psk-recorder config
+init` (first time) and `psk-recorder config edit` (subsequent) launch
+a menu-driven wizard:
 
-The two JSON entry points the wizard uses are stable surfaces for
-sigmond and other tooling:
-
-```bash
-psk-recorder config show --json [--defaults]   # → stdout JSON
-psk-recorder config apply --json -             # ← stdin JSON, validated, atomic write
+```
+Station    Call=AC0G  Grid=EM38ww40pk
+Paths      spool=/var/lib/psk-recorder  decoder=decode_ft8
+Processing lifetime=6000 frames
+Timing     chain_delay=0 ns (sigmond usually overrides)
+Radiod     blocks: bee1-rx888
+Delivery   pipelines: direct,server-raw (per-instance env)
+Edit-TOML  Open raw config in $EDITOR (for freqs_hz lists)
+Apply      Review and write changes
+Cancel     Discard pending changes and exit
 ```
 
-`config apply` writes only `[station]`, `[paths]`, `[processing]`.
-`[[radiod]]` blocks pass through unchanged but cannot be set this way
-(whiptail can't express array-of-tables, and `tomllib` can't preserve
-comments across a round-trip).  Operators who need multi-radiod or
-custom frequency lists use the "Edit raw TOML" menu item or
-`sudoedit` directly.
+Inside a section, Cancel drops back to the menu — effective "back"
+navigation.  Each section walks its questions linearly with per-field
+help and validation.
+
+- **Station / Paths / Processing / Timing** edit the TOML through
+  `config apply`.
+- **Radiod** lets you pick an existing `[[radiod]]` block to edit
+  (`id`, `radiod_status`) or add a new one.  `freqs_hz` arrays stay
+  in the raw TOML — use the **Edit-TOML** menu item for those.
+- **Delivery** edits `/etc/psk-recorder/env/<radiod_id>.env` through
+  `env apply`.  Shows `SIGMOND_SQLITE_PATH` from coordination.env
+  read-only for context.  Auto-downgrades `direct + server-merge` to
+  `direct + server-raw` so the wsprdaemon server doesn't double-post.
+
+Per-key help lives in `config/help.toml`; pre-fills come from
+`/etc/sigmond/coordination.env` (`STATION_CALL`, `STATION_GRID`) and
+the current TOML / env files.
+
+Same UI pattern mag-recorder uses; see that repo's README for the
+basic shape.
+
+#### Headless / scripted
+
+```bash
+psk-recorder config init --non-interactive
+```
+
+Renders the template with `STATION_CALL` / `SIGMOND_INSTANCE` /
+`SIGMOND_RADIOD_STATUS` env-bag substitutions, no prompts.
+
+#### Hand-edit
+
+```bash
+sudoedit /etc/psk-recorder/psk-recorder-config.toml
+sudoedit /etc/psk-recorder/env/<radiod_id>.env
+```
+
+Operator who values inline comments / formatting should pick this
+path; the wizard's `config apply` rewrites the TOML cleanly and
+doesn't preserve comments.
+
+#### JSON entry points (for sigmond / other tooling)
+
+```bash
+psk-recorder config show  --json [--defaults]              # → TOML as JSON
+psk-recorder config apply --json -                         # ← stdin JSON, validated, atomic write
+psk-recorder env    show  --json --instance <radiod_id>    # → env file as JSON
+psk-recorder env    apply --json - --instance <radiod_id>  # ← stdin JSON, validated, atomic write
+```
+
+`config apply` writes `[station]`, `[paths]`, `[processing]`,
+`[timing]`, and `[[radiod]]` (overlay-wins for the radiod list — the
+operator's full list replaces the file's list; per-band `freqs_hz`
+must be passed back in the payload if you want to preserve them).
+
+`env apply` writes `PSK_DELIVERY_PIPELINES`, `PSK_USE_HS_UPLOADER`,
+`PSK_DIRECT_DEDUP`, and the legacy `PSK_DELIVERY_MODE`.  Keys outside
+that set are rejected so a typo doesn't silently land in the env
+file.  Setting a key to JSON `null` deletes it.
 
 For ongoing development on a checked-out repo:
 

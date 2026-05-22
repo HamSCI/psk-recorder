@@ -49,13 +49,13 @@ def _install_sighup_handler() -> None:
 def main():
     # "Quiet" surfaces emit clean stdout (JSON or shell-parseable) and
     # must not get the "psk-recorder starting" log line on top.
-    # config show / config apply join inventory / validate / version
-    # here because the whiptail wizard parses their stdout.
+    # config show / config apply, env show / env apply join inventory /
+    # validate / version because the whiptail wizard parses their stdout.
     _contract_quiet = any(
         arg in ("inventory", "validate", "version")
         for arg in sys.argv[1:3]
     ) or (
-        len(sys.argv) >= 3 and sys.argv[1] == "config"
+        len(sys.argv) >= 3 and sys.argv[1] in ("config", "env")
         and sys.argv[2] in ("show", "apply")
     )
 
@@ -157,6 +157,12 @@ def main():
     from psk_recorder import configurator as _cfg
     _cfg.add_show_apply_subparsers(cfg_sub, common=_add_common)
 
+    # Top-level `env show` / `env apply` for per-instance env files at
+    # /etc/psk-recorder/env/<radiod_id>.env -- the upload-destination
+    # knobs (PSK_DELIVERY_PIPELINES etc.) that don't fit in the TOML
+    # because systemd unit's EnvironmentFile= consumes them at start.
+    _cfg.add_env_subparsers(subparsers, common=_add_common)
+
     args = parser.parse_args()
 
     if args.log_level and not _contract_quiet:
@@ -176,9 +182,22 @@ def main():
         _handle_status(args)
     elif args.command == "config":
         _handle_config(args)
+    elif args.command == "env":
+        _handle_env(args)
     else:
         parser.print_help()
         sys.exit(1)
+
+
+def _handle_env(args):
+    from psk_recorder import configurator
+    sub = getattr(args, "env_command", None)
+    if sub == "show":
+        sys.exit(configurator.cmd_env_show(args))
+    if sub == "apply":
+        sys.exit(configurator.cmd_env_apply(args))
+    print("usage: psk-recorder env {show|apply} --instance <radiod_id>")
+    sys.exit(2)
 
 
 def _handle_config(args):

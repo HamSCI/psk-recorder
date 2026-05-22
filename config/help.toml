@@ -34,6 +34,15 @@ example        = "EM38ww40pk"
 validator_hint = "2 letters + 2 digits + 2-8 alphanumeric chars"
 required       = true
 
+[station.antenna]
+title          = "Antenna description (optional)"
+help           = """Free-form antenna text reported to PSKReporter
+alongside each spot.  Some operators put their antenna type and
+direction here (e.g. "G5RV @ 10m, NW").  Leave empty if you don't
+care to publish it."""
+example        = "G5RV @ 10m"
+required       = false
+
 # --- Paths ---------------------------------------------------------
 
 [paths.spool_dir]
@@ -54,11 +63,28 @@ with one line per decoded spot."""
 example        = "/var/log/psk-recorder"
 required       = false
 
-[paths.decoder]
+[paths.decoder_kind]
+title          = "Decoder kind"
+help           = """Which FT8/FT4 decoder psk-recorder invokes per
+slot.  Only one option supported today:
+
+  decode_ft8   ka9q/ft8_lib decoder; streams to stdout, reports an
+               ft8_lib-internal score (not a calibrated dB SNR),
+               costs ~0.05 s CPU and ~4 MB RSS per slot per band.
+
+Rows in psk.spots self-identify via the decoder_kind column."""
+example        = "decode_ft8"
+validator_hint = "decode_ft8"
+required       = false
+
+[paths.decoder_decode_ft8]
 title          = "decode_ft8 binary path"
 help           = """Absolute path to the ``decode_ft8`` binary from
-https://github.com/ka9q/ft8_lib -- the FT8/FT4 decoder psk-recorder
-invokes once per slot.  Must be on PATH or absolute."""
+https://github.com/ka9q/ft8_lib.  Must be on PATH or absolute.
+
+The wizard previously asked for [paths].decoder here, which the
+template uses but the code never reads -- always use
+decoder_decode_ft8."""
 example        = "/usr/local/bin/decode_ft8"
 validator_hint = "absolute path to an executable file"
 required       = false
@@ -68,9 +94,24 @@ title          = "pskreporter binary path"
 help           = """Absolute path to the ``pskreporter`` binary (or
 the local ``pskreporter-sender`` wrapper) from
 https://github.com/pjsg/ftlib-pskreporter -- the long-running
-subprocess psk-recorder feeds spots to.  Must be on PATH or absolute."""
+subprocess psk-recorder feeds spots to via stdin (TCP or UDP
+depending on paths.pskreporter_tcp)."""
 example        = "/usr/local/bin/pskreporter-sender"
 validator_hint = "absolute path to an executable file"
+required       = false
+
+[paths.pskreporter_tcp]
+title          = "Use TCP transport to pskreporter-sender?"
+help           = """How psk-recorder feeds spots into the
+pskreporter-sender subprocess:
+
+  true   (default) write each spot to the sender's stdin
+                   via a long-lived TCP socket.  Reliable;
+                   recommended.
+  false            spawn one sender per cycle and write via UDP.
+                   Lighter-weight but lossy under load."""
+example        = "true"
+validator_hint = "true or false"
 required       = false
 
 [paths.keep_wav]
@@ -101,4 +142,113 @@ radiod owns the channel for its full template default).  Use only
 when you truly want a channel to outlive the recorder."""
 example        = "6000"
 validator_hint = "non-negative integer (frames; 0 = infinite)"
+required       = false
+
+# --- Radiod (one entry per [[radiod]] block; arrays-of-tables) -----
+
+[radiod.id]
+title          = "Radiod block id"
+help           = """Short identifier for this [[radiod]] block.
+Matches systemd's psk-recorder@<id>.service instance suffix and the
+per-instance env file at /etc/psk-recorder/env/<id>.env.
+
+Conventionally <hostname>-<sdr>, e.g. bee1-rx888."""
+example        = "bee1-rx888"
+validator_hint = "1-64 letters/digits/hyphens/underscores"
+required       = true
+
+[radiod.radiod_status]
+title          = "Radiod status address (mDNS)"
+help           = """The mDNS hostname radiod publishes its status RTP
+control channel on -- always a .local hostname, never an IP.
+Format: <radiod-id>-status.local."""
+example        = "bee1-status.local"
+validator_hint = "<hostname>.local"
+required       = true
+
+# --- Timing (advanced) ---------------------------------------------
+
+[timing.chain_delay_ns]
+title          = "Chain delay (nanoseconds)"
+help           = """CONTRACT v0.3 §8 fallback: how many nanoseconds
+later than wall-clock the RTP audio actually arrives at psk-recorder,
+accounting for SDR + radiod + multicast latency.  Subtracted from
+slot timestamps so spots align to true UTC.
+
+Almost always overridden by RADIOD_<id>_CHAIN_DELAY_NS in
+/etc/sigmond/coordination.env (sigmond measures this empirically
+per radiod and writes it there).  Set here only as a standalone
+fallback when sigmond isn't running or hasn't filled it in yet."""
+example        = "0"
+validator_hint = "integer nanoseconds (typically 0..1_000_000_000)"
+required       = false
+
+# === Per-instance env file =========================================
+#
+# /etc/psk-recorder/env/<radiod_id>.env holds the upload-destination
+# knobs (PSK_DELIVERY_PIPELINES etc.).  The wizard's "Delivery"
+# section walks these and writes the env file via
+# `psk-recorder env apply`.  Keys are env-var names with a
+# leading "env." path component in this help-toml schema.
+
+[env.PSK_DELIVERY_PIPELINES]
+title          = "Upload pipelines (where spots go)"
+help           = """Comma-separated list of upload pipelines; order
+doesn't matter.
+
+  direct         client POSTs spots directly to pskreporter.info
+                 (cross-receiver dedup via HsPskReporterUploader).
+                 No server involvement on the upload side.
+
+  server-merge   ship every row to wsprdaemon-server with the
+                 forward_to_pskreporter flag set.  The server's
+                 elected pskreporter_forwarder picks one
+                 representative row per (call, freq, time) tuple
+                 and POSTs that one to pskreporter.info.
+
+  server-raw    ship every row to wsprdaemon-server with the
+                 forward_to_pskreporter flag CLEARED, so the
+                 server doesn't double-post.  Use when 'direct'
+                 is also enabled (the wizard auto-downgrades
+                 server-merge -> server-raw in that case).
+
+Typical settings:
+  Standalone host:                          direct
+  Site contributing to wsprdaemon network:  server-merge
+  Both:                                     direct,server-raw
+
+Legacy PSK_DELIVERY_MODE (server / direct / both) is still
+honoured for backward compatibility."""
+example        = "direct"
+validator_hint = "comma-separated subset of {direct,server-merge,server-raw}"
+required       = false
+
+[env.PSK_USE_HS_UPLOADER]
+title          = "Enable the hs-uploader pipeline?"
+help           = """When 1 (the recommended setting on this fleet),
+psk-recorder runs the in-process hs-uploader Pipeline that ships
+spots through the chosen PSK_DELIVERY_PIPELINES.
+
+When 0 / unset, no uploads happen -- psk-recorder records and
+decodes locally but ships nothing to pskreporter.info or wsprdaemon.
+Useful for offline debugging."""
+example        = "1"
+validator_hint = "0 or 1"
+required       = false
+
+[env.PSK_DIRECT_DEDUP]
+title          = "Direct-pipeline dedup CTE (advanced)"
+help           = """When 1, the 'direct' pipeline runs a window-function
+CTE to deduplicate spots across receivers before POSTing to
+pskreporter.info -- one row per (call, freq, ~time) tuple wins.
+
+Default 0 because on hosts where /var/lib/sigmond/sink.db is also
+being written to by wspr-recorder, the CTE materialisation trips
+sqlite3.OperationalError: disk I/O error every 30 s and the direct
+pipeline stalls.
+
+Enable on a multi-source host that is NOT sharing sink.db with
+wspr-recorder, or where the IOERR has been verified not to occur."""
+example        = "0"
+validator_hint = "0 or 1"
 required       = false
