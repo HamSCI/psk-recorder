@@ -54,14 +54,30 @@ if ! id -u "$SERVICE_USER" &>/dev/null; then
             "$SERVICE_USER"
 fi
 
-# --- Phase 1.5: ensure sibling repos (callhash, hs-uploader) ---
-# pyproject.toml declares these as path-based deps under [tool.uv.sources]:
-#     callhash    = { path = "../callhash" }
-#     hs-uploader = { path = "../hs-uploader" }
-# Plain pip (used below) doesn't honor [tool.uv.sources], so we install
-# both editable into the venv ourselves *before* the main `pip install -e .`
-# of psk-recorder.  If a sibling isn't at the canonical location, relocate
-# from common alternates (~, ~/git, /opt/git) or clone upstream.
+# --- Phase 1.4: ensure uv is on PATH (canonical sigmond-suite installer) ---
+_ensure_uv() {
+    if command -v uv >/dev/null 2>&1; then
+        ui_info "uv $(uv --version 2>/dev/null | awk '{print $2}') at $(command -v uv)"
+        return
+    fi
+    ui_info "uv not found -- installing system-wide to /usr/local/bin"
+    command -v curl >/dev/null || { ui_error "curl not found (apt install curl)"; exit 1; }
+    if ! curl -LsSf https://astral.sh/uv/install.sh | env XDG_BIN_HOME=/usr/local/bin UV_NO_MODIFY_PATH=1 sh; then
+        ui_error "uv installer failed"
+        exit 1
+    fi
+    command -v uv >/dev/null || { ui_error "uv installer ran but uv is still not on PATH"; exit 1; }
+    ui_info "uv $(uv --version 2>/dev/null | awk '{print $2}') installed"
+}
+_ensure_uv
+
+# --- Phase 1.5: ensure sibling repos (callhash, hs-uploader, ka9q-python) ---
+# pyproject.toml declares these via [tool.uv.sources] with `editable = true`
+# and `path = "../<name>"`.  uv sync honors that natively (unlike plain
+# pip), so we don't need an explicit pre-install pass anymore -- just
+# verify the sibling repos exist on disk first.  If a sibling isn't at
+# the canonical location, relocate from common alternates (~, ~/git,
+# /opt/git) or clone upstream.
 _ensure_sibling() {
     local name="$1" repo_url="$2"
     local target="/opt/git/sigmond/$name"
@@ -104,6 +120,7 @@ _ensure_sibling() {
 
 _ensure_sibling callhash    https://github.com/mijahauan/callhash
 _ensure_sibling hs-uploader https://github.com/mijahauan/hs-uploader
+_ensure_sibling ka9q-python https://github.com/mijahauan/ka9q-python
 
 # --- Phase 2: repo + venv ---
 if [[ ! -d "$REPO_SOURCE" ]]; then
@@ -125,45 +142,46 @@ if $DO_PULL; then
     git -C "$REPO_SOURCE" pull --ff-only
 fi
 
-# Recreate the venv if it doesn't exist, OR if it's incomplete (a
-# previous install that crashed before bootstrapping pip leaves a
-# partial venv with python but no bin/pip — re-running install would
-# then trip on `$VENV_DIR/bin/pip` not existing).
-if [[ ! -d "$VENV_DIR" ]] || [[ ! -x "$VENV_DIR/bin/pip" ]]; then
-    if [[ -d "$VENV_DIR" ]]; then
-        ui_warn "Venv at $VENV_DIR is incomplete — recreating"
-        rm -rf "$VENV_DIR"
-    fi
+# Recreate the venv if it doesn't exist.  (An incomplete venv from a
+# crashed previous install is also handled here -- uv venv --allow-existing
+# would normally fail loudly; rm+recreate is safer for the bootstrap case.)
+if [[ ! -d "$VENV_DIR" ]]; then
     ui_info "Creating venv at $VENV_DIR"
     mkdir -p "$(dirname "$VENV_DIR")"
-    python3 -m venv "$VENV_DIR"
+    # --seed populates pip/setuptools/wheel for compatibility with tooling
+    # that shells out to pip (e.g. the vendored pskreporter.py install
+    # step below uses install(1), not pip, so --seed is not strictly
+    # required here -- but it harmlessly keeps the venv layout
+    # consistent with what pip-based tooling expects).
+    uv venv "$VENV_DIR" --python 3.11 --seed --quiet
 fi
 
-"$VENV_DIR/bin/pip" install --upgrade pip setuptools wheel >/dev/null
+# uv sync reads pyproject.toml + uv.lock, resolves [tool.uv.sources]
+# (callhash, hs-uploader, ka9q-python all editable from sibling paths),
+# installs psk-recorder itself editable into the venv, and pins exactly
+# what's in uv.lock.  --no-dev skips dev extras (pytest etc.); --frozen
+# requires uv.lock to be current (regenerate locally with `uv lock` if
+# siblings or deps have shifted).
+ui_info "Syncing psk-recorder + siblings (callhash, hs-uploader, ka9q-python) into $VENV_DIR"
+UV_PROJECT_ENVIRONMENT="$VENV_DIR" \
+    uv sync --project "$REPO_SOURCE" --frozen --no-dev --quiet
 
-# Install sibling packages editable first so pip's resolver finds them
-# when it processes psk-recorder's dependencies below.  Order matters:
-# callhash and hs-uploader must be present in the venv before
-# `pip install -e .` of psk-recorder.
-ui_info "Installing callhash (editable) into venv"
-"$VENV_DIR/bin/pip" install -e /opt/git/sigmond/callhash >/dev/null
-ui_info "Installing hs-uploader (editable) into venv"
-"$VENV_DIR/bin/pip" install -e /opt/git/sigmond/hs-uploader >/dev/null
 # sigmond is the host-wide orchestrator; psk-recorder lazy-imports
 # sigmond.wizard_dispatch from configurator.py for the whiptail wizard
 # plumbing (helpers shared with mag-recorder / wspr-recorder via
 # sigmond's lib).  Falls back to a local implementation when absent
-# so this install is recommended but not strictly required.
+# so this install is recommended but not strictly required.  NOT
+# declared in pyproject.toml so uv sync doesn't install it; explicit
+# uv pip install when the sibling exists.
 if [[ -d /opt/git/sigmond/sigmond ]]; then
     ui_info "Installing sigmond (editable) into venv"
-    "$VENV_DIR/bin/pip" install -e /opt/git/sigmond/sigmond >/dev/null
+    # uv pip install needs --python (not UV_PROJECT_ENVIRONMENT, which only
+    # applies to project-level commands like uv sync).
+    uv pip install --quiet --python "$VENV_DIR/bin/python3" -e /opt/git/sigmond/sigmond
 else
     ui_info "sigmond repo not found at /opt/git/sigmond/sigmond -- wizard"
     ui_info "will use the local legacy-fallback dispatch."
 fi
-
-ui_info "Installing psk-recorder (editable) into venv"
-"$VENV_DIR/bin/pip" install -e "$REPO_SOURCE" >/dev/null
 
 # Install our vendored pskreporter.py directly into the venv's
 # site-packages.  We don't depend on the upstream `pjsg/ftlib-
@@ -211,47 +229,6 @@ for dir in "$SPOOL_DIR" "$LOG_DIR"; do
     mkdir -p "$dir"
     chown "$SERVICE_USER:$SERVICE_GROUP" "$dir"
 done
-
-# --- Phase 4.5: bundled jt9 decoder binaries ---
-# Ship per-arch binaries under /opt/psk-recorder/bin/decoders/ (project-
-# scoped, never in /usr/local/sbin).  Avoids pulling in the full WSJT-X
-# GUI package — only the few runtime shared libs it needs.  After
-# installing all arches, symlink the active host's arch to a stable
-# `jt9` filename so the config can reference one path on every box.
-INSTALL_DEC_DIR="/opt/psk-recorder/bin/decoders"
-ui_info "Installing bundled jt9 binaries to $INSTALL_DEC_DIR"
-mkdir -p "$INSTALL_DEC_DIR"
-install -o root -g root -m 755 "$REPO_ROOT/bin/decoders/jt9-x86-v27"   "$INSTALL_DEC_DIR/"
-install -o root -g root -m 755 "$REPO_ROOT/bin/decoders/jt9-arm64-v27" "$INSTALL_DEC_DIR/"
-install -o root -g root -m 755 "$REPO_ROOT/bin/decoders/jt9-arm32-v26" "$INSTALL_DEC_DIR/"
-
-case "$(uname -m)" in
-    x86_64)        arch_jt9="jt9-x86-v27" ;;
-    aarch64|arm64) arch_jt9="jt9-arm64-v27" ;;
-    armv7l|armhf)  arch_jt9="jt9-arm32-v26" ;;
-    *)             arch_jt9="" ;;
-esac
-if [[ -n "$arch_jt9" ]]; then
-    ln -sfn "$INSTALL_DEC_DIR/$arch_jt9" "$INSTALL_DEC_DIR/jt9"
-    ui_info "  symlinked $INSTALL_DEC_DIR/jt9 → $arch_jt9"
-else
-    ui_warn "unknown architecture $(uname -m); $INSTALL_DEC_DIR/jt9 not symlinked"
-    ui_warn "set paths.decoder_jt9 explicitly in /etc/psk-recorder/psk-recorder-config.toml"
-fi
-
-# Verify jt9's runtime deps are present.  We don't pull `wsjtx` (which
-# would drag in Qt5Gui + sample sounds + ~150 MB of GUI parts); only
-# the minimum shared libs jt9 dlopens are required.
-missing_libs=()
-for lib in libQt5Core.so.5 libfftw3f.so.3 libgfortran.so.5; do
-    if ! ldconfig -p | grep -q "$lib"; then
-        missing_libs+=("$lib")
-    fi
-done
-if (( ${#missing_libs[@]} > 0 )); then
-    ui_warn "jt9 runtime libs missing: ${missing_libs[*]}"
-    ui_warn "Install with: sudo apt install libqt5core5a libfftw3-single3 libgfortran5"
-fi
 
 # --- Phase 5: systemd ---
 ui_info "Installing systemd unit template"
