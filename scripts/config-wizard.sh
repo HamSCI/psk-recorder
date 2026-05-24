@@ -507,6 +507,128 @@ if 0 <= idx < len(blocks):
 PYEOF
 }
 
+# Picker for radiod_status that surfaces LAN radiods from sigmond's
+# environment cache (/var/lib/sigmond/environment-cache.json).
+# Operator picks a real cached entry by its advertised name instead
+# of typing a hostname from memory.  Falls through to the free-form
+# inputbox for "(manual)" or when the cache is missing / empty.
+#
+# Lifted from wspr-recorder's wizard (commit 9bf605f, Rob Robinett).
+# Differences:
+#   - accepts BOTH `source=='mdns'` and `source=='multicast'` because
+#     sigmond has two discovery code paths and both produce kind=radiod
+#     observations.  wspr-recorder's port only checks 'mdns', which
+#     yields an empty cache on hosts using the multicast discovery
+#     code path (this is one of them).
+#   - falls back through display label preferences:
+#         mdns_name (advertised label like "AC0G @EM38ww B1 T3FD")
+#         -> id (radiod_id from the [[radiod]] block)
+#         -> endpoint (bare hostname)
+#
+# Args:  $1 = current value (the pre-fill if operator picks manual)
+# Output (stdout): the chosen hostname, or empty on cancel.
+pick_radiod_status() {
+    local current="${1:-}"
+    local cache="${SIGMOND_ENV_CACHE:-/var/lib/sigmond/environment-cache.json}"
+
+    # Pull cached radiod observations as "<endpoint>|<label>" lines.
+    local -a cache_lines=()
+    if [[ -r "$cache" ]]; then
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && cache_lines+=("$line")
+        done < <(CACHE="$cache" python3 <<'PYEOF' 2>/dev/null
+import json, os
+try:
+    data = json.load(open(os.environ['CACHE']))
+except Exception:
+    raise SystemExit(0)
+seen = set()
+for obs in data.get('observations') or []:
+    if obs.get('source') not in ('mdns', 'multicast'):
+        continue
+    if obs.get('kind') != 'radiod' or not obs.get('ok', True):
+        continue
+    endpoint = (obs.get('endpoint') or '').rsplit(':', 1)[0]
+    if not endpoint or endpoint in seen:
+        continue
+    seen.add(endpoint)
+    fields = obs.get('fields') or {}
+    label = (fields.get('mdns_name')
+             or obs.get('id')
+             or endpoint).strip()
+    print(f'{endpoint}|{label}')
+PYEOF
+)
+    fi
+
+    # Build the whiptail menu.  Each cached entry gets a "cached-N" tag
+    # so we can map back to the address after selection.
+    local -A tag_to_addr=()
+    local -a menu_items=()
+    local i=0 addr label tag desc
+    for line in "${cache_lines[@]}"; do
+        addr="${line%%|*}"
+        label="${line#*|}"
+        tag="cached-$i"
+        tag_to_addr["$tag"]="$addr"
+        desc="$label"
+        if [[ "$addr" == "$current" ]]; then
+            desc="$desc  (current)"
+        else
+            desc="$desc  (cached)"
+        fi
+        menu_items+=("$tag" "$desc")
+        i=$((i + 1))
+    done
+    # If the current value isn't in the cache, surface it explicitly so
+    # the operator can re-pick it without retyping.
+    if [[ -n "$current" ]]; then
+        local found=0
+        for tag in "${!tag_to_addr[@]}"; do
+            [[ "${tag_to_addr[$tag]}" == "$current" ]] && { found=1; break; }
+        done
+        if [[ $found -eq 0 ]]; then
+            tag_to_addr["cached-current"]="$current"
+            menu_items+=("cached-current" "$current  (current; not in cache)")
+        fi
+    fi
+    menu_items+=("manual" "Enter another mDNS hostname by hand...")
+    menu_items+=("cancel" "(cancel: keep current value)")
+
+    local hint="Pick the radiod multicast control plane this recorder should join."
+    if [[ ${#cache_lines[@]} -eq 0 ]]; then
+        hint+=$'\n\nNo radiods in sigmond\'s environment cache.\nRun `smd environment probe` to populate it, or pick Manual.'
+    fi
+
+    local pick
+    if ! pick=$(whiptail \
+            --title "Radiod status address" \
+            --backtitle "$BACKTITLE" \
+            --menu "$hint" \
+            "$HEIGHT" "$WIDTH" "$LIST_HEIGHT" \
+            "${menu_items[@]}" 3>&1 1>&2 2>&3); then
+        # Esc/Cancel = keep current value (silently).
+        echo "$current"
+        return 0
+    fi
+
+    case "$pick" in
+        cancel)
+            echo "$current"
+            ;;
+        manual)
+            # Fall through to the same inputbox the legacy path used.
+            ask radiod.radiod_status "$current" valid_mdns_host || return 1
+            ;;
+        cached-*)
+            echo "${tag_to_addr[$pick]:-$current}"
+            ;;
+        *)
+            echo "$current"
+            ;;
+    esac
+}
+
 # psk-recorder's radiod id has the same shape as a callsign in spirit
 # -- letters, digits, hyphens.  Let's not block legitimate values.
 valid_radiod_id()   { [[ "$1" =~ ^[A-Za-z0-9_-]{1,64}$ ]]; }
@@ -560,7 +682,10 @@ main menu for those." \
             new)
                 local new_id new_status
                 new_id=$(ask     radiod.id            "" valid_radiod_id) || continue
-                new_status=$(ask radiod.radiod_status "" valid_mdns_host) || continue
+                new_status=$(pick_radiod_status      "") || continue
+                # pick_radiod_status echoes empty on cancel-with-no-current;
+                # treat that as abort-this-block.
+                [[ -z "$new_status" ]] && continue
                 radiod_block_update -1 "$new_id" "$new_status"
                 ;;
             *)
@@ -583,8 +708,8 @@ main menu for those." \
                 case "$subpick" in
                     edit)
                         local new_id new_status
-                        new_id=$(ask     radiod.id            "$cur_id"     valid_radiod_id) || continue
-                        new_status=$(ask radiod.radiod_status "$cur_status" valid_mdns_host) || continue
+                        new_id=$(ask     radiod.id          "$cur_id"     valid_radiod_id) || continue
+                        new_status=$(pick_radiod_status "$cur_status") || continue
                         radiod_block_update "$pick" "$new_id" "$new_status"
                         ;;
                     delete)

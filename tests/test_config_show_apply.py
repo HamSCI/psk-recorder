@@ -430,6 +430,130 @@ def test_env_apply_rejects_invalid_legacy_delivery_mode(tmp_path: Path, monkeypa
     assert "delivery_mode" in err
 
 
+# ---------- environment-cache radiod picker (cross-pollinated from wspr-recorder)
+
+# These pin the parser logic that lives inside scripts/config-wizard.sh's
+# pick_radiod_status function.  The shell scaffolding around it (menu
+# construction, fallback path) is mechanical -- the interesting bit is
+# this filter, and we want a regression test that catches the next time
+# sigmond changes the cache schema.
+
+import subprocess
+
+
+def _run_parser(cache_path: Path) -> list[tuple[str, str]]:
+    """Run the same Python heredoc the wizard runs, return parsed
+    (endpoint, label) tuples."""
+    src = '''
+import json, os
+try:
+    data = json.load(open(os.environ['CACHE']))
+except Exception:
+    raise SystemExit(0)
+seen = set()
+for obs in data.get('observations') or []:
+    if obs.get('source') not in ('mdns', 'multicast'):
+        continue
+    if obs.get('kind') != 'radiod' or not obs.get('ok', True):
+        continue
+    endpoint = (obs.get('endpoint') or '').rsplit(':', 1)[0]
+    if not endpoint or endpoint in seen:
+        continue
+    seen.add(endpoint)
+    fields = obs.get('fields') or {}
+    label = (fields.get('mdns_name') or obs.get('id') or endpoint).strip()
+    print(f'{endpoint}|{label}')
+'''
+    out = subprocess.run(
+        ["python3", "-c", src],
+        env={"CACHE": str(cache_path)},
+        capture_output=True, text=True, check=False,
+    ).stdout
+    return [tuple(line.split("|", 1)) for line in out.splitlines() if line]
+
+
+def test_env_cache_parser_handles_multicast_source(tmp_path: Path) -> None:
+    """bee1's cache uses source='multicast' (not 'mdns').  wspr-recorder's
+    original port only accepted 'mdns', which yielded an empty cache on
+    multicast-discovery hosts.  Our port must accept both."""
+    cache = tmp_path / "env-cache.json"
+    cache.write_text(json.dumps({"observations": [{
+        "source": "multicast", "kind": "radiod", "ok": True,
+        "endpoint": "bee1-status.local", "id": "bee1-rx888",
+        "fields": {},
+    }]}))
+    out = _run_parser(cache)
+    assert out == [("bee1-status.local", "bee1-rx888")]
+
+
+def test_env_cache_parser_handles_mdns_source(tmp_path: Path) -> None:
+    cache = tmp_path / "env-cache.json"
+    cache.write_text(json.dumps({"observations": [{
+        "source": "mdns", "kind": "radiod", "ok": True,
+        "endpoint": "ax.local", "id": "ax-rx888",
+        "fields": {"mdns_name": "AC0G @EM38ww B1 T3FD"},
+    }]}))
+    out = _run_parser(cache)
+    assert out == [("ax.local", "AC0G @EM38ww B1 T3FD")]
+
+
+def test_env_cache_parser_strips_port_from_endpoint(tmp_path: Path) -> None:
+    cache = tmp_path / "env-cache.json"
+    cache.write_text(json.dumps({"observations": [{
+        "source": "mdns", "kind": "radiod", "ok": True,
+        "endpoint": "h.local:5006", "fields": {},
+    }]}))
+    out = _run_parser(cache)
+    assert out == [("h.local", "h.local")]
+
+
+def test_env_cache_parser_skips_non_radiod_kinds(tmp_path: Path) -> None:
+    cache = tmp_path / "env-cache.json"
+    cache.write_text(json.dumps({"observations": [
+        {"source": "mdns", "kind": "gpsdo", "ok": True, "endpoint": "g.local"},
+        {"source": "ntp",  "kind": "time_source", "ok": True, "endpoint": "n:123"},
+        {"source": "mdns", "kind": "radiod", "ok": True, "endpoint": "r.local"},
+    ]}))
+    out = _run_parser(cache)
+    assert out == [("r.local", "r.local")]
+
+
+def test_env_cache_parser_skips_failed_observations(tmp_path: Path) -> None:
+    cache = tmp_path / "env-cache.json"
+    cache.write_text(json.dumps({"observations": [
+        {"source": "mdns", "kind": "radiod", "ok": False, "endpoint": "bad.local"},
+        {"source": "mdns", "kind": "radiod", "ok": True,  "endpoint": "good.local"},
+    ]}))
+    out = _run_parser(cache)
+    assert [endpoint for endpoint, _ in out] == ["good.local"]
+
+
+def test_env_cache_parser_deduplicates_repeated_endpoints(tmp_path: Path) -> None:
+    """If sigmond's discovery wrote two observations for the same radiod
+    (e.g. both mdns and multicast saw bee1), the picker should show one
+    menu row, not two."""
+    cache = tmp_path / "env-cache.json"
+    cache.write_text(json.dumps({"observations": [
+        {"source": "mdns",      "kind": "radiod", "ok": True, "endpoint": "bee1.local"},
+        {"source": "multicast", "kind": "radiod", "ok": True, "endpoint": "bee1.local"},
+    ]}))
+    out = _run_parser(cache)
+    assert len(out) == 1
+
+
+def test_env_cache_parser_returns_empty_on_missing_or_invalid(tmp_path: Path) -> None:
+    assert _run_parser(tmp_path / "absent.json")        == []
+    bad = tmp_path / "bad.json"
+    bad.write_text("not json")
+    assert _run_parser(bad)                              == []
+
+
+def test_env_cache_parser_returns_empty_on_no_observations(tmp_path: Path) -> None:
+    cache = tmp_path / "env-cache.json"
+    cache.write_text(json.dumps({"observations": []}))
+    assert _run_parser(cache) == []
+
+
 # ---------- env-file serializer / parser ----------------------------------
 
 def test_serialize_env_file_quotes_values_with_whitespace() -> None:
