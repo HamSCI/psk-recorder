@@ -19,7 +19,7 @@ from psk_recorder.version import GIT_INFO
 
 logger = logging.getLogger(__name__)
 
-CONTRACT_VERSION = "0.6"
+CONTRACT_VERSION = "0.7"
 
 
 def build_inventory(config: dict, config_path: Path) -> dict:
@@ -97,6 +97,14 @@ def build_inventory(config: dict, config_path: Path) -> dict:
             "uses_timing_calibration": False,
             "provides_timing_calibration": False,
             "chain_delay_ns_applied": chain_delay,
+            # CONTRACT v0.7 §18 — runtime-state field for the §18
+            # subscription. psk-recorder runs in RTP-default mode (PSK
+            # decoding is ms-tolerant; no hard-deadline scheduling
+            # against UTC, so subscribing to a peer authority would
+            # not improve spot quality). Reported as null to satisfy
+            # the v0.7 inventory shape and signal "contract-aware,
+            # currently default mode."
+            "timing_authority_applied": None,
         }
         instances.append(instance)
 

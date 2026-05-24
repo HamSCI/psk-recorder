@@ -88,7 +88,17 @@ class InventoryV03Tests(unittest.TestCase):
         self.assertEqual(self.data["client"], "psk-recorder")
 
     def test_contract_version(self):
-        self.assertEqual(self.data["contract_version"], "0.6")
+        self.assertEqual(self.data["contract_version"], "0.7")
+
+    def test_timing_authority_applied_explicit_null(self):
+        """CONTRACT v0.7 §3/§18 — runtime-state field for the §18
+        subscription. psk-recorder runs in RTP-default mode (PSK
+        decoding is ms-tolerant; no hard-deadline scheduling), so
+        the field is present and explicitly None — distinguishes
+        contract-aware-in-default-mode from a pre-v0.7 client."""
+        inst = self.data["instances"][0]
+        self.assertIn("timing_authority_applied", inst)
+        self.assertIsNone(inst["timing_authority_applied"])
 
     def test_data_sinks_present_v0_6(self):
         """CONTRACT v0.6 §17.3: every instance has a data_sinks array."""
