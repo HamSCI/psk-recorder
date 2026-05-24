@@ -260,6 +260,120 @@ def test_wizard_available_false_when_script_missing(monkeypatch, tmp_path) -> No
     assert configurator._wizard_available() is False
 
 
+# ---------- sigmond.wizard_dispatch delegation -----------------------------
+# Same shape as mag-recorder's tests (mag-recorder commit 52190e7).  Once
+# the third client (wspr-recorder) also adopts the lib, the test bodies
+# will be near-identical across three repos -- a hint the test helpers
+# might be the next thing to extract into a shared sigmond test-support
+# module.
+
+def test_wizard_dispatch_delegates_to_sigmond_when_available(monkeypatch) -> None:
+    """When sigmond.wizard_dispatch is importable, _wizard_available
+    must defer to sigmond's is_wizard_available(args, _WIZARD_PATH)."""
+    captured = {}
+
+    class _FakeWD:
+        SIGMOND_WIZARD_DISPATCH_API = "1"
+        @staticmethod
+        def is_wizard_available(args, wizard_path):
+            captured["args"]         = args
+            captured["wizard_path"]  = wizard_path
+            return True
+    monkeypatch.setattr(configurator, "_sigmond_wd", _FakeWD)
+
+    args = argparse.Namespace(non_interactive=False)
+    assert configurator._wizard_available(args) is True
+    assert captured["args"]        is args
+    assert captured["wizard_path"] == configurator._WIZARD_PATH
+
+
+def test_wizard_dispatch_falls_back_when_sigmond_absent(monkeypatch, tmp_path) -> None:
+    """With sigmond.wizard_dispatch unavailable, _wizard_available
+    must use the local TTY+whiptail+script-exists check."""
+    monkeypatch.setattr(configurator, "_sigmond_wd", None)
+    monkeypatch.setattr(configurator, "_WIZARD_PATH", tmp_path / "absent.sh")
+    assert configurator._wizard_available(argparse.Namespace(non_interactive=False)) is False
+
+
+def test_exec_wizard_threads_env_through_sigmond(monkeypatch, tmp_path) -> None:
+    """Pins the env-var contract (PSK_RECORDER_HELP_TOML,
+    PSK_RECORDER_CLI, SIGMOND_WIZARD_LIB_SH) + extra_args shape +
+    parse=None semantics for psk-recorder."""
+    captured = {}
+    fake_lib_sh = tmp_path / "wizard_dispatch.sh"
+    fake_lib_sh.write_text("# fake\n")
+
+    class _FakeResult:
+        returncode = 0
+        error      = None
+
+    class _FakeWD:
+        SIGMOND_WIZARD_DISPATCH_API = "1"
+        @staticmethod
+        def exec_wizard(wizard_path, *, extra_env=None, parse=None, extra_args=None):
+            captured["wizard_path"]  = wizard_path
+            captured["extra_env"]    = extra_env
+            captured["parse"]        = parse
+            captured["extra_args"]   = extra_args
+            return _FakeResult()
+    monkeypatch.setattr(configurator, "_sigmond_wd",            _FakeWD)
+    monkeypatch.setattr(configurator, "_SIGMOND_WIZARD_LIB_SH", fake_lib_sh)
+
+    args = argparse.Namespace(non_interactive=False,
+                              config=Path("/etc/psk-recorder/psk-recorder-config.toml"))
+    rc = configurator._exec_wizard(args, "edit")
+    assert rc == 0
+    assert captured["extra_args"] == [
+        "edit", "--config", "/etc/psk-recorder/psk-recorder-config.toml",
+    ]
+    # parse=None: psk-recorder's wizard pipes JSON to `config apply` itself
+    assert captured["parse"] is None
+    env = captured["extra_env"]
+    assert "PSK_RECORDER_HELP_TOML" in env
+    assert "PSK_RECORDER_CLI"       in env
+    assert env["SIGMOND_WIZARD_LIB_SH"] == str(fake_lib_sh)
+
+
+def test_exec_wizard_falls_back_to_legacy_when_sigmond_absent(monkeypatch) -> None:
+    """When sigmond isn't installed, _exec_wizard uses the
+    pre-extraction local subprocess.call path."""
+    captured = {}
+    monkeypatch.setattr(configurator, "_sigmond_wd", None)
+    monkeypatch.setattr(configurator, "_SIGMOND_WIZARD_LIB_SH", None)
+
+    def _fake_call(cmd, env=None):
+        captured["cmd"] = cmd
+        captured["env"] = env
+        return 7
+    monkeypatch.setattr(configurator.subprocess, "call", _fake_call)
+
+    args = argparse.Namespace(non_interactive=False, config=None)
+    rc = configurator._exec_wizard(args, "init")
+    assert rc == 7
+    assert captured["cmd"][0] == str(configurator._WIZARD_PATH)
+    assert captured["cmd"][1] == "init"
+    assert captured["env"]["PSK_RECORDER_HELP_TOML"] == str(configurator._HELP_TOML_PATH)
+
+
+def test_exec_wizard_surfaces_sigmond_error(monkeypatch) -> None:
+    """When sigmond's exec_wizard returns .error, _exec_wizard logs
+    it and returns 1 -- not bubble the error up."""
+    class _FakeResult:
+        returncode = 0
+        error      = "exec failed: [Errno 2] No such file"
+
+    class _FakeWD:
+        SIGMOND_WIZARD_DISPATCH_API = "1"
+        @staticmethod
+        def exec_wizard(*a, **kw):
+            return _FakeResult()
+    monkeypatch.setattr(configurator, "_sigmond_wd", _FakeWD)
+
+    args = argparse.Namespace(non_interactive=False, config=None)
+    rc = configurator._exec_wizard(args, "init")
+    assert rc == 1
+
+
 # ---------- [timing] apply -------------------------------------------------
 
 def test_apply_writes_timing_section(tmp_path: Path) -> None:

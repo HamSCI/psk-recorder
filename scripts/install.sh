@@ -149,6 +149,18 @@ ui_info "Installing callhash (editable) into venv"
 "$VENV_DIR/bin/pip" install -e /opt/git/sigmond/callhash >/dev/null
 ui_info "Installing hs-uploader (editable) into venv"
 "$VENV_DIR/bin/pip" install -e /opt/git/sigmond/hs-uploader >/dev/null
+# sigmond is the host-wide orchestrator; psk-recorder lazy-imports
+# sigmond.wizard_dispatch from configurator.py for the whiptail wizard
+# plumbing (helpers shared with mag-recorder / wspr-recorder via
+# sigmond's lib).  Falls back to a local implementation when absent
+# so this install is recommended but not strictly required.
+if [[ -d /opt/git/sigmond/sigmond ]]; then
+    ui_info "Installing sigmond (editable) into venv"
+    "$VENV_DIR/bin/pip" install -e /opt/git/sigmond/sigmond >/dev/null
+else
+    ui_info "sigmond repo not found at /opt/git/sigmond/sigmond -- wizard"
+    ui_info "will use the local legacy-fallback dispatch."
+fi
 
 ui_info "Installing psk-recorder (editable) into venv"
 "$VENV_DIR/bin/pip" install -e "$REPO_SOURCE" >/dev/null
