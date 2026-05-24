@@ -40,9 +40,36 @@ PSK_RECORDER="${PSK_RECORDER_CLI:-psk-recorder}"
 HELP_TOML="${PSK_RECORDER_HELP_TOML:-/opt/git/sigmond/psk-recorder/config/help.toml}"
 COORD_ENV="/etc/sigmond/coordination.env"
 
-HEIGHT=20
-WIDTH=78
-LIST_HEIGHT=10
+# -------- shared shell helpers ----------------------------------------
+#
+# Source sigmond's Tier-1 wizard helpers (preflight_or_exit_2, _info /
+# _warn / _err, recommended HEIGHT/WIDTH/LIST_HEIGHT/BACKTITLE
+# defaults).  The Python dispatcher (psk_recorder.configurator
+# ._exec_wizard) sets SIGMOND_WIZARD_LIB_SH in the env; the :- default
+# below covers direct-invocation safety (e.g. running this script by
+# hand during development).
+#
+# If sigmond's lib isn't installed, define the helpers inline as a
+# fallback so this script still works on a host that's missing sigmond.
+SIGMOND_WIZARD_LIB_SH="${SIGMOND_WIZARD_LIB_SH:-/opt/git/sigmond/sigmond/lib/sigmond/wizard_dispatch/wizard_dispatch.sh}"
+if [[ -r "$SIGMOND_WIZARD_LIB_SH" ]]; then
+    # shellcheck disable=SC1090
+    . "$SIGMOND_WIZARD_LIB_SH"
+else
+    HEIGHT=20; WIDTH=78; LIST_HEIGHT=10
+    _info() { printf '  %s\n'                "$*" >&2; }
+    _warn() { printf '  \033[33m⚠\033[0m %s\n' "$*" >&2; }
+    _err()  { printf '  \033[31m✗\033[0m %s\n' "$*" >&2; }
+    preflight_or_exit_2() {
+        command -v whiptail >/dev/null 2>&1 \
+            || { _err "whiptail not on PATH"; exit 2; }
+        [[ -t 1 ]] \
+            || { _err "stdout is not a TTY"; exit 2; }
+    }
+fi
+
+# Override BACKTITLE to be client-specific (the lib's default is
+# generic for the rare case where a client forgets).
 BACKTITLE="psk-recorder configuration"
 
 # -------- preflight ----------------------------------------------------
@@ -61,6 +88,7 @@ Or use the legacy stdin-prompt path with:
 EOF
     exit 1
 fi
+preflight_or_exit_2
 
 # -------- helpers ----------------------------------------------------
 
