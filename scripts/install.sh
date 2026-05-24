@@ -55,21 +55,30 @@ if ! id -u "$SERVICE_USER" &>/dev/null; then
 fi
 
 # --- Phase 1.4: ensure uv is on PATH (canonical sigmond-suite installer) ---
-_ensure_uv() {
-    if command -v uv >/dev/null 2>&1; then
-        ui_info "uv $(uv --version 2>/dev/null | awk '{print $2}') at $(command -v uv)"
-        return
-    fi
-    ui_info "uv not found -- installing system-wide to /usr/local/bin"
-    command -v curl >/dev/null || { ui_error "curl not found (apt install curl)"; exit 1; }
-    if ! curl -LsSf https://astral.sh/uv/install.sh | env XDG_BIN_HOME=/usr/local/bin UV_NO_MODIFY_PATH=1 sh; then
-        ui_error "uv installer failed"
-        exit 1
-    fi
-    command -v uv >/dev/null || { ui_error "uv installer ran but uv is still not on PATH"; exit 1; }
-    ui_info "uv $(uv --version 2>/dev/null | awk '{print $2}') installed"
-}
-_ensure_uv
+# Delegates to sigmond's shared helper if present; inline fallback for
+# the bootstrap case.  Keep the fallback in sync with
+# sigmond/scripts/install/ensure_uv.sh.
+_ENSURE_UV_SH="/opt/git/sigmond/sigmond/scripts/install/ensure_uv.sh"
+if [[ -r "$_ENSURE_UV_SH" ]]; then
+    # shellcheck source=/dev/null
+    source "$_ENSURE_UV_SH"
+else
+    _ensure_uv() {
+        if command -v uv >/dev/null 2>&1; then
+            printf '[INFO]  uv %s at %s\n' "$(uv --version 2>/dev/null | awk '{print $2}')" "$(command -v uv)"
+            return 0
+        fi
+        printf '[INFO]  uv not found -- installing system-wide to /usr/local/bin\n'
+        command -v curl >/dev/null || { printf '[ERROR] curl not found (apt install curl)\n' >&2; return 1; }
+        if ! curl -LsSf https://astral.sh/uv/install.sh | env XDG_BIN_HOME=/usr/local/bin UV_NO_MODIFY_PATH=1 sh; then
+            printf '[ERROR] uv installer failed\n' >&2
+            return 1
+        fi
+        command -v uv >/dev/null || { printf '[ERROR] uv installer ran but uv is still not on PATH\n' >&2; return 1; }
+        printf '[INFO]  uv %s installed\n' "$(uv --version 2>/dev/null | awk '{print $2}')"
+    }
+fi
+_ensure_uv || { ui_error "_ensure_uv failed"; exit 1; }
 
 # --- Phase 1.5: ensure sibling repos (callhash, hs-uploader, ka9q-python) ---
 # pyproject.toml declares these via [tool.uv.sources] with `editable = true`
