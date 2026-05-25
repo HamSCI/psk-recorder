@@ -146,12 +146,19 @@ class InventoryV03Tests(unittest.TestCase):
         self.assertIn(7047500, freqs)
 
     def test_log_paths_present(self):
-        """v0.3 §10: log_paths must be present."""
+        """§10: log_paths must be present and list the spot-log files.
+
+        Process log is journal-routed (StandardOutput=journal in the
+        systemd unit), so the ``process`` key intentionally does not
+        appear in log_paths — only file-based logs are listed (for
+        ``smd log --files``).  See the log_paths builder in
+        ``src/psk_recorder/contract.py`` for the design rationale.
+        """
         self.assertIn("log_paths", self.data)
         log_paths = self.data["log_paths"]
         self.assertIn("test-rx888", log_paths)
-        self.assertIn("process", log_paths["test-rx888"])
         self.assertIn("spots", log_paths["test-rx888"])
+        self.assertNotIn("process", log_paths["test-rx888"])
 
     def test_log_level_present(self):
         """v0.3 §11: log_level must be present."""
