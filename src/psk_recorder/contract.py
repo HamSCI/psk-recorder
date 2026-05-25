@@ -142,7 +142,6 @@ def build_inventory(config: dict, config_path: Path) -> dict:
     payload["deps"] = {
         "git": [
             {"name": "ka9q-radio", "note": "decode_ft8 binary"},
-            {"name": "ftlib-pskreporter", "note": "pskreporter binary"},
         ],
         "pypi": [
             {"name": "ka9q-python", "version": ">=3.6.0"},
@@ -193,14 +192,6 @@ def _collect_issues(config: dict, paths: dict) -> list[dict]:
             "severity": "warn",
             "instance": "all",
             "message": f"decoder not found: {decoder}",
-        })
-
-    pskreporter = paths.get("pskreporter", "/usr/local/bin/pskreporter")
-    if not shutil.which(pskreporter) and not Path(pskreporter).is_file():
-        issues.append({
-            "severity": "warn",
-            "instance": "all",
-            "message": f"pskreporter-sender not found: {pskreporter}",
         })
 
     radiod_blocks = config.get("radiod", [])
