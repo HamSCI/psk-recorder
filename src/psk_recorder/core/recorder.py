@@ -229,8 +229,11 @@ class PskRecorder:
         self,
         config: dict,
         radiod_blocks: Union[dict, list[dict]],
+        *,
+        reporter_id: Optional[str] = None,
     ):
         self._config = config
+        self._reporter_id = reporter_id
         # Accept dict (legacy single-source) or list (multi-source).
         # Internal storage is always a list for uniform iteration.
         if isinstance(radiod_blocks, dict):
@@ -278,6 +281,7 @@ class PskRecorder:
                 spool_root=spool_root,
                 log_dir=log_dir,
                 radiod_lifetime_frames=self._radiod_lifetime_frames,
+                reporter_id=self._reporter_id,
             )
             for block in self._radiod_blocks
         ]

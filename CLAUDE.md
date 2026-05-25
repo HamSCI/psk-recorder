@@ -233,7 +233,11 @@ freqs_hz    = [14080000, 7047500, ...]
 
 ## Production paths
 
-- Config: `/etc/psk-recorder/psk-recorder-config.toml`
+- Config: `/etc/psk-recorder/psk-recorder-config.toml` (legacy shared
+  — fall-through path; deprecated, see Per-instance cutover below)
+- Per-instance config: `/etc/psk-recorder/<reporter-id>.toml`
+  (preferred path; preferred when `--instance` is passed and file
+  exists)
 - Per-instance env: `/etc/psk-recorder/env/<instance>.env`
 - Spool: `/var/lib/psk-recorder/<radiod_id>/{ft8,ft4}/YYMMDD_HHMMSS.wav`
 - Spot logs: `/var/log/psk-recorder/<radiod_id>-{ft8,ft4}.log`
@@ -243,6 +247,31 @@ freqs_hz    = [14080000, 7047500, ...]
 - Venv: `/opt/psk-recorder/venv`
 - Source: `/opt/git/sigmond/psk-recorder` (editable install)
 - Service user: `pskrec:pskrec`
+
+## Per-instance cutover (Phase 3 of sigmond multi-instance architecture)
+
+The systemd unit (`psk-recorder@%i.service`) passes both
+`--instance %i` and `--radiod-id %i`.  `config.resolve_config_path()`
+prefers `/etc/psk-recorder/<instance>.toml` when it exists; otherwise
+falls back to the legacy shared `psk-recorder-config.toml` with a
+one-line `DeprecationWarning`.
+
+For operators currently running radiod-keyed instance names
+(`psk-recorder@my-rx888.service`), no action is required — the
+daemon continues to read the shared config under the legacy path.
+Migrating to reporter-keyed instance names is a one-shot operation
+via `sudo smd instance migrate` (sigmond Phase 8, not yet shipped).
+After migration, the per-instance config holds an `[instance]` block
+with `reporter_id = "AC0G-B1"`, and the daemon stops emitting the
+deprecation warning.
+
+Spot rows now carry both `instance` (= radiod_id, legacy field,
+removed in sigmond Phase 9) and `reporter_id` (= per-instance value
+or radiod_id-derived fallback) — downstream consumers should switch
+to `reporter_id` as the primary identifier.
+
+See `/opt/git/sigmond/sigmond/docs/MULTI-INSTANCE-ARCHITECTURE.md`
+for the architecture, file-layout, and phase plan.
 
 ## Further reading
 

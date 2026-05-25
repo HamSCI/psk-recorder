@@ -21,8 +21,12 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from psk_recorder.config import (
+    DEFAULT_CONFIG_PATH,
+    PER_INSTANCE_CONFIG_DIR,
     derive_source_key,
     ensure_sources,
+    extract_reporter_id,
+    resolve_config_path,
     resolve_radiod_status,
 )
 
@@ -122,6 +126,88 @@ class TestResolveRadiodStatusContract(unittest.TestCase):
             derive_source_key(block),
             f"radiod:{resolve_radiod_status(block)}",
         )
+
+
+class TestResolveConfigPath(unittest.TestCase):
+    """Per-instance config resolution per sigmond MULTI-INSTANCE-ARCHITECTURE.md §4."""
+
+    def setUp(self):
+        self._old_env = os.environ.get("PSK_RECORDER_CONFIG")
+        os.environ.pop("PSK_RECORDER_CONFIG", None)
+
+    def tearDown(self):
+        if self._old_env is None:
+            os.environ.pop("PSK_RECORDER_CONFIG", None)
+        else:
+            os.environ["PSK_RECORDER_CONFIG"] = self._old_env
+
+    def test_explicit_path_wins(self):
+        explicit = Path("/tmp/some-config.toml")
+        result = resolve_config_path(instance="AC0G-B1", explicit_path=explicit)
+        self.assertEqual(result, explicit)
+
+    def test_env_var_wins_over_instance(self):
+        os.environ["PSK_RECORDER_CONFIG"] = "/tmp/from-env.toml"
+        result = resolve_config_path(instance="AC0G-B1")
+        self.assertEqual(result, Path("/tmp/from-env.toml"))
+
+    def test_per_instance_when_file_exists(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            instance_file = Path(tmp) / "AC0G-B1.toml"
+            instance_file.write_text("[instance]\nreporter_id = 'AC0G-B1'\n")
+            # Monkey-patch PER_INSTANCE_CONFIG_DIR for the test
+            from psk_recorder import config as cfg_mod
+            old = cfg_mod.PER_INSTANCE_CONFIG_DIR
+            cfg_mod.PER_INSTANCE_CONFIG_DIR = Path(tmp)
+            try:
+                result = resolve_config_path(instance="AC0G-B1")
+                self.assertEqual(result, instance_file)
+            finally:
+                cfg_mod.PER_INSTANCE_CONFIG_DIR = old
+
+    def test_deprecation_warning_when_instance_file_missing(self):
+        import warnings
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = resolve_config_path(instance="NEVER-EXISTS-XYZ")
+        self.assertEqual(result, DEFAULT_CONFIG_PATH)
+        self.assertTrue(
+            any(issubclass(w.category, DeprecationWarning) for w in caught),
+            f"expected DeprecationWarning, got {[w.category for w in caught]}",
+        )
+
+    def test_silent_fallback_when_no_instance(self):
+        import warnings
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = resolve_config_path()
+        self.assertEqual(result, DEFAULT_CONFIG_PATH)
+        self.assertFalse(
+            any(issubclass(w.category, DeprecationWarning) for w in caught),
+            "no instance arg = pre-instance world; should not warn",
+        )
+
+
+class TestExtractReporterId(unittest.TestCase):
+
+    def test_present(self):
+        self.assertEqual(
+            extract_reporter_id({"instance": {"reporter_id": "AC0G-B1"}}),
+            "AC0G-B1",
+        )
+
+    def test_missing_block(self):
+        self.assertIsNone(extract_reporter_id({"paths": {}}))
+
+    def test_block_without_key(self):
+        self.assertIsNone(extract_reporter_id({"instance": {"antenna": "loop"}}))
+
+    def test_empty_string(self):
+        self.assertIsNone(extract_reporter_id({"instance": {"reporter_id": ""}}))
+
+    def test_non_string(self):
+        self.assertIsNone(extract_reporter_id({"instance": {"reporter_id": 42}}))
 
 
 if __name__ == "__main__":

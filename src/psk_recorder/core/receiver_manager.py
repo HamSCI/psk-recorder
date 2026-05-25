@@ -82,10 +82,17 @@ class ReceiverManager:
         spool_root: Path,
         log_dir: Path,
         radiod_lifetime_frames: int,
+        reporter_id: Optional[str] = None,
     ) -> None:
         self._config = config
         self._radiod = radiod_block
         self._radiod_id = radiod_block.get("id", "default")
+        # Phase-3 per-instance reporter ID
+        # (sigmond's MULTI-INSTANCE-ARCHITECTURE.md §3).  May be None
+        # in legacy shared-config deployments — ChTailer falls back
+        # to radiod_id-derived value so spot rows still carry the
+        # field during the deprecation window.
+        self._reporter_id = reporter_id
         try:
             self._rx_source = derive_source_key(radiod_block)
         except ValueError:
@@ -350,6 +357,7 @@ class ReceiverManager:
                     log_path=log_path,
                     mode=tailer_mode,
                     radiod_id=self._radiod_id,
+                    reporter_id=self._reporter_id,
                     rx_source=self._rx_source,
                     host_call=callsign,
                     host_grid=host_grid,

@@ -330,5 +330,58 @@ class TestChTailer(unittest.TestCase):
             self.assertGreaterEqual(len(fake.inserts), 2)
 
 
+class TestChTailerReporterId(unittest.TestCase):
+    """Phase-3 (sigmond MULTI-INSTANCE-ARCHITECTURE.md §7): spot rows
+    carry a `reporter_id` field, falling back to `radiod_id` when no
+    explicit reporter ID is provided (legacy single-instance world)."""
+
+    def _make_tailer_with_writes(self, reporter_id=None):
+        """Spin a tailer over a one-line log, capture the inserted row."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "test.log"
+            log_path.write_text("")
+            fake = FakeWriter()
+            tailer = ChTailer(
+                log_path=log_path, mode="ft8",
+                radiod_id="test-rx888",
+                reporter_id=reporter_id,
+                host_call="AC0G", host_grid="EM38ww",
+                processing_version="0.1.0+abc",
+                writer_factory=lambda batch_rows: fake,
+                forward_to_pskreporter=False,
+            )
+            tailer.start()
+            try:
+                # Wait for poll to engage, then append a line
+                time.sleep(0.6)
+                with open(log_path, "a") as fh:
+                    fh.write(LINE_PLAIN + "\n")
+                # Wait for the insert
+                deadline = time.monotonic() + 3.0
+                while time.monotonic() < deadline and not fake.inserts:
+                    time.sleep(0.05)
+            finally:
+                tailer.stop(timeout=2.0)
+            return fake.inserts
+
+    def test_reporter_id_falls_back_to_radiod_id_when_none(self):
+        inserts = self._make_tailer_with_writes(reporter_id=None)
+        self.assertTrue(inserts, "expected at least one row inserted")
+        row = inserts[0]
+        self.assertEqual(row["reporter_id"], "test-rx888")
+        self.assertEqual(row["instance"], "test-rx888")  # legacy field preserved
+
+    def test_reporter_id_uses_explicit_value(self):
+        inserts = self._make_tailer_with_writes(reporter_id="AC0G-B1")
+        self.assertTrue(inserts, "expected at least one row inserted")
+        row = inserts[0]
+        self.assertEqual(row["reporter_id"], "AC0G-B1")
+        # legacy `instance` still equals radiod_id (cleared in Phase 9)
+        self.assertEqual(row["instance"], "test-rx888")
+        # radiod_id is its own field — unchanged by reporter_id presence
+        self.assertEqual(row["radiod_id"], "test-rx888")
+
+
 if __name__ == "__main__":
     unittest.main()

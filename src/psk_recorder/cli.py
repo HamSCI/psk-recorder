@@ -119,8 +119,16 @@ def main():
 
     sub_daemon = subparsers.add_parser("daemon", help="Run recorder daemon")
     sub_daemon.add_argument(
+        "--instance", default=None,
+        help="Reporter-ID instance (loads /etc/psk-recorder/<instance>.toml "
+             "when present; falls back to shared config otherwise). "
+             "See sigmond's MULTI-INSTANCE-ARCHITECTURE.md §6.",
+    )
+    sub_daemon.add_argument(
         "--radiod-id", default=None,
-        help="ID of the [[radiod]] block to use",
+        help="ID of the [[radiod]] block to use (legacy single-source "
+             "selector; ignored when --instance resolves to a per-instance "
+             "config).",
     )
     _add_common(sub_daemon)
 
@@ -298,15 +306,33 @@ def _handle_daemon(args):
     from psk_recorder.config import (
         DEFAULT_CONFIG_PATH,
         ensure_sources,
+        extract_reporter_id,
         load_config,
+        resolve_config_path,
         resolve_radiod_block,
     )
     from psk_recorder.core.recorder import PskRecorder
 
-    config_path = args.config or Path(
-        os.environ.get("PSK_RECORDER_CONFIG", str(DEFAULT_CONFIG_PATH))
+    # Phase-3 config resolution (sigmond's MULTI-INSTANCE-ARCHITECTURE.md
+    # §4): prefer per-instance config when --instance is given and the
+    # file exists; fall back to legacy shared with a deprecation
+    # warning otherwise.  --config still wins over both (operator
+    # override).
+    config_path = resolve_config_path(
+        instance=args.instance, explicit_path=args.config,
     )
     config = load_config(config_path)
+
+    # Per-instance config carries the reporter_id in its [instance]
+    # block; legacy shared config has None here — ChTailer falls back
+    # to radiod_id-derived value so every spot row still has the field.
+    reporter_id = extract_reporter_id(config)
+    if args.instance and reporter_id is None:
+        # Operator passed --instance but the resolved config has no
+        # [instance] block (legacy shared-config fall-through).  Use
+        # the instance argument as the reporter_id so spots are still
+        # tagged correctly during the deprecation window.
+        reporter_id = args.instance
 
     if args.radiod_id is not None:
         # Legacy single-source mode — operator explicitly selected one
@@ -316,13 +342,14 @@ def _handle_daemon(args):
         blocks = [radiod_block]
         logger.info(
             "Starting psk-recorder daemon for radiod %s "
-            "(config=%s, single-source mode)",
+            "(config=%s, reporter_id=%s, single-source mode)",
             radiod_block.get("id", "default"), config_path,
+            reporter_id or "<derived>",
         )
     else:
         # Multi-source mode — drive every [[radiod]] block in the
-        # config from a single process.  Mirrors wspr-recorder's
-        # single-process / multi-source pattern.
+        # config from a single process.  In the per-instance world
+        # the per-instance config defines this instance's source list.
         sources = ensure_sources(config)
         if not sources:
             raise SystemExit(
@@ -331,13 +358,14 @@ def _handle_daemon(args):
         blocks = [s["radiod_block"] for s in sources]
         logger.info(
             "Starting psk-recorder daemon for %d radiod source(s): %s "
-            "(config=%s)",
+            "(config=%s, reporter_id=%s)",
             len(blocks),
             ", ".join(s["radiod_id"] for s in sources),
             config_path,
+            reporter_id or "<derived>",
         )
 
-    recorder = PskRecorder(config, blocks)
+    recorder = PskRecorder(config, blocks, reporter_id=reporter_id)
     recorder.run()
 
 

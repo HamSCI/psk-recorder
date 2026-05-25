@@ -235,10 +235,17 @@ class ChTailer:
         forward_to_pskreporter: bool = True,
         rx_source: str = "",
         cycle_batcher: Optional[object] = None,
+        reporter_id: Optional[str] = None,
     ) -> None:
         self._log_path = Path(log_path)
         self._mode = mode
         self._radiod_id = radiod_id
+        # Phase-3 per-instance reporter ID
+        # (sigmond's MULTI-INSTANCE-ARCHITECTURE.md §3).  Falls back
+        # to radiod_id so legacy single-instance deployments still
+        # get a meaningful value in the spot row's reporter_id
+        # field during the deprecation window.
+        self._reporter_id = reporter_id or radiod_id
         self._host_call = host_call
         self._host_grid = host_grid
         self._processing_version = processing_version
@@ -422,7 +429,8 @@ class ChTailer:
             row["host_call"] = self._host_call
             row["host_grid"] = self._host_grid
             row["radiod_id"] = self._radiod_id
-            row["instance"] = self._radiod_id
+            row["instance"] = self._radiod_id   # legacy field — removed in Phase 9
+            row["reporter_id"] = self._reporter_id
             row["rx_source"] = self._rx_source
             # Phase D Cut 2: 100 Hz bucket of the absolute decode
             # frequency.  PSKReporter's own dedup tolerance, and large

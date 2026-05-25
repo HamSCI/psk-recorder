@@ -37,8 +37,18 @@ ExecStartPre=+/usr/bin/chown -R pskrec:pskrec /var/log/psk-recorder
 # of the shared watermarks.db with "attempt to write a readonly
 # database".  Observed on bee1 2026-05-14.  Removed.
 
+# Phase-3 cutover (sigmond MULTI-INSTANCE-ARCHITECTURE.md):
+# --instance %i picks up /etc/psk-recorder/%i.toml when the operator
+# has run `sudo smd instance migrate` (Phase 8).  Until then, the
+# per-instance config doesn't exist and the daemon falls back to the
+# legacy /etc/psk-recorder/psk-recorder-config.toml with a one-line
+# deprecation warning.  --radiod-id %i stays for the legacy fallback
+# path (selects the matching [[radiod]] block within the shared
+# config); ignored once per-instance config takes over.
+# Note: --config is intentionally omitted — passing it would force
+# the legacy path always (explicit_path wins in resolve_config_path).
 ExecStart=/opt/psk-recorder/venv/bin/python3 -m psk_recorder.cli daemon \
-    --config /etc/psk-recorder/psk-recorder-config.toml \
+    --instance %i \
     --radiod-id %i
 
 # 180s covers a typical 19-channel (FT8 × 10 bands + FT4 × 9 bands) startup

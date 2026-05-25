@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import os
+import warnings
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 try:
     import tomllib
@@ -13,6 +14,65 @@ except ModuleNotFoundError:
 
 
 DEFAULT_CONFIG_PATH = Path("/etc/psk-recorder/psk-recorder-config.toml")
+PER_INSTANCE_CONFIG_DIR = Path("/etc/psk-recorder")
+
+
+def resolve_config_path(
+    instance: Optional[str] = None,
+    explicit_path: Optional[Path] = None,
+) -> Path:
+    """Resolve which config file to load for this invocation.
+
+    Resolution order (most → least specific):
+      1. `explicit_path` (operator passed --config) — always wins.
+      2. `$PSK_RECORDER_CONFIG` env var — explicit override.
+      3. `/etc/psk-recorder/<instance>.toml` when `instance` is given
+         and the file exists — the per-instance v0.8 world
+         (sigmond's MULTI-INSTANCE-ARCHITECTURE.md §4).
+      4. `/etc/psk-recorder/psk-recorder-config.toml` (legacy shared)
+         — emits a DeprecationWarning when `instance` was given but
+         the per-instance file does not exist (operator hasn't run
+         `sudo smd instance migrate` yet).
+      5. `/etc/psk-recorder/psk-recorder-config.toml` (legacy shared)
+         silently when no instance was given (pre-instance world).
+    """
+    if explicit_path is not None:
+        return Path(explicit_path)
+    env_override = os.environ.get("PSK_RECORDER_CONFIG")
+    if env_override:
+        return Path(env_override)
+    if instance:
+        per_instance = PER_INSTANCE_CONFIG_DIR / f"{instance}.toml"
+        if per_instance.exists():
+            return per_instance
+        warnings.warn(
+            f"per-instance config {per_instance} not found; falling "
+            f"back to legacy shared config {DEFAULT_CONFIG_PATH}. "
+            f"Migrate this host with `sudo smd instance migrate` "
+            f"(MULTI-INSTANCE-ARCHITECTURE.md §6) — the legacy path "
+            f"will be removed after the deprecation window.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    return DEFAULT_CONFIG_PATH
+
+
+def extract_reporter_id(config: dict) -> Optional[str]:
+    """Read the reporter ID from the per-instance `[instance]` block.
+
+    Returns None when the config has no `[instance]` block (legacy
+    shared-config world).  Callers should fall back to a derived
+    identifier (e.g. the radiod_id) when None is returned, so every
+    spot row still carries a meaningful identifier during the
+    deprecation window.
+    """
+    inst = config.get("instance")
+    if not isinstance(inst, dict):
+        return None
+    rid = inst.get("reporter_id")
+    if not isinstance(rid, str) or not rid:
+        return None
+    return rid
 
 DEFAULTS: dict[str, Any] = {
     "paths": {
