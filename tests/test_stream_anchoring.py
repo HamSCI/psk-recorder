@@ -141,9 +141,28 @@ class TestAnchorOnce(unittest.TestCase):
         finally:
             _cleanup_sink(sink)
 
-    def test_on_stream_restored_does_not_change_anchor(self):
-        """Stream-gap recovery must NOT re-anchor; that was the old
-        wall-clock-correlated bug."""
+    def test_on_stream_restored_re_anchors(self):
+        """Stream-gap recovery MUST re-anchor.  This inverts the older
+        contract — see commit 502573c (``fix(stream): re-anchor on
+        stream_restored after radiod outage``) and the design comment
+        in stream.py::on_stream_restored.
+
+        Background: MultiStream only fires on_stream_restored after a
+        real radiod restart (15 s + ensure_channel success), and on
+        such a restart MultiStream resets ``quality =
+        StreamQuality()`` so ``total_samples_delivered`` restarts at 0.
+        Holding the pre-restart anchor across that discontinuity drives
+        ``delta_samples`` wildly negative, every projected UTC misses
+        every slot window, and decodes silently fall to 0/0 forever
+        (observed B4-100 2026-05-14, every band silent 3 h).
+
+        Correct behavior after restore:
+          - ``_anchor_utc`` cleared to None
+          - ``_anchor_total_samples`` cleared to 0
+          - ``_channel_info`` REPLACED by the new snapshot
+        The next ``on_samples`` call re-anchors from a fresh wall-clock
+        correlation.
+        """
         sink = _make_sink()
         sink.set_channel_info(_FakeChannelInfo(rtp_timesnap=1))
         try:
@@ -156,18 +175,18 @@ class TestAnchorOnce(unittest.TestCase):
                         _FakeQuality(total_samples_delivered=sr,
                                      first_rtp_timestamp=1),
                     )
-            initial_anchor = sink._anchor_utc
-            initial_total = sink._anchor_total_samples
-            initial_channel = sink._channel_info
+            # First batch anchored normally.
+            self.assertEqual(sink._anchor_utc, 2000.0)
+            self.assertIsNotNone(sink._anchor_source)
 
-            # Stream "restored" with a totally different channel_info.
-            sink.on_stream_restored(_FakeChannelInfo(rtp_timesnap=999))
+            new_info = _FakeChannelInfo(rtp_timesnap=999)
+            sink.on_stream_restored(new_info)
 
-            # Anchor MUST be unchanged.
-            self.assertEqual(sink._anchor_utc, initial_anchor)
-            self.assertEqual(sink._anchor_total_samples, initial_total)
-            # channel_info MUST also be unchanged (any new snapshot ignored).
-            self.assertIs(sink._channel_info, initial_channel)
+            # Anchor MUST be cleared so the next batch re-anchors.
+            self.assertIsNone(sink._anchor_utc)
+            self.assertEqual(sink._anchor_total_samples, 0)
+            # channel_info MUST be replaced by the new snapshot.
+            self.assertIs(sink._channel_info, new_info)
         finally:
             _cleanup_sink(sink)
 

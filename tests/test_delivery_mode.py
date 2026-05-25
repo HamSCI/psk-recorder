@@ -8,17 +8,10 @@ with backward-compat translation from the legacy env var.
 from __future__ import annotations
 
 import os
-import sys
-import types
 import unittest
 from unittest import mock
 
-# Stub heavy deps that recorder.py pulls in transitively.
-for _name in ("numpy",):
-    if _name not in sys.modules:
-        sys.modules[_name] = types.ModuleType(_name)
-
-from psk_recorder.core.recorder import (  # noqa: E402
+from psk_recorder.core.recorder import (
     _LEGACY_MODE_TO_PIPELINES,
     _VALID_DELIVERY_PIPELINES,
     _resolve_delivery_pipelines,

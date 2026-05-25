@@ -11,7 +11,7 @@ import sys
 import time
 import unittest
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC_DIR = REPO_ROOT / "src"
@@ -56,7 +56,9 @@ class TestLineParser(unittest.TestCase):
         self.assertEqual(row["frequency"], 14_074_131)
         self.assertAlmostEqual(row["frequency_mhz"], 14.0741312, places=4)
         self.assertEqual(row["message"], "K1ABC W1XYZ EM26")
-        self.assertEqual(row["time"], datetime(2026, 5, 7, 12, 34, 56))
+        self.assertEqual(
+            row["time"], datetime(2026, 5, 7, 12, 34, 56, tzinfo=timezone.utc)
+        )
 
     def test_full_line_plain(self):
         # C locale: no thousands separator
