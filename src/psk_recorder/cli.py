@@ -324,15 +324,18 @@ def _handle_daemon(args):
     config = load_config(config_path)
 
     # Per-instance config carries the reporter_id in its [instance]
-    # block; legacy shared config has None here — ChTailer falls back
-    # to radiod_id-derived value so every spot row still has the field.
+    # block; legacy shared config has None here, and we deliberately
+    # do NOT fall back to args.instance.  During the cutover, args.instance
+    # is the systemd %i which is typically a radiod identifier
+    # (e.g. "my-rx888"), not a reporter ID — using it as a reporter_id
+    # would propagate a misleading value into spot rows.  Instead we
+    # leave reporter_id=None; ChTailer's row-construction layer falls
+    # back to radiod_id (the existing legacy `instance` field's
+    # semantic), keeping the field present without claiming it's a
+    # real reporter ID.  Operators set a real reporter_id by populating
+    # the [instance] block in the per-instance config (sigmond Phase 8
+    # `smd instance migrate` is the planned interactive setup path).
     reporter_id = extract_reporter_id(config)
-    if args.instance and reporter_id is None:
-        # Operator passed --instance but the resolved config has no
-        # [instance] block (legacy shared-config fall-through).  Use
-        # the instance argument as the reporter_id so spots are still
-        # tagged correctly during the deprecation window.
-        reporter_id = args.instance
 
     if args.radiod_id is not None:
         # Legacy single-source mode — operator explicitly selected one
