@@ -16,7 +16,7 @@ NotifyAccess=main
 EnvironmentFile=-/etc/sigmond/coordination.env
 EnvironmentFile=-/etc/psk-recorder/env/%i.env
 
-WorkingDirectory=/opt/psk-recorder
+WorkingDirectory=/opt/git/sigmond/psk-recorder
 
 ExecStartPre=+/bin/mkdir -p /var/lib/psk-recorder/%i/ft8
 ExecStartPre=+/bin/mkdir -p /var/lib/psk-recorder/%i/ft4
@@ -47,7 +47,7 @@ ExecStartPre=+/usr/bin/chown -R pskrec:pskrec /var/log/psk-recorder
 # config); ignored once per-instance config takes over.
 # Note: --config is intentionally omitted — passing it would force
 # the legacy path always (explicit_path wins in resolve_config_path).
-ExecStart=/opt/psk-recorder/venv/bin/python3 -m psk_recorder.cli daemon \
+ExecStart=/opt/git/sigmond/psk-recorder/venv/bin/python3 -m psk_recorder.cli daemon \
     --instance %i \
     --radiod-id %i
 

@@ -13,17 +13,17 @@ edit = ["/usr/local/bin/psk-recorder", "config", "edit"]
 
 [build]
 steps = [
-    "python3 -m venv /opt/psk-recorder/venv",
-    "/opt/psk-recorder/venv/bin/pip install --upgrade pip setuptools wheel",
-    "/opt/psk-recorder/venv/bin/pip install -e /opt/git/sigmond/psk-recorder",
+    "python3 -m venv /opt/git/sigmond/psk-recorder/venv",
+    "/opt/git/sigmond/psk-recorder/venv/bin/pip install --upgrade pip setuptools wheel",
+    "/opt/git/sigmond/psk-recorder/venv/bin/pip install -e /opt/git/sigmond/psk-recorder",
 ]
 produces = [
-    "/opt/psk-recorder/venv/bin/psk-recorder",
+    "/opt/git/sigmond/psk-recorder/venv/bin/psk-recorder",
 ]
 
 [[install.steps]]
 kind = "link"
-src  = "/opt/psk-recorder/venv/bin/psk-recorder"
+src  = "/opt/git/sigmond/psk-recorder/venv/bin/psk-recorder"
 dst  = "/usr/local/bin/psk-recorder"
 
 [[install.steps]]
@@ -70,7 +70,7 @@ note       = "provides /usr/local/bin/pskreporter-sender (pip-installable)"
 [[deps.pypi]]
 name    = "ka9q-python"
 version = "3.6.0"
-venv    = "/opt/psk-recorder/venv"
+venv    = "/opt/git/sigmond/psk-recorder/venv"
 
 [[deps.apt]]
 name = "whiptail"

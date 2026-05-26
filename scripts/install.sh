@@ -6,7 +6,7 @@
 # What it does:
 #   1. Creates service user pskrec:pskrec
 #   2. Clones/links repo to /opt/git/sigmond/psk-recorder
-#   3. Creates venv at /opt/psk-recorder/venv with editable install
+#   3. Creates venv at /opt/git/sigmond/psk-recorder/venv with editable install
 #   4. Renders config template (non-destructive — never overwrites)
 #   5. Installs systemd unit template
 #   6. Disables native ka9q-radio FT services if running
@@ -19,7 +19,7 @@ set -euo pipefail
 SERVICE_USER="pskrec"
 SERVICE_GROUP="pskrec"
 REPO_SOURCE="/opt/git/sigmond/psk-recorder"
-VENV_DIR="/opt/psk-recorder/venv"
+VENV_DIR="/opt/git/sigmond/psk-recorder/venv"
 CONFIG_DIR="/etc/psk-recorder"
 CONFIG_FILE="${CONFIG_DIR}/psk-recorder-config.toml"
 SPOOL_DIR="/var/lib/psk-recorder"
