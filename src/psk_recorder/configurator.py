@@ -210,37 +210,149 @@ def _resolve_target(args) -> Path:
     return Path(getattr(args, "config", None) or DEFAULT_CONFIG_PATH)
 
 
+def _discover_radiods(timeout: float = 5.0) -> list[dict]:
+    """Return discovered radiods or [] on failure (avahi missing, etc.).
+
+    Lazy-imports ka9q.discovery so the configurator still works when
+    ka9q-python isn't installed yet (e.g. mid-bootstrap).  Each entry
+    is {"name": str, "address": str} — `address` is the mDNS
+    multicast control/status name (e.g. "bee1-status.local") which
+    becomes the value of the new `[[radiod]] status` field per
+    RADIOD-IDENTIFICATION.md §3.1.
+    """
+    try:
+        from ka9q.discovery import discover_radiod_services
+        return discover_radiod_services(timeout=timeout) or []
+    except Exception:
+        return []
+
+
+def _pick_radiod_status_from_discovery(
+    discovered: list[dict], env_status: str, instance_hint: str,
+) -> str:
+    """Interactive discovery flow per RADIOD-IDENTIFICATION.md §4.
+
+    Returns the chosen multicast status name (e.g. "bee1-status.local").
+
+    Cases:
+      0 discovered → warn + fall back to manual entry (env or prompt)
+      1 discovered → confirm (default Y)
+      ≥2 discovered → menu chooser; operator picks one
+    """
+    if not discovered:
+        print("\033[33m⚠\033[0m  No radiod instances broadcasting on the "
+              "local network.")
+        _info("Install + start radiod before continuing:")
+        _info("  sudo smd install ka9q-radio")
+        _info("Continuing with manual entry — the daemon will refuse to "
+              "start if the multicast name is unreachable.")
+        default = env_status or (
+            f"{instance_hint}-status.local" if instance_hint else "")
+        return _prompt(
+            "Radiod status DNS (manual entry)", default, required=True)
+
+    # `hostname` is the mDNS multicast control/status name (per
+    # ka9q-python's enhanced discover_radiod_services).  This is the
+    # canonical identifier per RADIOD-IDENTIFICATION.md §2.  We never
+    # use the `address` (multicast IP) — it's discoverable but
+    # unstable across radiod restarts.
+    if len(discovered) == 1:
+        only = discovered[0]
+        _info(f"One radiod discovered: {only['hostname']!r} "
+              f"(advertised name: {only['name']!r})")
+        confirm = _prompt(
+            f"Use {only['hostname']!r}? [Y/n]", "Y").strip().lower()
+        if confirm in ("", "y", "yes"):
+            return only["hostname"]
+        # Operator declined the only choice — fall back to manual.
+        return _prompt(
+            "Radiod status DNS (manual entry)",
+            env_status or only["hostname"], required=True)
+
+    # Multi-radiod menu.
+    _info("Multiple radiods discovered on the LAN:")
+    for i, svc in enumerate(discovered, 1):
+        _info(f"  [{i}] {svc['hostname']:<32} (advertised: {svc['name']!r})")
+    while True:
+        choice = _prompt(
+            f"Pick a radiod [1-{len(discovered)}]", "1").strip()
+        try:
+            idx = int(choice) - 1
+        except ValueError:
+            print("\033[33m⚠\033[0m  Enter a number from the menu.")
+            continue
+        if 0 <= idx < len(discovered):
+            return discovered[idx]["hostname"]
+        print(f"\033[33m⚠\033[0m  Out of range; pick 1-{len(discovered)}.")
+
+
 def _collect_init_values(args) -> dict:
-    """Build the substitution dict for init.  Env vars are defaults; an
-    interactive prompt fills in anything missing unless --non-interactive."""
+    """Build the substitution dict for init.
+
+    Env vars are defaults; ka9q-python discovery is consulted in
+    interactive mode (RADIOD-IDENTIFICATION.md §4); a prompt fills in
+    anything missing unless --non-interactive."""
     call = os.environ.get("STATION_CALL", "")
     grid = os.environ.get("STATION_GRID", "")
     instance = os.environ.get("SIGMOND_INSTANCE", "")
-    status = os.environ.get("SIGMOND_RADIOD_STATUS", "")
+    env_status = os.environ.get("SIGMOND_RADIOD_STATUS", "")
     default_callsign = _default_reporter_callsign(call)
 
     if getattr(args, "non_interactive", False):
+        # Non-interactive: env wins.  If env is empty and exactly one
+        # radiod is discoverable on the LAN, take it; otherwise fall
+        # back to the legacy placeholder shape so the rendered config
+        # is syntactically valid (operator can re-run interactively).
+        if env_status:
+            radiod_status = env_status
+        else:
+            discovered = _discover_radiods()
+            if len(discovered) == 1:
+                radiod_status = discovered[0]["hostname"]
+            else:
+                radiod_status = (
+                    f"{instance}-status.local"
+                    if instance else "my-rx888-status.local"
+                )
         return {
             "callsign":      default_callsign or "YOURCALL",
             "grid":          grid or "AA00aa",
             "radiod_id":     instance or "my-rx888",
-            "radiod_status": status or (
-                f"{instance}-status.local" if instance else "my-rx888-status.local"
-            ),
+            "radiod_status": radiod_status,
         }
 
     callsign = _prompt("Callsign", default_callsign, required=True)
     grid_square = _prompt("Grid square", grid, required=True)
-    radiod_id = _prompt("Radiod id (e.g. bee1-rx888)",
-                        instance, required=True)
-    default_status = status or f"{radiod_id}-status.local"
-    radiod_status = _prompt("Radiod status DNS", default_status, required=True)
+
+    # RADIOD-IDENTIFICATION.md §4 — discovery-driven radiod selection.
+    discovered = _discover_radiods()
+    radiod_status = _pick_radiod_status_from_discovery(
+        discovered, env_status, instance)
+
+    # Legacy `id` local label.  Phase 6 cutover removes this from the
+    # interactive flow entirely; for now it's still asked because
+    # build_inventory uses it for env-var key derivation + log/spool
+    # file naming during the deprecation window.  Default derived from
+    # status when no env hint is present.
+    radiod_id_default = instance or _derive_label_from_status(radiod_status)
+    radiod_id = _prompt("Radiod id (local label — legacy, will be retired)",
+                        radiod_id_default, required=True)
     return {
         "callsign":      callsign,
         "grid":          grid_square,
         "radiod_id":     radiod_id,
         "radiod_status": radiod_status,
     }
+
+
+def _derive_label_from_status(status: str) -> str:
+    """Strip common mDNS suffixes to make a default local label.
+    ``bee1-status.local`` → ``bee1``."""
+    base = (status or "").strip()
+    for suffix in ("-status.local", ".local"):
+        if base.endswith(suffix):
+            return base[: -len(suffix)]
+    return base or "default"
 
 
 def _default_reporter_callsign(call: str) -> str:

@@ -265,5 +265,70 @@ class EditCommandTests(unittest.TestCase):
             self.assertEqual(rc, 0)
 
 
+class DiscoveryFlowTests(unittest.TestCase):
+    """RADIOD-IDENTIFICATION.md §4 — ka9q-python discovery-driven init."""
+
+    def test_single_radiod_used_when_env_empty(self):
+        """Non-interactive: env empty but exactly one radiod discoverable
+        → use its `hostname` (mDNS multicast name)."""
+        _clear_env('SIGMOND_RADIOD_STATUS')
+        with mock.patch.object(
+                configurator, '_discover_radiods',
+                return_value=[{
+                    "name": "radiod@bee1",
+                    "hostname": "bee1-status.local",
+                    "address": "239.205.73.40",
+                    "port": 5006,
+                }]):
+            with mock.patch.dict(os.environ, {'SIGMOND_INSTANCE': 'bee1-rx888'},
+                                 clear=False):
+                args = _ns(non_interactive=True)
+                values = configurator._collect_init_values(args)
+        self.assertEqual(values['radiod_status'], 'bee1-status.local')
+
+    def test_zero_radiods_falls_back_to_placeholder(self):
+        """Non-interactive + env empty + no discovery → placeholder shape."""
+        _clear_env('SIGMOND_RADIOD_STATUS')
+        with mock.patch.object(configurator, '_discover_radiods',
+                               return_value=[]):
+            with mock.patch.dict(os.environ, {'SIGMOND_INSTANCE': 'rx2'},
+                                 clear=False):
+                args = _ns(non_interactive=True)
+                values = configurator._collect_init_values(args)
+        self.assertEqual(values['radiod_status'], 'rx2-status.local')
+
+    def test_env_wins_over_discovery(self):
+        """Non-interactive + SIGMOND_RADIOD_STATUS set → env wins even
+        if discovery returns a different value."""
+        with mock.patch.object(
+                configurator, '_discover_radiods',
+                return_value=[{
+                    "name": "other",
+                    "hostname": "other.local",
+                    "address": "239.0.0.1",
+                    "port": 5006,
+                }]):
+            with mock.patch.dict(os.environ, {
+                'SIGMOND_RADIOD_STATUS': 'operator-set.local',
+                'SIGMOND_INSTANCE':      'bee1-rx888',
+            }, clear=False):
+                args = _ns(non_interactive=True)
+                values = configurator._collect_init_values(args)
+        self.assertEqual(values['radiod_status'], 'operator-set.local')
+
+    def test_derive_label_from_status_strips_suffixes(self):
+        from psk_recorder.configurator import _derive_label_from_status
+        self.assertEqual(_derive_label_from_status('bee1-status.local'), 'bee1')
+        self.assertEqual(_derive_label_from_status('rx888.local'), 'rx888')
+        self.assertEqual(_derive_label_from_status('plain-name'), 'plain-name')
+        self.assertEqual(_derive_label_from_status(''), 'default')
+
+
+def _clear_env(*names):
+    """Helper: remove env vars (no-op if absent)."""
+    for n in names:
+        os.environ.pop(n, None)
+
+
 if __name__ == '__main__':
     unittest.main()
