@@ -337,11 +337,34 @@ def _handle_daemon(args):
     # `smd instance migrate` is the planned interactive setup path).
     reporter_id = extract_reporter_id(config)
 
+    radiod_block: dict | None = None
     if args.radiod_id is not None:
         # Legacy single-source mode — operator explicitly selected one
         # block; honor it exactly even if the config has more.  Used
         # by ``psk-recorder@<radiod-id>.service`` template units.
-        radiod_block = resolve_radiod_block(config, args.radiod_id)
+        try:
+            radiod_block = resolve_radiod_block(config, args.radiod_id)
+        except ValueError:
+            # Post-`smd instance migrate` soft-cutover: the systemd
+            # template still passes --radiod-id %i (= reporter ID),
+            # which doesn't match the [[radiod]] block's id (= mDNS
+            # source label) in the per-instance config.  When --instance
+            # was given, the per-instance config unambiguously defines
+            # this instance's source list — fall through to multi-source
+            # mode (which accepts any block count) and rely on
+            # ensure_sources to pick the right block.  Warn so the
+            # mismatch stays visible to operators.
+            if args.instance is None:
+                raise
+            logger.warning(
+                "--radiod-id=%r did not match any [[radiod]] block in "
+                "%s; falling through to per-instance multi-source path "
+                "(--instance=%r).  Drop --radiod-id from the systemd "
+                "template once all reporters are migrated.",
+                args.radiod_id, config_path, args.instance,
+            )
+
+    if radiod_block is not None:
         blocks = [radiod_block]
         logger.info(
             "Starting psk-recorder daemon for radiod %s "
