@@ -41,8 +41,13 @@ def build_inventory(config: dict, config_path: Path) -> dict:
     all_log_paths: dict[str, Any] = {}
 
     for block in radiod_blocks:
-        radiod_id = block.get("id", "default")  # local label; used for
-                                                # env-var keys, log paths
+        # Local label for env-var keys + per-instance file paths.
+        # Legacy `id` field takes precedence (preserves existing paths
+        # for operators mid-migration); falls back to the new `status`
+        # field for status-only configs.  After Phase 6 cutover, the
+        # `id` fallback is removed and `status` becomes the only
+        # source — see RADIOD-IDENTIFICATION.md §6.
+        radiod_id = block.get("id") or block.get("status") or "default"
         ft8_freqs = get_freqs(block, "ft8")
         ft4_freqs = get_freqs(block, "ft4")
         all_freqs = sorted(set(ft8_freqs + ft4_freqs))

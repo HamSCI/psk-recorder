@@ -135,6 +135,14 @@ def load_config(path: Path | None = None) -> dict:
 def resolve_radiod_block(config: dict, radiod_id: str | None) -> dict:
     """Find the [[radiod]] block matching radiod_id.
 
+    Match precedence (RADIOD-IDENTIFICATION.md §3.1 + §6):
+      1. New canonical: ``block["status"]`` (the mDNS multicast name)
+      2. Legacy fallback: ``block["id"]`` (operator's local label)
+
+    A DeprecationWarning fires when the match comes from the legacy
+    ``id`` field — operators are expected to migrate to ``status``
+    during the Phase 3 deprecation window.
+
     If radiod_id is None, the config must contain exactly one [[radiod]].
     """
     radiod_blocks = config.get("radiod", [])
@@ -152,13 +160,30 @@ def resolve_radiod_block(config: dict, radiod_id: str | None) -> dict:
             )
         return radiod_blocks[0]
 
+    # New canonical: match on `status` (the multicast name).
     for block in radiod_blocks:
-        if block.get("id") == radiod_id:
+        if block.get("status") == radiod_id:
             return block
 
-    available = [b.get("id", "<unnamed>") for b in radiod_blocks]
+    # Legacy fallback: match on `id` (the local label).
+    for block in radiod_blocks:
+        if block.get("id") == radiod_id:
+            warnings.warn(
+                f"[[radiod]] block matched on legacy `id` field "
+                f"({radiod_id!r}); rename to `status` per "
+                "RADIOD-IDENTIFICATION.md §3.1",
+                DeprecationWarning, stacklevel=2,
+            )
+            return block
+
+    # Build a helpful 'available' list showing whichever field each
+    # block has (preferring `status` when both are present).
+    available = [
+        b.get("status") or b.get("id", "<unnamed>")
+        for b in radiod_blocks
+    ]
     raise ValueError(
-        f"No [[radiod]] block with id={radiod_id!r}. "
+        f"No [[radiod]] block with status or id={radiod_id!r}. "
         f"Available: {', '.join(available)}"
     )
 
@@ -180,25 +205,52 @@ def get_mode_params(radiod_block: dict, mode: str) -> dict:
 
 
 def resolve_radiod_status(radiod_block: dict) -> str:
-    """Resolve the radiod mDNS hostname.
+    """Resolve the radiod mDNS control/status multicast name.
 
-    Precedence:
-      1. RADIOD_<ID>_STATUS from environment (sigmond-supplied)
-      2. radiod_status field in the [[radiod]] block (standalone fallback)
+    Precedence (RADIOD-IDENTIFICATION.md §3.1 + §6):
+      1. New canonical: ``block["status"]`` (the multicast name).  No
+         env-var override needed since the field is operator-set
+         explicitly.
+      2. Legacy: ``RADIOD_<ID>_STATUS`` from environment, where ``<ID>``
+         is derived from ``block["id"]``.  DeprecationWarning fires.
+      3. Legacy: ``block["radiod_status"]``.  DeprecationWarning fires.
+
+    The legacy paths exist for the Phase 3 deprecation window.  Phase 6
+    cutover removes them and ``status`` becomes the only source.
     """
+    # New canonical path.
+    status = radiod_block.get("status")
+    if status:
+        return status
+
+    # Legacy paths — surface DeprecationWarning so operators see the
+    # migration prompt in stderr / pytest output / smd validate stream.
     radiod_id = radiod_block.get("id", "")
     env_key = f"RADIOD_{radiod_id.upper().replace('-', '_')}_STATUS"
     from_env = os.environ.get(env_key)
     if from_env:
+        warnings.warn(
+            f"using legacy env override {env_key}; declare "
+            "[[radiod]] status instead per RADIOD-IDENTIFICATION.md §3.1",
+            DeprecationWarning, stacklevel=2,
+        )
         return from_env
 
-    status = radiod_block.get("radiod_status")
-    if not status:
-        raise ValueError(
-            f"[[radiod]] id={radiod_id!r} has no radiod_status and "
-            f"{env_key} is not set in the environment"
+    legacy_status = radiod_block.get("radiod_status")
+    if legacy_status:
+        warnings.warn(
+            "[[radiod]] radiod_status is deprecated; rename to "
+            "[[radiod]] status per RADIOD-IDENTIFICATION.md §3.1",
+            DeprecationWarning, stacklevel=2,
         )
-    return status
+        return legacy_status
+
+    raise ValueError(
+        f"[[radiod]] block has no `status` field declared "
+        f"(id={radiod_id!r} legacy fields also absent); see "
+        "RADIOD-IDENTIFICATION.md §3.1 — operator should set "
+        "`status = \"<mDNS-multicast-name>\"`"
+    )
 
 
 def derive_source_key(radiod_block: dict) -> str:

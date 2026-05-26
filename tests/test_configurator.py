@@ -147,8 +147,11 @@ class InitCommandTests(unittest.TestCase):
             text = target.read_text()
             self.assertIn('callsign    = "AC0G"', text)
             self.assertIn('grid_square = "EM38"', text)
-            self.assertIn('id            = "bee1-rx888"', text)
-            self.assertIn('radiod_status = "bee1-status.local"', text)
+            # RADIOD-IDENTIFICATION.md §3.1: template's canonical field
+            # is `status` (the multicast mDNS name).  The legacy `id`
+            # line is a commented example only.
+            self.assertIn('status = "bee1-status.local"', text)
+            self.assertNotIn('status = "<configure-via-config-init>"', text)
 
     def test_writes_template_with_env_defaults_multi_radiod(self):
         # COUNT > 1 → callsign defaults to AC0G/B<index>.

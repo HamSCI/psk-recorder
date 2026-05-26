@@ -267,5 +267,76 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(ft4, [14080000, 7047500])
 
 
+class RadiodSchemaPhase3Tests(unittest.TestCase):
+    """RADIOD-IDENTIFICATION.md §3.1 — new `status` field acceptance.
+
+    Phase 3 of the canonical-naming cleanup adds `[[radiod]] status`
+    as the primary identifier (mDNS multicast name).  Legacy fields
+    (`id`, `radiod_status`, RADIOD_<ID>_STATUS env var) are still
+    accepted during the deprecation window but emit
+    DeprecationWarning."""
+
+    def test_resolve_status_prefers_new_field_no_warning(self):
+        import warnings
+        from psk_recorder.config import resolve_radiod_status
+        block = {
+            "status": "bee1-status.local",
+            # Legacy fields ignored when `status` is present.
+            "id": "should-be-ignored",
+            "radiod_status": "should-be-ignored-too.local",
+        }
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            result = resolve_radiod_status(block)
+        self.assertEqual(result, "bee1-status.local")
+        # No DeprecationWarning when the new field is used.
+        self.assertEqual(
+            [warning for warning in w
+             if issubclass(warning.category, DeprecationWarning)],
+            [])
+
+    def test_resolve_status_legacy_radiod_status_warns(self):
+        import warnings
+        from psk_recorder.config import resolve_radiod_status
+        block = {
+            "id": "legacy",
+            "radiod_status": "legacy.local",
+        }
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            result = resolve_radiod_status(block)
+        self.assertEqual(result, "legacy.local")
+        self.assertTrue(any(
+            issubclass(warning.category, DeprecationWarning)
+            and "radiod_status" in str(warning.message)
+            for warning in w))
+
+    def test_resolve_block_matches_status_field(self):
+        """A block with only `status` matches when caller passes the
+        multicast name."""
+        from psk_recorder.config import resolve_radiod_block
+        config = {"radiod": [
+            {"status": "bee1-status.local", "ft8": {"freqs_hz": [14074000]}},
+            {"status": "other.local", "ft8": {"freqs_hz": [7074000]}},
+        ]}
+        block = resolve_radiod_block(config, "bee1-status.local")
+        self.assertEqual(block["status"], "bee1-status.local")
+
+    def test_resolve_block_legacy_id_match_warns(self):
+        import warnings
+        from psk_recorder.config import resolve_radiod_block
+        config = {"radiod": [
+            {"id": "my-rx888", "ft8": {"freqs_hz": [14074000]}},
+        ]}
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            block = resolve_radiod_block(config, "my-rx888")
+        self.assertEqual(block["id"], "my-rx888")
+        self.assertTrue(any(
+            issubclass(warning.category, DeprecationWarning)
+            and "legacy `id`" in str(warning.message)
+            for warning in w))
+
+
 if __name__ == "__main__":
     unittest.main()

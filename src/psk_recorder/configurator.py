@@ -271,8 +271,13 @@ def _default_reporter_callsign(call: str) -> str:
 def _apply_init_substitutions(body: str, values: dict) -> str:
     body = _replace_station_field(body, "callsign",    values["callsign"])
     body = _replace_station_field(body, "grid_square", values["grid"])
-    body = _replace_radiod_field(body, 0, "id",            values["radiod_id"])
-    body = _replace_radiod_field(body, 0, "radiod_status", values["radiod_status"])
+    # RADIOD-IDENTIFICATION.md §3.1 — the canonical field is `status`
+    # (multicast mDNS name).  The legacy `id` and `radiod_status`
+    # lines are commented out in the template; substitute the operator-
+    # supplied multicast name into the active `status = ...` line.
+    # Phase 4 will replace the env-var-driven defaults with
+    # ka9q-python discovery.
+    body = _replace_radiod_field(body, 0, "status", values["radiod_status"])
     return body
 
 
