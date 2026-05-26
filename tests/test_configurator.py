@@ -209,9 +209,11 @@ class InitCommandTests(unittest.TestCase):
                 rc = configurator.cmd_config_init(args)
             self.assertEqual(rc, 0)
             text = target.read_text()
-            # Template values get used as the safe fallback.
+            # Template values get used as the safe fallback.  Phase 6:
+            # the canonical `status` field is the only radiod
+            # identifier — `id` no longer appears in the template.
             self.assertIn('callsign    = "YOURCALL"', text)
-            self.assertIn('id            = "my-rx888"', text)
+            self.assertIn('status = "my-rx888-status.local"', text)
 
 
 class EditCommandTests(unittest.TestCase):

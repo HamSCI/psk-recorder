@@ -135,13 +135,11 @@ def load_config(path: Path | None = None) -> dict:
 def resolve_radiod_block(config: dict, radiod_id: str | None) -> dict:
     """Find the [[radiod]] block matching radiod_id.
 
-    Match precedence (RADIOD-IDENTIFICATION.md §3.1 + §6):
-      1. New canonical: ``block["status"]`` (the mDNS multicast name)
-      2. Legacy fallback: ``block["id"]`` (operator's local label)
-
-    A DeprecationWarning fires when the match comes from the legacy
-    ``id`` field — operators are expected to migrate to ``status``
-    during the Phase 3 deprecation window.
+    Match on the canonical ``status`` field (mDNS multicast name) per
+    RADIOD-IDENTIFICATION.md §3.1.  Phase 6 cutover (this release)
+    removed acceptance of the legacy ``id`` field; operators still
+    using legacy configs must run ``sudo smd radiod migrate --yes``
+    before restarting daemons.
 
     If radiod_id is None, the config must contain exactly one [[radiod]].
     """
@@ -160,31 +158,17 @@ def resolve_radiod_block(config: dict, radiod_id: str | None) -> dict:
             )
         return radiod_blocks[0]
 
-    # New canonical: match on `status` (the multicast name).
     for block in radiod_blocks:
         if block.get("status") == radiod_id:
             return block
 
-    # Legacy fallback: match on `id` (the local label).
-    for block in radiod_blocks:
-        if block.get("id") == radiod_id:
-            warnings.warn(
-                f"[[radiod]] block matched on legacy `id` field "
-                f"({radiod_id!r}); rename to `status` per "
-                "RADIOD-IDENTIFICATION.md §3.1",
-                DeprecationWarning, stacklevel=2,
-            )
-            return block
-
-    # Build a helpful 'available' list showing whichever field each
-    # block has (preferring `status` when both are present).
-    available = [
-        b.get("status") or b.get("id", "<unnamed>")
-        for b in radiod_blocks
-    ]
+    available = [b.get("status", "<unnamed>") for b in radiod_blocks]
     raise ValueError(
-        f"No [[radiod]] block with status or id={radiod_id!r}. "
-        f"Available: {', '.join(available)}"
+        f"No [[radiod]] block with status={radiod_id!r}. "
+        f"Available: {', '.join(available)}.  "
+        "If you see legacy `id` fields in the config, run "
+        "`sudo smd radiod migrate --yes` to rewrite them per "
+        "RADIOD-IDENTIFICATION.md §3.1."
     )
 
 
@@ -207,64 +191,30 @@ def get_mode_params(radiod_block: dict, mode: str) -> dict:
 def resolve_radiod_status(radiod_block: dict) -> str:
     """Resolve the radiod mDNS control/status multicast name.
 
-    Precedence (RADIOD-IDENTIFICATION.md §3.1 + §6):
-      1. New canonical: ``block["status"]`` (the multicast name).  No
-         env-var override needed since the field is operator-set
-         explicitly.
-      2. Legacy: ``RADIOD_<ID>_STATUS`` from environment, where ``<ID>``
-         is derived from ``block["id"]``.  DeprecationWarning fires.
-      3. Legacy: ``block["radiod_status"]``.  DeprecationWarning fires.
-
-    The legacy paths exist for the Phase 3 deprecation window.  Phase 6
-    cutover removes them and ``status`` becomes the only source.
+    Reads the canonical ``status`` field per
+    RADIOD-IDENTIFICATION.md §3.1.  Phase 6 cutover (this release)
+    removed the legacy paths (``RADIOD_<ID>_STATUS`` env override
+    and ``radiod_status`` field) — operators with legacy configs
+    must run ``sudo smd radiod migrate --yes``.
     """
-    # New canonical path.
     status = radiod_block.get("status")
-    if status:
-        return status
-
-    # Legacy paths — surface DeprecationWarning so operators see the
-    # migration prompt in stderr / pytest output / smd validate stream.
-    radiod_id = radiod_block.get("id", "")
-    env_key = f"RADIOD_{radiod_id.upper().replace('-', '_')}_STATUS"
-    from_env = os.environ.get(env_key)
-    if from_env:
-        warnings.warn(
-            f"using legacy env override {env_key}; declare "
-            "[[radiod]] status instead per RADIOD-IDENTIFICATION.md §3.1",
-            DeprecationWarning, stacklevel=2,
+    if not status:
+        raise ValueError(
+            "[[radiod]] block has no `status` field.  Run "
+            "`sudo smd radiod migrate --yes` if this config still "
+            "uses the legacy `radiod_status` field, or run "
+            "`psk-recorder config init` for a fresh config."
         )
-        return from_env
-
-    legacy_status = radiod_block.get("radiod_status")
-    if legacy_status:
-        warnings.warn(
-            "[[radiod]] radiod_status is deprecated; rename to "
-            "[[radiod]] status per RADIOD-IDENTIFICATION.md §3.1",
-            DeprecationWarning, stacklevel=2,
-        )
-        return legacy_status
-
-    raise ValueError(
-        f"[[radiod]] block has no `status` field declared "
-        f"(id={radiod_id!r} legacy fields also absent); see "
-        "RADIOD-IDENTIFICATION.md §3.1 — operator should set "
-        "`status = \"<mDNS-multicast-name>\"`"
-    )
+    return status
 
 
 def derive_source_key(radiod_block: dict) -> str:
     """Canonical source identifier for a radiod block.
 
-    Returns ``radiod:<resolved_status_address>`` — matches
+    Returns ``radiod:<status_address>`` — matches
     ``sigmond.sources.SourceKey`` string form and wspr-recorder's
     ``SourceConfig.key`` so a spot's ``rx_source`` tag is comparable
     across clients.
-
-    Status resolution follows ``resolve_radiod_status`` precedence
-    (env override → ``radiod_status`` field), so the key reflects what
-    the recorder is actually talking to at runtime, not a static
-    config field.
     """
     return f"radiod:{resolve_radiod_status(radiod_block)}"
 
@@ -272,17 +222,13 @@ def derive_source_key(radiod_block: dict) -> str:
 def ensure_sources(config: dict) -> list[dict]:
     """Normalise ``[[radiod]]`` blocks into a list of source descriptors.
 
-    Foundation for multi-source psk-recorder (Phase B).  Today each
-    daemon process still serves one radiod via ``--radiod-id`` /
-    ``resolve_radiod_block``; this helper just synthesises the
-    Phase-B-shaped list so other code can be written against the
-    final shape now.
-
     Each entry has:
       ``key``               — ``radiod:<status_address>`` (matches
                               ``derive_source_key``)
-      ``radiod_id``         — short id from the ``[[radiod]]`` block
-      ``status_address``    — resolved mDNS hostname
+      ``radiod_id``         — the mDNS status name (canonical id per
+                              RADIOD-IDENTIFICATION.md §3.1)
+      ``status_address``    — same value, kept for callers that read
+                              the field by that name
       ``radiod_block``      — the original block (freqs, lifetime, etc.)
     """
     blocks = config.get("radiod", [])
@@ -294,13 +240,13 @@ def ensure_sources(config: dict) -> list[dict]:
         try:
             status = resolve_radiod_status(block)
         except ValueError:
-            # Skip blocks that haven't been wired up yet — same shape
+            # Skip blocks missing the `status` field — same shape
             # ``resolve_radiod_block`` would reject; callers should
             # not assume every entry resolves.
             continue
         sources.append({
             "key": f"radiod:{status}",
-            "radiod_id": block.get("id", "default"),
+            "radiod_id": status,
             "status_address": status,
             "radiod_block": block,
         })

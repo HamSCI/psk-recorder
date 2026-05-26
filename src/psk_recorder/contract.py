@@ -41,32 +41,23 @@ def build_inventory(config: dict, config_path: Path) -> dict:
     all_log_paths: dict[str, Any] = {}
 
     for block in radiod_blocks:
-        # Local label for env-var keys + per-instance file paths.
-        # Legacy `id` field takes precedence (preserves existing paths
-        # for operators mid-migration); falls back to the new `status`
-        # field for status-only configs.  After Phase 6 cutover, the
-        # `id` fallback is removed and `status` becomes the only
-        # source — see RADIOD-IDENTIFICATION.md §6.
-        radiod_id = block.get("id") or block.get("status") or "default"
+        # Canonical mDNS multicast name per RADIOD-IDENTIFICATION.md
+        # §3.1.  Phase 6 cutover removed the legacy `id` field; the
+        # status name IS the identifier.
+        status_dns = resolve_radiod_status(block)
+        # Internal label for env-var keys and per-instance file paths.
+        # Derived from the status name (sanitized: dots → underscores
+        # for env-var compatibility).
+        radiod_id = status_dns
         ft8_freqs = get_freqs(block, "ft8")
         ft4_freqs = get_freqs(block, "ft4")
         all_freqs = sorted(set(ft8_freqs + ft4_freqs))
 
-        try:
-            status_dns = resolve_radiod_status(block)
-        except ValueError:
-            status_dns = block.get("radiod_status", "")
+        # Inventory `radiod_id` field is the multicast name (the only
+        # functional identifier per RADIOD-IDENTIFICATION.md §3.2).
+        inventory_radiod_id = status_dns
 
-        # RADIOD-IDENTIFICATION.md §3.2 — inventory radiod_id is the
-        # mDNS control/status multicast name (the only functional
-        # identifier).  Fall back to the local label when the operator
-        # hasn't declared radiod_status yet, so legacy configs still
-        # produce parseable inventory.  The local `radiod_id` variable
-        # remains the per-block label for env-var lookups and file
-        # naming — that internal use isn't changing in Phase 2.
-        inventory_radiod_id = status_dns or radiod_id
-
-        chain_delay_env = f"RADIOD_{radiod_id.upper().replace('-', '_')}_CHAIN_DELAY_NS"
+        chain_delay_env = f"RADIOD_{radiod_id.upper().replace('-', '_').replace('.', '_')}_CHAIN_DELAY_NS"
         chain_delay_raw = os.environ.get(chain_delay_env)
         chain_delay = int(chain_delay_raw) if chain_delay_raw else None
 
@@ -220,15 +211,16 @@ def _collect_issues(config: dict, paths: dict) -> list[dict]:
         })
 
     for block in radiod_blocks:
-        rid = block.get("id", "<unnamed>")
-        if not block.get("radiod_status"):
-            env_key = f"RADIOD_{rid.upper().replace('-', '_')}_STATUS"
-            if not os.environ.get(env_key):
-                issues.append({
-                    "severity": "fail",
-                    "instance": rid,
-                    "message": f"radiod_status not set and {env_key} not in environment",
-                })
+        rid = block.get("status", "<unnamed>")
+        if not block.get("status"):
+            issues.append({
+                "severity": "fail",
+                "instance": rid,
+                "message": (
+                    "[[radiod]] block has no `status` field "
+                    "(mDNS multicast name)"
+                ),
+            })
 
         ft8 = get_freqs(block, "ft8")
         ft4 = get_freqs(block, "ft4")

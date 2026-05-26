@@ -126,12 +126,10 @@ class InventoryV03Tests(unittest.TestCase):
 
     def test_instance_fields(self):
         inst = self.data["instances"][0]
-        self.assertEqual(inst["instance"], "test-rx888")
-        # RADIOD-IDENTIFICATION.md §3.2: inventory radiod_id is the
-        # mDNS multicast status name, not the local `[[radiod]] id`
-        # label.  The fixture's [[radiod]] block has
-        # radiod_status="test-status.local", so that's the value
-        # exposed via inventory.
+        # RADIOD-IDENTIFICATION.md §3.1 (Phase 6): the mDNS multicast
+        # status name IS the identifier.  `instance` and `radiod_id`
+        # are both the canonical status name.
+        self.assertEqual(inst["instance"], "test-status.local")
         self.assertEqual(inst["radiod_id"], "test-status.local")
         self.assertEqual(inst["radiod_status_dns"], "test-status.local")
         self.assertIn("data_destination", inst)
@@ -150,28 +148,6 @@ class InventoryV03Tests(unittest.TestCase):
         self.assertIn(14080000, freqs)
         self.assertIn(7047500, freqs)
 
-    def test_inventory_radiod_id_falls_back_when_no_status(self):
-        """RADIOD-IDENTIFICATION.md §3.2 — when a legacy config has no
-        radiod_status / status_address declared, inventory radiod_id
-        falls back to the local `[[radiod]] id` label so the output is
-        still parseable.  Greenfield configs (which always set status)
-        get the multicast name in radiod_id; legacy configs keep the
-        old behavior under the migration window."""
-        from psk_recorder.contract import build_inventory
-        legacy_config = {
-            "station": {"callsign": "AC0G"},
-            "paths": {"log_dir": "/tmp/log", "spool_dir": "/tmp/spool"},
-            "radiod": [{
-                "id": "legacy-label",
-                # NO radiod_status field.
-                "ft8": {"freqs_hz": [14074000]},
-            }],
-        }
-        payload = build_inventory(legacy_config, Path("/tmp/legacy.toml"))
-        inst = payload["instances"][0]
-        self.assertEqual(inst["radiod_id"], "legacy-label")
-        self.assertEqual(inst["radiod_status_dns"], "")
-
     def test_log_paths_present(self):
         """§10: log_paths must be present and list the spot-log files.
 
@@ -183,9 +159,9 @@ class InventoryV03Tests(unittest.TestCase):
         """
         self.assertIn("log_paths", self.data)
         log_paths = self.data["log_paths"]
-        self.assertIn("test-rx888", log_paths)
-        self.assertIn("spots", log_paths["test-rx888"])
-        self.assertNotIn("process", log_paths["test-rx888"])
+        self.assertIn("test-status.local", log_paths)
+        self.assertIn("spots", log_paths["test-status.local"])
+        self.assertNotIn("process", log_paths["test-status.local"])
 
     def test_log_level_present(self):
         """v0.3 §11: log_level must be present."""
@@ -241,9 +217,8 @@ class ConfigTests(unittest.TestCase):
     def test_resolve_radiod_block(self):
         from psk_recorder.config import load_config, resolve_radiod_block
         config = load_config(TEST_CONFIG)
-        block = resolve_radiod_block(config, "test-rx888")
-        self.assertEqual(block["id"], "test-rx888")
-        self.assertEqual(block["radiod_status"], "test-status.local")
+        block = resolve_radiod_block(config, "test-status.local")
+        self.assertEqual(block["status"], "test-status.local")
 
     def test_resolve_radiod_block_missing(self):
         from psk_recorder.config import load_config, resolve_radiod_block
@@ -255,65 +230,34 @@ class ConfigTests(unittest.TestCase):
         from psk_recorder.config import load_config, resolve_radiod_block
         config = load_config(TEST_CONFIG)
         block = resolve_radiod_block(config, None)
-        self.assertEqual(block["id"], "test-rx888")
+        self.assertEqual(block["status"], "test-status.local")
 
     def test_get_freqs(self):
         from psk_recorder.config import get_freqs, load_config, resolve_radiod_block
         config = load_config(TEST_CONFIG)
-        block = resolve_radiod_block(config, "test-rx888")
+        block = resolve_radiod_block(config, "test-status.local")
         ft8 = get_freqs(block, "ft8")
         self.assertEqual(ft8, [14074000, 7074000])
         ft4 = get_freqs(block, "ft4")
         self.assertEqual(ft4, [14080000, 7047500])
 
 
-class RadiodSchemaPhase3Tests(unittest.TestCase):
-    """RADIOD-IDENTIFICATION.md §3.1 — new `status` field acceptance.
+class RadiodSchemaTests(unittest.TestCase):
+    """RADIOD-IDENTIFICATION.md §3.1 — canonical `status` field is the
+    only identifier (Phase 6 cutover removed legacy `id`/`radiod_status`
+    acceptance and the RADIOD_<ID>_STATUS env override)."""
 
-    Phase 3 of the canonical-naming cleanup adds `[[radiod]] status`
-    as the primary identifier (mDNS multicast name).  Legacy fields
-    (`id`, `radiod_status`, RADIOD_<ID>_STATUS env var) are still
-    accepted during the deprecation window but emit
-    DeprecationWarning."""
-
-    def test_resolve_status_prefers_new_field_no_warning(self):
-        import warnings
+    def test_resolve_status_reads_canonical_field(self):
         from psk_recorder.config import resolve_radiod_status
-        block = {
-            "status": "bee1-status.local",
-            # Legacy fields ignored when `status` is present.
-            "id": "should-be-ignored",
-            "radiod_status": "should-be-ignored-too.local",
-        }
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            result = resolve_radiod_status(block)
-        self.assertEqual(result, "bee1-status.local")
-        # No DeprecationWarning when the new field is used.
-        self.assertEqual(
-            [warning for warning in w
-             if issubclass(warning.category, DeprecationWarning)],
-            [])
+        block = {"status": "bee1-status.local"}
+        self.assertEqual(resolve_radiod_status(block), "bee1-status.local")
 
-    def test_resolve_status_legacy_radiod_status_warns(self):
-        import warnings
+    def test_resolve_status_missing_raises(self):
         from psk_recorder.config import resolve_radiod_status
-        block = {
-            "id": "legacy",
-            "radiod_status": "legacy.local",
-        }
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            result = resolve_radiod_status(block)
-        self.assertEqual(result, "legacy.local")
-        self.assertTrue(any(
-            issubclass(warning.category, DeprecationWarning)
-            and "radiod_status" in str(warning.message)
-            for warning in w))
+        with self.assertRaises(ValueError):
+            resolve_radiod_status({})
 
     def test_resolve_block_matches_status_field(self):
-        """A block with only `status` matches when caller passes the
-        multicast name."""
         from psk_recorder.config import resolve_radiod_block
         config = {"radiod": [
             {"status": "bee1-status.local", "ft8": {"freqs_hz": [14074000]}},
@@ -322,20 +266,11 @@ class RadiodSchemaPhase3Tests(unittest.TestCase):
         block = resolve_radiod_block(config, "bee1-status.local")
         self.assertEqual(block["status"], "bee1-status.local")
 
-    def test_resolve_block_legacy_id_match_warns(self):
-        import warnings
+    def test_resolve_block_missing_status_raises(self):
         from psk_recorder.config import resolve_radiod_block
-        config = {"radiod": [
-            {"id": "my-rx888", "ft8": {"freqs_hz": [14074000]}},
-        ]}
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            block = resolve_radiod_block(config, "my-rx888")
-        self.assertEqual(block["id"], "my-rx888")
-        self.assertTrue(any(
-            issubclass(warning.category, DeprecationWarning)
-            and "legacy `id`" in str(warning.message)
-            for warning in w))
+        config = {"radiod": [{"status": "only.local"}]}
+        with self.assertRaises(ValueError):
+            resolve_radiod_block(config, "nonexistent.local")
 
 
 if __name__ == "__main__":

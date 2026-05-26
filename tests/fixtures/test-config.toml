@@ -10,8 +10,7 @@ pskreporter = "/usr/local/bin/pskreporter-sender"
 keep_wav    = false
 
 [[radiod]]
-id            = "test-rx888"
-radiod_status = "test-status.local"
+status = "test-status.local"
 
 [radiod.ft8]
 sample_rate = 12000

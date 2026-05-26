@@ -33,27 +33,12 @@ from psk_recorder.config import (
 
 class TestDeriveSourceKey(unittest.TestCase):
 
-    def test_from_radiod_status_field(self):
-        block = {"id": "bee1", "radiod_status": "bee1-status.local"}
+    def test_from_status_field(self):
+        block = {"status": "bee1-status.local"}
         self.assertEqual(derive_source_key(block), "radiod:bee1-status.local")
 
-    def test_env_override_wins(self):
-        block = {"id": "bee1", "radiod_status": "stale-status.local"}
-        env_key = "RADIOD_BEE1_STATUS"
-        old = os.environ.get(env_key)
-        try:
-            os.environ[env_key] = "fresh-status.local"
-            self.assertEqual(
-                derive_source_key(block), "radiod:fresh-status.local",
-            )
-        finally:
-            if old is None:
-                os.environ.pop(env_key, None)
-            else:
-                os.environ[env_key] = old
-
     def test_missing_status_raises(self):
-        block = {"id": "no-status"}
+        block = {}  # post-cutover: no `status` = invalid block
         with self.assertRaises(ValueError):
             derive_source_key(block)
 
@@ -64,12 +49,12 @@ class TestEnsureSources(unittest.TestCase):
         """TOML's ``[radiod]`` (single dict) is accepted alongside
         ``[[radiod]]`` (list of dicts)."""
         config = {
-            "radiod": {"id": "rx888", "radiod_status": "rx888.local"},
+            "radiod": {"status": "rx888.local"},
         }
         sources = ensure_sources(config)
         self.assertEqual(len(sources), 1)
         self.assertEqual(sources[0]["key"], "radiod:rx888.local")
-        self.assertEqual(sources[0]["radiod_id"], "rx888")
+        self.assertEqual(sources[0]["radiod_id"], "rx888.local")
         self.assertEqual(sources[0]["status_address"], "rx888.local")
         # The original block is preserved so per-source freq lookups
         # (get_freqs, get_mode_params) keep working unchanged.
@@ -78,12 +63,9 @@ class TestEnsureSources(unittest.TestCase):
     def test_multiple_radiod_blocks(self):
         config = {
             "radiod": [
-                {"id": "local",
-                 "radiod_status": "local-status.local"},
-                {"id": "bee1",
-                 "radiod_status": "bee1-status.local"},
-                {"id": "bee2",
-                 "radiod_status": "bee2-status.local"},
+                {"status": "local-status.local"},
+                {"status": "bee1-status.local"},
+                {"status": "bee2-status.local"},
             ],
         }
         sources = ensure_sources(config)
@@ -95,19 +77,18 @@ class TestEnsureSources(unittest.TestCase):
         ])
 
     def test_unresolvable_block_skipped_not_raised(self):
-        """A block missing radiod_status (and no env override) is
-        silently skipped — callers should rely on
-        ``resolve_radiod_block`` to surface that as a hard error when
-        the block is actually selected."""
+        """A block missing the `status` field is silently skipped —
+        callers should rely on ``resolve_radiod_block`` to surface
+        that as a hard error when the block is actually selected."""
         config = {
             "radiod": [
-                {"id": "good", "radiod_status": "good.local"},
-                {"id": "bad"},                          # no status
+                {"status": "good.local"},
+                {},                          # no status
             ],
         }
         sources = ensure_sources(config)
         self.assertEqual(len(sources), 1)
-        self.assertEqual(sources[0]["radiod_id"], "good")
+        self.assertEqual(sources[0]["radiod_id"], "good.local")
 
     def test_empty_config(self):
         self.assertEqual(ensure_sources({}), [])
@@ -115,13 +96,13 @@ class TestEnsureSources(unittest.TestCase):
 
 
 class TestResolveRadiodStatusContract(unittest.TestCase):
-    """derive_source_key must call resolve_radiod_status, so the env
-    override path is the single source of truth.  Anchored here in
-    case someone "optimises" derive_source_key to read the field
-    directly later."""
+    """derive_source_key must call resolve_radiod_status so the
+    canonical `status` field is the single source of truth.  Anchored
+    here in case someone "optimises" derive_source_key to read the
+    field directly later."""
 
     def test_status_matches_resolver(self):
-        block = {"id": "anchored", "radiod_status": "anchored.local"}
+        block = {"status": "anchored.local"}
         self.assertEqual(
             derive_source_key(block),
             f"radiod:{resolve_radiod_status(block)}",

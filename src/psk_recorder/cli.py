@@ -369,7 +369,7 @@ def _handle_daemon(args):
         logger.info(
             "Starting psk-recorder daemon for radiod %s "
             "(config=%s, reporter_id=%s, single-source mode)",
-            radiod_block.get("id", "default"), config_path,
+            radiod_block.get("status", "<unconfigured>"), config_path,
             reporter_id or "<derived>",
         )
     else:

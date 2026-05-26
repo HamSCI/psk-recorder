@@ -86,20 +86,12 @@ class ReceiverManager:
     ) -> None:
         self._config = config
         self._radiod = radiod_block
-        self._radiod_id = radiod_block.get("id", "default")
-        # Phase-3 per-instance reporter ID
-        # (sigmond's MULTI-INSTANCE-ARCHITECTURE.md §3).  May be None
-        # in legacy shared-config deployments — ChTailer falls back
-        # to radiod_id-derived value so spot rows still carry the
-        # field during the deprecation window.
+        # RADIOD-IDENTIFICATION.md §3.1: the mDNS multicast status name
+        # IS the identifier.  No fallback — provision_channels would
+        # fail without it anyway.
+        self._radiod_id = resolve_radiod_status(radiod_block)
         self._reporter_id = reporter_id
-        try:
-            self._rx_source = derive_source_key(radiod_block)
-        except ValueError:
-            # Same fallback as PskRecorder — radiod_status will be
-            # demanded again by provision_channels, which fails loudly
-            # if still missing.
-            self._rx_source = f"radiod:{self._radiod_id}"
+        self._rx_source = f"radiod:{self._radiod_id}"
         self._spool_root = Path(spool_root) / self._radiod_id
         self._log_dir = Path(log_dir)
         self._radiod_lifetime_frames = int(radiod_lifetime_frames)

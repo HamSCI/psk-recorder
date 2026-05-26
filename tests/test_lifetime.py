@@ -56,7 +56,7 @@ class ConfigDefaultsTests(unittest.TestCase):
         # No [processing] section at all — should default to 6000.
         path = self._write_config(
             '[paths]\nspool_dir = "/tmp/x"\n'
-            '[[radiod]]\nid = "x"\nradiod_status = "host"\n'
+            '[[radiod]]\nstatus = "host"\n'
         )
         cfg = load_config(path)
         self.assertEqual(
@@ -66,7 +66,7 @@ class ConfigDefaultsTests(unittest.TestCase):
     def test_explicit_value_honored(self):
         path = self._write_config(
             '[processing]\nradiod_lifetime_frames = 3000\n'
-            '[[radiod]]\nid = "x"\nradiod_status = "host"\n'
+            '[[radiod]]\nstatus = "host"\n'
         )
         cfg = load_config(path)
         self.assertEqual(
@@ -77,7 +77,7 @@ class ConfigDefaultsTests(unittest.TestCase):
         # 0 is the sentinel for "don't send LIFETIME, no keep-alive."
         path = self._write_config(
             '[processing]\nradiod_lifetime_frames = 0\n'
-            '[[radiod]]\nid = "x"\nradiod_status = "host"\n'
+            '[[radiod]]\nstatus = "host"\n'
         )
         cfg = load_config(path)
         self.assertEqual(cfg["processing"]["radiod_lifetime_frames"], 0)
@@ -85,7 +85,7 @@ class ConfigDefaultsTests(unittest.TestCase):
     def test_negative_rejected(self):
         path = self._write_config(
             '[processing]\nradiod_lifetime_frames = -1\n'
-            '[[radiod]]\nid = "x"\nradiod_status = "host"\n'
+            '[[radiod]]\nstatus = "host"\n'
         )
         with self.assertRaisesRegex(ValueError, "radiod_lifetime_frames"):
             load_config(path)
@@ -93,7 +93,7 @@ class ConfigDefaultsTests(unittest.TestCase):
     def test_non_int_rejected(self):
         path = self._write_config(
             '[processing]\nradiod_lifetime_frames = "many"\n'
-            '[[radiod]]\nid = "x"\nradiod_status = "host"\n'
+            '[[radiod]]\nstatus = "host"\n'
         )
         with self.assertRaisesRegex(ValueError, "radiod_lifetime_frames"):
             load_config(path)
@@ -117,7 +117,7 @@ class _RecorderForKeepAliveTests:
             "station": {},
             "processing": {"radiod_lifetime_frames": lifetime_frames},
         }
-        radiod = {"id": "test", "radiod_status": "host"}
+        radiod = {"status": "host"}
         return PskRecorder(cfg, radiod)
 
 

@@ -37,13 +37,6 @@ decoder_decode_ft8  = "/usr/local/bin/decode_ft8"
 # the operator runs the configurator.
 status = "<configure-via-config-init>"
 
-# Legacy fields below are accepted during the Phase 3 deprecation
-# window (RADIOD-IDENTIFICATION.md §6).  Greenfield installs should
-# leave them out; existing deployments can keep them until the
-# operator runs the configurator to migrate to the `status` field.
-# id            = "my-rx888"
-# radiod_status = "my-rx888-status.local"
-
 [radiod.ft8]
 sample_rate = 12000
 preset      = "usb"

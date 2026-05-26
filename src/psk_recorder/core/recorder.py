@@ -28,6 +28,7 @@ from psk_recorder.config import (
     FT8_CADENCE_SEC,
     derive_source_key,
     get_freqs,
+    resolve_radiod_status,
 )
 # ChannelSink imports numpy via psk_recorder.core.stream — kept under
 # TYPE_CHECKING so this module imports cleanly in lightweight test
@@ -251,7 +252,8 @@ class PskRecorder:
         # — including the canonical ``rx_source`` tag — belongs in
         # the corresponding ReceiverManager.
         self._radiod = self._radiod_blocks[0]
-        self._radiod_id = self._radiod.get("id", "default")
+        # Phase 6: canonical identifier is the mDNS status name.
+        self._radiod_id = resolve_radiod_status(self._radiod)
         self._paths = config.get("paths", {})
         self._station = config.get("station", {})
 
