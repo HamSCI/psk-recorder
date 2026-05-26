@@ -127,7 +127,12 @@ class InventoryV03Tests(unittest.TestCase):
     def test_instance_fields(self):
         inst = self.data["instances"][0]
         self.assertEqual(inst["instance"], "test-rx888")
-        self.assertEqual(inst["radiod_id"], "test-rx888")
+        # RADIOD-IDENTIFICATION.md §3.2: inventory radiod_id is the
+        # mDNS multicast status name, not the local `[[radiod]] id`
+        # label.  The fixture's [[radiod]] block has
+        # radiod_status="test-status.local", so that's the value
+        # exposed via inventory.
+        self.assertEqual(inst["radiod_id"], "test-status.local")
         self.assertEqual(inst["radiod_status_dns"], "test-status.local")
         self.assertIn("data_destination", inst)
         self.assertIn("ka9q_channels", inst)
@@ -144,6 +149,28 @@ class InventoryV03Tests(unittest.TestCase):
         self.assertIn(7074000, freqs)
         self.assertIn(14080000, freqs)
         self.assertIn(7047500, freqs)
+
+    def test_inventory_radiod_id_falls_back_when_no_status(self):
+        """RADIOD-IDENTIFICATION.md §3.2 — when a legacy config has no
+        radiod_status / status_address declared, inventory radiod_id
+        falls back to the local `[[radiod]] id` label so the output is
+        still parseable.  Greenfield configs (which always set status)
+        get the multicast name in radiod_id; legacy configs keep the
+        old behavior under the migration window."""
+        from psk_recorder.contract import build_inventory
+        legacy_config = {
+            "station": {"callsign": "AC0G"},
+            "paths": {"log_dir": "/tmp/log", "spool_dir": "/tmp/spool"},
+            "radiod": [{
+                "id": "legacy-label",
+                # NO radiod_status field.
+                "ft8": {"freqs_hz": [14074000]},
+            }],
+        }
+        payload = build_inventory(legacy_config, Path("/tmp/legacy.toml"))
+        inst = payload["instances"][0]
+        self.assertEqual(inst["radiod_id"], "legacy-label")
+        self.assertEqual(inst["radiod_status_dns"], "")
 
     def test_log_paths_present(self):
         """§10: log_paths must be present and list the spot-log files.

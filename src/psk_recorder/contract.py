@@ -41,7 +41,8 @@ def build_inventory(config: dict, config_path: Path) -> dict:
     all_log_paths: dict[str, Any] = {}
 
     for block in radiod_blocks:
-        radiod_id = block.get("id", "default")
+        radiod_id = block.get("id", "default")  # local label; used for
+                                                # env-var keys, log paths
         ft8_freqs = get_freqs(block, "ft8")
         ft4_freqs = get_freqs(block, "ft4")
         all_freqs = sorted(set(ft8_freqs + ft4_freqs))
@@ -50,6 +51,15 @@ def build_inventory(config: dict, config_path: Path) -> dict:
             status_dns = resolve_radiod_status(block)
         except ValueError:
             status_dns = block.get("radiod_status", "")
+
+        # RADIOD-IDENTIFICATION.md §3.2 — inventory radiod_id is the
+        # mDNS control/status multicast name (the only functional
+        # identifier).  Fall back to the local label when the operator
+        # hasn't declared radiod_status yet, so legacy configs still
+        # produce parseable inventory.  The local `radiod_id` variable
+        # remains the per-block label for env-var lookups and file
+        # naming — that internal use isn't changing in Phase 2.
+        inventory_radiod_id = status_dns or radiod_id
 
         chain_delay_env = f"RADIOD_{radiod_id.upper().replace('-', '_')}_CHAIN_DELAY_NS"
         chain_delay_raw = os.environ.get(chain_delay_env)
@@ -86,7 +96,7 @@ def build_inventory(config: dict, config_path: Path) -> dict:
 
         instance = {
             "instance": radiod_id,
-            "radiod_id": radiod_id,
+            "radiod_id": inventory_radiod_id,
             "host": "localhost",
             "radiod_status_dns": status_dns,
             "data_destination": None,
