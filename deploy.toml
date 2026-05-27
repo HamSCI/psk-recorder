@@ -86,3 +86,9 @@ verb         = "psk"
 description  = "PSK Reporter ft8/ft4 cycles + flushes"
 verbose      = true
 per_instance = true
+
+[client_features.verifier]
+verb         = "psk"
+description  = "PSK Reporter upload audit (lost / in-flight / delivered / cadence)"
+kind         = "spot_queue"
+per_instance = true
