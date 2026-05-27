@@ -54,6 +54,20 @@ if ! id -u "$SERVICE_USER" &>/dev/null; then
             "$SERVICE_USER"
 fi
 
+# Add SERVICE_USER to the sigmond supplementary group so psk-recorder can
+# write to /var/lib/hs-uploader/watermarks.db and /var/lib/sigmond/sink.db.
+# (The sigmond group is created by sigmond/install.sh, and the shared
+# /var/lib/hs-uploader dir is provisioned by hs-uploader/install.sh's
+# tmpfiles.d entry.  If neither has run yet, skip — re-run after they have.)
+if getent group sigmond &>/dev/null; then
+    if ! id -nG "$SERVICE_USER" 2>/dev/null | tr ' ' '\n' | grep -qx sigmond; then
+        usermod -a -G sigmond "$SERVICE_USER"
+        ui_info "Added $SERVICE_USER to sigmond group"
+    fi
+else
+    ui_info "sigmond group not present yet — re-run after sigmond install"
+fi
+
 # --- Phase 1.4: ensure uv is on PATH (canonical sigmond-suite installer) ---
 # Delegates to sigmond's shared helper if present; inline fallback for
 # the bootstrap case.  Keep the fallback in sync with
