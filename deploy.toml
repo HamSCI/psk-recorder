@@ -92,3 +92,9 @@ verb         = "psk"
 description  = "PSK Reporter upload audit (lost / in-flight / delivered / cadence)"
 kind         = "spot_queue"
 per_instance = true
+
+[client_features.receiver_channels]
+description  = "FT4/FT8 spot channels (per-mode freqs_hz)"
+per_instance = true
+parser_file  = "src/psk_recorder/sigmond_tui.py"
+parser_attr  = "parse_receiver_channels"
