@@ -44,8 +44,19 @@ example        = "G5RV @ 10m"
 required       = false
 
 # --- Paths ---------------------------------------------------------
+#
+# 2026-05-29 three-tier audit:
+#   * spool_dir, log_dir, decoder*, pskreporter, pskreporter_tcp
+#     are tier-1 install-canonical (FHS dirs / install-canonical
+#     binary paths / protocol detail) and are marked `hidden = true`
+#     so the Textual wizard skips them.  Bodies are kept intact so
+#     whiptail / $EDITOR users still see the help when editing the
+#     file directly.
+#   * decoder_kind is tier-2 (operator picks decode_ft8 vs jt9).
+#   * keep_wav is tier-2 (debug flag).
 
 [paths.spool_dir]
+hidden = true
 title          = "WAV spool directory"
 help           = """Where psk-recorder writes raw FT8/FT4 audio slices
 before decoding.  One sub-directory per radiod ID and mode, e.g.
@@ -56,6 +67,7 @@ example        = "/var/lib/psk-recorder"
 required       = false
 
 [paths.log_dir]
+hidden = true
 title          = "Spot-log directory"
 help           = """Where psk-recorder writes per-radiod, per-mode spot
 logs (``<radiod_id>-{ft8,ft4}.log``).  These are append-only text logs
@@ -66,18 +78,21 @@ required       = false
 [paths.decoder_kind]
 title          = "Decoder kind"
 help           = """Which FT8/FT4 decoder psk-recorder invokes per
-slot.  Only one option supported today:
+slot:
 
   decode_ft8   ka9q/ft8_lib decoder; streams to stdout, reports an
                ft8_lib-internal score (not a calibrated dB SNR),
                costs ~0.05 s CPU and ~4 MB RSS per slot per band.
+  jt9          WSJT-X's jt9 decoder; calibrated dB SNR, slower but
+               more accurate signal-quality reporting.
 
 Rows in psk.spots self-identify via the decoder_kind column."""
 example        = "decode_ft8"
-validator_hint = "decode_ft8"
+validator_hint = '"decode_ft8" or "jt9"'
 required       = false
 
 [paths.decoder_decode_ft8]
+hidden = true
 title          = "decode_ft8 binary path"
 help           = """Absolute path to the ``decode_ft8`` binary from
 https://github.com/ka9q/ft8_lib.  Must be on PATH or absolute.
@@ -89,7 +104,14 @@ example        = "/usr/local/bin/decode_ft8"
 validator_hint = "absolute path to an executable file"
 required       = false
 
+[paths.decoder]
+hidden = true
+
+[paths.decoder_jt9]
+hidden = true
+
 [paths.pskreporter]
+hidden = true
 title          = "pskreporter binary path"
 help           = """Absolute path to the ``pskreporter`` binary (or
 the local ``pskreporter-sender`` wrapper) from
@@ -101,6 +123,7 @@ validator_hint = "absolute path to an executable file"
 required       = false
 
 [paths.pskreporter_tcp]
+hidden = true
 title          = "Use TCP transport to pskreporter-sender?"
 help           = """How psk-recorder feeds spots into the
 pskreporter-sender subprocess:
@@ -123,6 +146,44 @@ band per mode at the default 12 kHz sample rate."""
 example        = "false"
 validator_hint = "true or false"
 required       = false
+
+# --- Optional PSWS identifiers (tier 2, only used if PSWS-uploading) -
+
+[station.psws_station_id]
+title          = "PSWS station ID (optional)"
+help           = """The PSWS-assigned station ID, if this psk-recorder
+also feeds PSWS.  Leave empty for pskreporter-only operation."""
+required       = false
+
+[station.psws_instrument_id]
+title          = "PSWS instrument ID (optional)"
+help           = """Per-instrument PSWS identifier, if PSWS-uploading."""
+required       = false
+
+# --- Radiod per-mode protocol constants (tier 1, hidden) ------------
+#
+# [radiod.ft8] / [radiod.ft4] sample_rate (12 kHz), preset (usb),
+# encoding (s16be) are WSJT-X protocol requirements.  freqs_hz is
+# the band list — wizard-skipped today (list-of-int), but operators
+# can edit raw TOML via "Edit raw TOML in $EDITOR".
+
+[radiod.ft8.sample_rate]
+hidden = true
+
+[radiod.ft8.preset]
+hidden = true
+
+[radiod.ft8.encoding]
+hidden = true
+
+[radiod.ft4.sample_rate]
+hidden = true
+
+[radiod.ft4.preset]
+hidden = true
+
+[radiod.ft4.encoding]
+hidden = true
 
 # --- Processing (advanced) -----------------------------------------
 
