@@ -63,25 +63,30 @@ def write_wav(
         _set_xattrs(path, sample_rate, frequency_hz)
 
 
-# RMS-target normalization. Per-slot peak-norm (789064f, reverted in
-# 50bd7d9) failed because one transient sets the peak and scales every
-# other sample into the noise floor. RMS is dominated by bulk signal,
-# not spikes, so one impulse barely moves it. MAX_GAIN ceilings silent
-# slots so pure noise doesn't get amplified into saturating garbage.
-_TARGET_RMS_INT16 = 2000.0   # ~ -24 dBFS, leaves ~24 dB peak headroom
-_MAX_GAIN = 2000.0
+# Peak-normalize to -1 dBFS, matching wspr-recorder's wav_writer
+# (per-slot peak -> full int16 range).  An earlier per-slot peak-norm
+# here (789064f, reverted 50bd7d9) was abandoned in the s16-channel era:
+# one transient set the peak and scaled the already-quantized signal
+# into the noise floor.  With f32 channels the full dynamic range
+# survives to this point, so peak-norm uses the whole int16 range for
+# low-level signals (e.g. a 25 dB-down FT8 channel) instead of letting
+# them quantize into the floor.
+_PEAK_TARGET_INT16 = 32767.0 * (10.0 ** (-1.0 / 20.0))   # -1 dBFS ~= 29205
 
 
 def _float32_to_int16(samples: np.ndarray) -> np.ndarray:
-    """Convert float32 audio to int16 with RMS-target normalization."""
+    """Peak-normalize float32 audio to int16 at -1 dBFS.
+
+    REQUIRES f32 channels on the wire: an s16 channel is already
+    quantized at the radiod before we see it, so this cannot recover
+    what s16 has thrown away.
+    """
     if samples.size == 0:
         return np.zeros(0, dtype=np.int16)
-    rms = float(np.sqrt(np.mean(samples.astype(np.float64) ** 2)))
-    if rms > 0.0:
-        gain = min(_TARGET_RMS_INT16 / (rms * 32767.0), _MAX_GAIN)
-    else:
-        gain = 1.0
-    scaled = samples * gain * 32767.0
+    peak = float(np.abs(samples).max())
+    if peak <= 0.0:
+        return np.zeros(samples.size, dtype=np.int16)
+    scaled = samples * (_PEAK_TARGET_INT16 / peak)
     return np.clip(scaled, -32768.0, 32767.0).astype(np.int16)
 
 

@@ -204,8 +204,20 @@ class ReceiverManager:
             params = get_mode_params(self._radiod, mode)
             sample_rate = params["sample_rate"]
             preset = params["preset"]
-            encoding_str = params.get("encoding", "s16be")
-            encoding_int = _resolve_encoding(encoding_str)
+            # The WAV writer (wav.py) peak-normalizes f32 -> s16be at
+            # write time, so radiod MUST emit f32 on the wire: an s16
+            # channel quantizes a low-level signal (e.g. a 25 dB-down FT8
+            # channel) into the noise floor at the radiod before we ever
+            # see it.  Force f32 regardless of the config `encoding` key.
+            cfg_encoding = params.get("encoding", "f32")
+            if cfg_encoding.lower() not in ("f32", "f32le"):
+                logger.warning(
+                    "ReceiverManager %s: %s config encoding=%s ignored; "
+                    "forcing f32 (WAV writer requires float32 channel input)",
+                    self._radiod_id, mode.upper(), cfg_encoding,
+                )
+            encoding_str = "f32"
+            encoding_int = _resolve_encoding("f32")
 
             log_path = self._log_dir / f"{self._radiod_id}-{mode}.log"
             if mode not in self._log_fds:
