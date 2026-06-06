@@ -33,6 +33,14 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
+# decode_ft8 (ka9q/ft8_lib) reports a fixed ~0.65 s dt offset vs WSJT-X/jt9
+# — verified 2026-06-05 by decoding the same on-time WAV with both (jt9
+# +0.17 s, decode_ft8 +0.82 s; the recording is on-time, this is a decoder
+# convention). Subtract it from FT8 dt so psk.spots and PSK Reporter uploads
+# use the WSJT-X dt convention. FT4 carries its own offset and is left raw.
+# Tunable via env; 0 restores the raw decoder value.
+_FT8_DT_CAL_SEC = float(os.environ.get("PSK_FT8_DT_CAL_SEC", "0.65"))
+
 
 # ── Line parser ─────────────────────────────────────────────────────────────
 
@@ -103,6 +111,9 @@ def parse_decode_ft8_line(line: str, *, mode: str) -> Optional[dict]:
         ).replace(tzinfo=timezone.utc)
         score = int(parts[2])
         dt = float(parts[3])
+        if mode == "ft8":
+            # WSJT-X dt convention for the sink/uploads (see _FT8_DT_CAL_SEC).
+            dt -= _FT8_DT_CAL_SEC
         freq = float(parts[4].replace(",", "").replace(" ", ""))
     except (ValueError, IndexError):
         return None
