@@ -40,6 +40,12 @@ logger = logging.getLogger(__name__)
 # use the WSJT-X dt convention. FT4 carries its own offset and is left raw.
 # Tunable via env; 0 restores the raw decoder value.
 _FT8_DT_CAL_SEC = float(os.environ.get("PSK_FT8_DT_CAL_SEC", "0.65"))
+# FT4 carries its own (larger, ceil-labelled) decode_ft8 offset. FT4 was too
+# sparse/short-lived to catch a clean jt9 comparison 2026-06-06, so this 0.6
+# default is from the production raw FT4 dt average (~+0.6, true dt ~0 for
+# NTP-aligned TX). Refine via PSK_FT4_DT_CAL_SEC after a clean jt9 -5 vs
+# decode_ft8 -4 measurement on a busy FT4 band.
+_FT4_DT_CAL_SEC = float(os.environ.get("PSK_FT4_DT_CAL_SEC", "0.6"))
 
 
 # ── Line parser ─────────────────────────────────────────────────────────────
@@ -114,6 +120,8 @@ def parse_decode_ft8_line(line: str, *, mode: str) -> Optional[dict]:
         if mode == "ft8":
             # WSJT-X dt convention for the sink/uploads (see _FT8_DT_CAL_SEC).
             dt -= _FT8_DT_CAL_SEC
+        elif mode == "ft4":
+            dt -= _FT4_DT_CAL_SEC
         freq = float(parts[4].replace(",", "").replace(" ", ""))
     except (ValueError, IndexError):
         return None
