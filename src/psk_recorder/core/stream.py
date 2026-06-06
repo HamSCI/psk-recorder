@@ -43,6 +43,7 @@ through any client-side wall-clock comparison.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Optional
@@ -78,7 +79,7 @@ class ChannelSink:
         spool_spots: bool = False,
         radiod_id: str = "",
         fault_reporter=None,
-        fault_threshold_sec: float = 0.25,
+        fault_threshold_sec: float = 0.35,
     ):
         self._mode = mode
         self._frequency_hz = frequency_hz
@@ -126,7 +127,16 @@ class ChannelSink:
         # fresh, so re-anchoring lands on radiod's current GPS reference.
         self._radiod_id = radiod_id
         self._fault_reporter = fault_reporter
-        self._fault_threshold_sec = fault_threshold_sec
+        # Threshold + persistence env-tunable.  0.35 s sits above the ~0.28 s
+        # post-restart anchor-settling and the ~0.45 s status-anchor jitter
+        # cadence; requiring _fault_after consecutive ~1 Hz over-threshold
+        # checks filters a lone jitter spike while still catching a sustained
+        # real divergence (e.g. bee1's -1.5 s).
+        self._fault_threshold_sec = float(
+            os.environ.get("PSK_TIMING_FAULT_SEC", str(fault_threshold_sec)))
+        self._fault_after = max(1, int(
+            os.environ.get("PSK_TIMING_FAULT_AFTER", "2")))
+        self._fault_strikes = 0
         self._last_check_mono = 0.0
         self._last_reanchor_mono = 0.0
         self._reanchor_cooldown_sec = 30.0
@@ -249,7 +259,14 @@ class ChannelSink:
             return
         divergence = projected_utc - reference
         if abs(divergence) <= self._fault_threshold_sec:
+            self._fault_strikes = 0
             return
+        # Persistence: require _fault_after consecutive over-threshold checks
+        # (~1 s apart) before acting, so a lone jitter spike doesn't re-anchor.
+        self._fault_strikes += 1
+        if self._fault_strikes < self._fault_after:
+            return
+        self._fault_strikes = 0
         if mono - self._last_reanchor_mono < self._reanchor_cooldown_sec:
             return
         self._last_reanchor_mono = mono
