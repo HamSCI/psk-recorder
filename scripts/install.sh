@@ -145,6 +145,43 @@ _ensure_sibling callhash    https://github.com/mijahauan/callhash
 _ensure_sibling hs-uploader https://github.com/mijahauan/hs-uploader
 _ensure_sibling ka9q-python https://github.com/mijahauan/ka9q-python
 
+# --- Phase 1.6: native FT8/FT4 decoder (ka9q/ft8_lib -> /usr/local/bin/decode_ft8) ---
+# psk-recorder forks decode_ft8 once per slot.  It is an upstream C binary, not
+# bundled, so we pin it to a known-good commit, build idempotently, and install
+# to /usr/local/bin -- the same owns-its-native-dep pattern hfdl-recorder uses
+# for dumphfdl (see sigmond/docs/native-binaries.md).
+FT8LIB_DIR="/opt/git/sigmond/ft8_lib"
+FT8LIB_URL="https://github.com/ka9q/ft8_lib"
+FT8LIB_PIN="400e236304bbae63ed3c342e6c36bf860c8c0425"
+DECODE_FT8="/usr/local/bin/decode_ft8"
+
+_ensure_decode_ft8() {
+    if [[ -x "$DECODE_FT8" && -f "$FT8LIB_DIR/.pin" \
+          && "$(cat "$FT8LIB_DIR/.pin" 2>/dev/null)" == "$FT8LIB_PIN" ]]; then
+        ui_info "decode_ft8 present and current (ft8_lib @ ${FT8LIB_PIN:0:12})"
+        return 0
+    fi
+    if command -v apt-get >/dev/null 2>&1 && ! dpkg -s libbsd-dev >/dev/null 2>&1; then
+        ui_info "Installing build dep: libbsd-dev"
+        apt-get install -y -q libbsd-dev || { ui_error "failed to install libbsd-dev"; return 1; }
+    fi
+    if [[ ! -d "$FT8LIB_DIR/.git" ]]; then
+        ui_info "Cloning ka9q/ft8_lib -> $FT8LIB_DIR"
+        git clone "$FT8LIB_URL" "$FT8LIB_DIR" || { ui_error "clone ft8_lib failed"; return 1; }
+    fi
+    git -C "$FT8LIB_DIR" -c safe.directory='*' fetch --quiet origin "$FT8LIB_PIN" 2>/dev/null ||         git -C "$FT8LIB_DIR" -c safe.directory='*' fetch --quiet --all 2>/dev/null || true
+    git -C "$FT8LIB_DIR" -c safe.directory='*' checkout --quiet "$FT8LIB_PIN" || {
+        ui_error "ft8_lib checkout $FT8LIB_PIN failed"; return 1; }
+    ui_info "Building decode_ft8 (ft8_lib @ ${FT8LIB_PIN:0:12})"
+    make -C "$FT8LIB_DIR" decode_ft8 || { ui_error "make decode_ft8 failed"; return 1; }
+    install -m 0755 "$FT8LIB_DIR/decode_ft8" "$DECODE_FT8" || { ui_error "install decode_ft8 failed"; return 1; }
+    echo "$FT8LIB_PIN" > "$FT8LIB_DIR/.pin"
+    ui_info "Installed $DECODE_FT8 (ft8_lib @ ${FT8LIB_PIN:0:12})"
+}
+# Non-fatal: psk-recorder still records slots without it; it just cannot decode
+# until decode_ft8 exists.  Surface clearly rather than aborting the install.
+_ensure_decode_ft8 || ui_error "decode_ft8 unavailable -- psk-recorder will record but NOT decode until it is built"
+
 # --- Phase 2: repo + venv ---
 if [[ ! -d "$REPO_SOURCE" ]]; then
     ui_info "Linking $REPO_ROOT -> $REPO_SOURCE"
