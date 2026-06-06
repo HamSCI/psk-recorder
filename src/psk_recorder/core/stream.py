@@ -76,6 +76,9 @@ class ChannelSink:
         authority_reader: Optional[AuthorityReader] = None,
         decoder_kind: str = "decode_ft8",
         spool_spots: bool = False,
+        radiod_id: str = "",
+        fault_reporter=None,
+        fault_threshold_sec: float = 0.25,
     ):
         self._mode = mode
         self._frequency_hz = frequency_hz
@@ -118,6 +121,15 @@ class ChannelSink:
         # can still inspect what hf-timestd is publishing.  Not used for
         # anchoring anymore — the one-shot anchor read is the only path.
         self._reader = authority_reader if authority_reader is not None else AuthorityReader()
+        # Timing-fault detector state (see _maybe_check_timing).  A
+        # StatusListener keeps self._channel_info's (gps_time, rtp_timesnap)
+        # fresh, so re-anchoring lands on radiod's current GPS reference.
+        self._radiod_id = radiod_id
+        self._fault_reporter = fault_reporter
+        self._fault_threshold_sec = fault_threshold_sec
+        self._last_check_mono = 0.0
+        self._last_reanchor_mono = 0.0
+        self._reanchor_cooldown_sec = 30.0
 
     @property
     def mode(self) -> str:
@@ -197,8 +209,54 @@ class ChannelSink:
             self._anchor_utc + delta_samples / self._sample_rate
         )
 
+        # Detect → alarm → re-anchor (operator principle 2026-06-05):
+        # compare this projection against radiod's fresh GPS reference for
+        # the same RTP value; on a gross divergence raise a loud fault AND
+        # drop the anchor so the next batch re-anchors off the fresh status
+        # snapshot, recovering decode timing instead of drifting silently.
+        self._maybe_check_timing(quality, n, utc_of_first)
+
         self._ring.push(samples, utc_of_first)
         self._total_delivered = quality.total_samples_delivered
+
+    def _maybe_check_timing(self, quality, n, projected_utc) -> None:
+        """Compare the sample-count projection against radiod's fresh GPS
+        reference (rtp_to_wallclock on the StatusListener-refreshed
+        channel_info) for the same RTP value.  Throttled to ~1 Hz.  On a
+        divergence past ``_fault_threshold_sec`` raise a loud fault and
+        re-anchor; a cooldown stops one fault re-anchoring every batch."""
+        if self._fault_reporter is None or self._channel_info is None:
+            return
+        mono = time.monotonic()
+        if mono - self._last_check_mono < 1.0:
+            return
+        self._last_check_mono = mono
+        first_rtp = getattr(quality, "first_rtp_timestamp", 0)
+        if not first_rtp:
+            return
+        try:
+            from ka9q import rtp_to_wallclock
+            batch_start_sample = quality.total_samples_delivered - n
+            rtp_ts = (first_rtp + batch_start_sample) & 0xFFFFFFFF
+            reference = rtp_to_wallclock(
+                rtp_ts, self._channel_info, wallclock_hint_sec=projected_utc,
+            )
+        except Exception as e:  # noqa: BLE001 — detection must not crash audio
+            logger.debug("%s %d Hz: timing check raised: %s",
+                         self._mode.upper(), self._frequency_hz, e)
+            return
+        if reference is None:
+            return
+        divergence = projected_utc - reference
+        if abs(divergence) <= self._fault_threshold_sec:
+            return
+        if mono - self._last_reanchor_mono < self._reanchor_cooldown_sec:
+            return
+        self._last_reanchor_mono = mono
+        self._fault_reporter.report(self._mode, self._frequency_hz, divergence)
+        # Re-anchor: clear the frozen anchor; the next batch recomputes it
+        # from the fresh (StatusListener-refreshed) channel_info.
+        self._anchor_utc = None
 
     def _compute_initial_anchor(self, samples: np.ndarray, quality):
         """Return (anchor_utc, source) for the very first batch.
