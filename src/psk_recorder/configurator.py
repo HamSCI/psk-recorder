@@ -111,6 +111,29 @@ def cmd_config_edit(args) -> int:
     return _legacy_config_edit(args)
 
 
+def _enable_instance(radiod_id: str) -> None:
+    """Enable the systemd instance for this radiod id so sigmond's lifecycle
+    (and a plain `systemctl start`) bring it up.  Best-effort: a missing
+    systemctl or lack of privilege is non-fatal -- the config is still written."""
+    import shutil
+    import subprocess
+    if not radiod_id:
+        return
+    sctl = shutil.which("systemctl")
+    if not sctl:
+        return
+    unit = f"psk-recorder@{radiod_id}.service"
+    try:
+        r = subprocess.run([sctl, "enable", unit], capture_output=True, text=True)
+    except OSError:
+        return
+    if r.returncode == 0:
+        _ok(f"enabled {unit}")
+    else:
+        _info(f"(could not enable {unit} -- enable manually: "
+              f"sudo systemctl enable {unit})")
+
+
 def _legacy_config_init(args) -> int:
     target = _resolve_target(args)
     if target.exists() and not getattr(args, "reconfig", False):
@@ -131,14 +154,15 @@ def _legacy_config_init(args) -> int:
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(body)
     _ok(f"wrote {target}")
+    _enable_instance(values["radiod_id"])
     _info(f"reporter: {values['callsign']}    grid: {values['grid']}")
     _info(f"radiod:   id={values['radiod_id']}  status={values['radiod_status']}")
     _info("")
     _info("Next steps:")
     _info(f"  1. Review the FT8/FT4 freq_hz arrays in {target}")
     _info(f"  2. Validate: psk-recorder validate --json")
-    _info(f"  3. Start:    sudo systemctl enable --now "
-          f"psk-recorder@{values['radiod_id']}.service")
+    _info(f"  3. Start:    sudo systemctl start "
+          f"psk-recorder@{values['radiod_id']}.service  (instance already enabled)")
     return 0
 
 

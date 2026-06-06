@@ -276,12 +276,16 @@ ui_info "Post-install verify OK"
 
 # --- Phase 3: config ---
 mkdir -p "$CONFIG_DIR"
-if [[ ! -f "$CONFIG_FILE" ]]; then
-    ui_info "Rendering config template -> $CONFIG_FILE"
-    cp "$REPO_SOURCE/config/psk-recorder-config.toml.template" "$CONFIG_FILE"
-    ui_warn "Edit $CONFIG_FILE with your callsign, grid, and radiod settings"
+# The config is created by `psk-recorder config init` (or `smd config init
+# psk-recorder`), which fills callsign/grid/radiod from the sigmond CONTRACT
+# §14 env bag.  The installer no longer pre-renders a placeholder here: a
+# placeholder made `config init` refuse ("already exists, pass --reconfig")
+# and made Phase 7 enable a phantom @default instance whose radiod id never
+# matched the one `config init` later wrote.
+if [[ -f "$CONFIG_FILE" ]]; then
+    ui_info "Config exists at $CONFIG_FILE — leaving it untouched"
 else
-    ui_info "Config exists at $CONFIG_FILE — not overwriting"
+    ui_info "No config yet — run: smd config init psk-recorder  (or: psk-recorder config init)"
 fi
 
 # --- Phase 4: directories ---
@@ -322,29 +326,12 @@ for pattern in 'ft8-decode.service' 'ft4-decode.service' \
     done
 done
 
-# --- Phase 7: enable instances ---
-ui_info "Parsing radiod IDs from $CONFIG_FILE"
-RADIOD_IDS=$("$VENV_DIR/bin/python3" -c "
-import tomllib
-with open('$CONFIG_FILE', 'rb') as f:
-    cfg = tomllib.load(f)
-blocks = cfg.get('radiod', [])
-if isinstance(blocks, dict):
-    blocks = [blocks]
-for b in blocks:
-    print(b.get('id', 'default'))
-" 2>/dev/null)
+# --- Phase 7: instances ---
+# Instance enablement follows configuration, not installation.  `config init`
+# enables psk-recorder@<radiod-id> for the id(s) it writes, so sigmond's
+# lifecycle discovers and starts the right instance.  There is nothing to
+# enable here until at least one radiod has been configured.
 
-if [[ -z "$RADIOD_IDS" ]]; then
-    ui_warn "No radiod IDs found in config — no instances enabled"
-else
-    for rid in $RADIOD_IDS; do
-        ui_info "Enabling psk-recorder@${rid}.service"
-        systemctl enable "psk-recorder@${rid}.service"
-        # Don't start yet — daemon is Phase 1 stub
-        ui_info "  (not starting — daemon not yet implemented)"
-    done
-fi
-
-ui_info "Install complete. Edit $CONFIG_FILE then start instances with:"
-ui_info "  sudo systemctl start psk-recorder@<radiod-id>"
+ui_info "Install complete. Configure + start with:"
+ui_info "  smd config init psk-recorder   # or: sudo psk-recorder config init"
+ui_info "  smd start --components psk-recorder"
