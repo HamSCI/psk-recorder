@@ -118,6 +118,11 @@ class ChannelSink:
         self._anchor_utc: Optional[float] = None
         self._anchor_total_samples: int = 0
         self._anchor_source: str = ""        # diagnostic: "rtp_to_wallclock" | "wallclock_fallback"
+        # ChannelInfo.anchor_epoch observed when the current anchor was set.
+        # When the StatusListener bumps it (radiod stepped its RTP↔GPS
+        # offset), we re-anchor immediately off the fresh snapshot rather
+        # than waiting for the projection-divergence gate to trip.
+        self._anchor_epoch: Optional[int] = None
         # Authority reader is retained so other consumers (e.g., diags)
         # can still inspect what hf-timestd is publishing.  Not used for
         # anchoring anymore — the one-shot anchor read is the only path.
@@ -194,6 +199,25 @@ class ChannelSink:
         if n == 0:
             return
 
+        # ── Proactive re-anchor on a radiod offset step ──
+        # The StatusListener bumps channel_info.anchor_epoch the instant
+        # radiod reports a different RTP↔GPS offset.  Drop the frozen anchor
+        # so the same batch re-anchors off the fresh snapshot — no waiting
+        # for sample-count projection to drift past the divergence gate
+        # (whose wrap-epoch disambiguation can mask a gross step entirely).
+        if self._anchor_utc is not None and self._channel_info is not None:
+            cur_epoch = getattr(self._channel_info, "anchor_epoch", None)
+            if cur_epoch is not None and cur_epoch != self._anchor_epoch:
+                step = getattr(self._channel_info, "last_offset_step_sec", None)
+                logger.warning(
+                    "%s %d Hz: radiod RTP↔GPS offset STEPPED %s (anchor_epoch "
+                    "%s→%s) — re-anchoring off fresh status snapshot",
+                    self._mode.upper(), self._frequency_hz,
+                    ("%+.3fs" % step) if step is not None else "?",
+                    self._anchor_epoch, cur_epoch,
+                )
+                self._anchor_utc = None
+
         if self._anchor_utc is None:
             anchor, source = self._compute_initial_anchor(samples, quality)
             if anchor is None:
@@ -204,10 +228,13 @@ class ChannelSink:
             self._anchor_utc = anchor
             self._anchor_total_samples = quality.total_samples_delivered - n
             self._anchor_source = source
+            # Record the epoch this anchor was derived against so a later
+            # status step is detected as a change.
+            self._anchor_epoch = getattr(self._channel_info, "anchor_epoch", None)
             logger.info(
-                "%s %d Hz: anchored via %s at UTC %.3f (sample %d)",
+                "%s %d Hz: anchored via %s at UTC %.3f (sample %d, epoch %s)",
                 self._mode.upper(), self._frequency_hz, source,
-                self._anchor_utc, self._anchor_total_samples,
+                self._anchor_utc, self._anchor_total_samples, self._anchor_epoch,
             )
 
         # Pure sample-count projection — the timing invariant the user
