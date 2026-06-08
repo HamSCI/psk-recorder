@@ -58,9 +58,17 @@ logger = logging.getLogger(__name__)
 # treat a still-unverifiable channel as a skip (warn + continue) rather than
 # a fatal error.  Both knobs are env-overridable for tuning without a
 # redeploy.
-_VERIFY_TIMEOUT_S = float(os.environ.get("PSK_CHANNEL_VERIFY_TIMEOUT_S", "20"))
-_VERIFY_RETRIES = int(os.environ.get("PSK_CHANNEL_VERIFY_RETRIES", "2"))
+_VERIFY_TIMEOUT_S = float(os.environ.get("PSK_CHANNEL_VERIFY_TIMEOUT_S", "10"))
+_VERIFY_RETRIES = int(os.environ.get("PSK_CHANNEL_VERIFY_RETRIES", "1"))
 _VERIFY_RETRY_BACKOFF_S = 1.5
+# Total wall-clock budget for the whole provisioning sweep.  psk notifies
+# systemd READY only AFTER provisioning every channel (recorder.py:_run),
+# so the sweep must finish well inside the unit's TimeoutStartSec (3 min)
+# or systemd SIGKILLs the daemon mid-provision.  Once the budget is spent
+# we stop verifying and skip the remaining channels so the daemon still
+# comes up (degraded) with whatever verified — the keepalive/refresh path
+# can pick up stragglers later.
+_VERIFY_BUDGET_S = float(os.environ.get("PSK_CHANNEL_VERIFY_BUDGET_S", "120"))
 
 
 def _resolve_encoding(enc_str: str) -> int:
@@ -211,6 +219,8 @@ class ReceiverManager:
 
         multi_by_group: dict[tuple, object] = {}
         failed: list = []
+        # Bound the whole sweep so READY is sent inside TimeoutStartSec.
+        deadline = time.monotonic() + _VERIFY_BUDGET_S
 
         for mode in ("ft8", "ft4"):
             freqs = get_freqs(self._radiod, mode)
@@ -261,7 +271,8 @@ class ReceiverManager:
                     keep_wav=keep_wav,
                     spool_spots=spool_spots,
                 )
-                if self._provision_one_with_retry(sink, multi_by_group):
+                if self._provision_one_with_retry(
+                        sink, multi_by_group, deadline):
                     self._sinks.append(sink)
                 else:
                     failed.append((mode, freq_hz))
@@ -287,18 +298,31 @@ class ReceiverManager:
                 f"timed out — is radiod streaming?)"
             )
 
-    def _provision_one_with_retry(self, sink, multi_by_group) -> bool:
-        """Provision one channel, retrying on verify timeout.
+    def _provision_one_with_retry(self, sink, multi_by_group, deadline) -> bool:
+        """Provision one channel, retrying on verify timeout within budget.
 
-        Returns True once the channel is verified, or False if it could not
-        be verified after ``_VERIFY_RETRIES`` retries — the caller logs a
-        summary and skips it instead of aborting the whole daemon (a
-        momentarily-busy radiod must not take psk-recorder down).
+        Each attempt's verify timeout is capped to the time left in the
+        sweep-wide ``deadline`` (monotonic).  Returns True once verified, or
+        False if it could not be verified (retries exhausted, or the budget
+        ran out) — the caller logs a summary and skips it instead of
+        aborting the whole daemon.  A momentarily-busy radiod must neither
+        take psk-recorder down nor make it miss systemd's start deadline.
         """
         attempts = _VERIFY_RETRIES + 1
         for attempt in range(1, attempts + 1):
+            remaining = deadline - time.monotonic()
+            if remaining <= 1.0:
+                logger.warning(
+                    "ReceiverManager %s: provisioning budget exhausted — "
+                    "skipping %s %d Hz (and any later channels) without "
+                    "verify so the daemon still comes up",
+                    self._radiod_id, sink.mode.upper(), sink.frequency_hz,
+                )
+                return False
+            attempt_timeout = min(_VERIFY_TIMEOUT_S, remaining)
             try:
-                self._add_sink_to_multi(sink, multi_by_group)
+                self._add_sink_to_multi(
+                    sink, multi_by_group, timeout=attempt_timeout)
                 if attempt > 1:
                     logger.info(
                         "ReceiverManager %s: %s %d Hz verified on attempt "
@@ -307,7 +331,12 @@ class ReceiverManager:
                     )
                 return True
             except TimeoutError as exc:
-                if attempt < attempts:
+                can_retry = (
+                    attempt < attempts
+                    and (deadline - time.monotonic()
+                         > _VERIFY_RETRY_BACKOFF_S + 1.0)
+                )
+                if can_retry:
                     logger.warning(
                         "ReceiverManager %s: %s %d Hz verify timed out "
                         "(attempt %d/%d): %s — retrying in %.1fs",
@@ -319,14 +348,16 @@ class ReceiverManager:
                 else:
                     logger.error(
                         "ReceiverManager %s: %s %d Hz could not be verified "
-                        "after %d attempts: %s",
+                        "(attempt %d/%d): %s — skipping",
                         self._radiod_id, sink.mode.upper(),
-                        sink.frequency_hz, attempts, exc,
+                        sink.frequency_hz, attempt, attempts, exc,
                     )
+                    return False
         return False
 
     def _add_sink_to_multi(
         self, sink: ChannelSink, multi_by_group: dict,
+        timeout: float = _VERIFY_TIMEOUT_S,
     ) -> None:
         """Attach sink to the MultiStream for its multicast group.
 
@@ -355,7 +386,7 @@ class ReceiverManager:
             sample_rate=sink.sample_rate,
             encoding=sink.encoding,
             lifetime=lifetime_arg,
-            timeout=_VERIFY_TIMEOUT_S,
+            timeout=timeout,
         )
         key = (info.multicast_address, info.port)
         multi = multi_by_group.get(key)
@@ -372,7 +403,7 @@ class ReceiverManager:
             on_stream_dropped=sink.on_stream_dropped,
             on_stream_restored=sink.on_stream_restored,
             lifetime=lifetime_arg,
-            timeout=_VERIFY_TIMEOUT_S,
+            timeout=timeout,
         )
         # Hand the freshly-discovered ChannelInfo (with GPS_TIME /
         # RTP_TIMESNAP / chain_delay_correction populated) to the sink
