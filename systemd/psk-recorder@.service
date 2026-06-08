@@ -1,5 +1,5 @@
 [Unit]
-Description=psk-recorder FT4/FT8 spot recorder for radiod %i
+Description=psk-recorder FT4/FT8 spot recorder for radiod %I
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=300
@@ -14,14 +14,14 @@ WatchdogSec=120
 NotifyAccess=main
 
 EnvironmentFile=-/etc/sigmond/coordination.env
-EnvironmentFile=-/etc/psk-recorder/env/%i.env
+EnvironmentFile=-/etc/psk-recorder/env/%I.env
 
 WorkingDirectory=/opt/git/sigmond/psk-recorder
 
-ExecStartPre=+/bin/mkdir -p /var/lib/psk-recorder/%i/ft8
-ExecStartPre=+/bin/mkdir -p /var/lib/psk-recorder/%i/ft4
+ExecStartPre=+/bin/mkdir -p /var/lib/psk-recorder/%I/ft8
+ExecStartPre=+/bin/mkdir -p /var/lib/psk-recorder/%I/ft4
 ExecStartPre=+/bin/mkdir -p /var/log/psk-recorder
-ExecStartPre=+/usr/bin/chown -R pskrec:pskrec /var/lib/psk-recorder/%i
+ExecStartPre=+/usr/bin/chown -R pskrec:pskrec /var/lib/psk-recorder/%I
 ExecStartPre=+/usr/bin/chown -R pskrec:pskrec /var/log/psk-recorder
 # /var/lib/hs-uploader is SHARED across HamSCI client users (pskrec,
 # wsprdaemon, ...) — its setgid+group-write shape is owned by
@@ -38,18 +38,18 @@ ExecStartPre=+/usr/bin/chown -R pskrec:pskrec /var/log/psk-recorder
 # database".  Observed on bee1 2026-05-14.  Removed.
 
 # Phase-3 cutover (sigmond MULTI-INSTANCE-ARCHITECTURE.md):
-# --instance %i picks up /etc/psk-recorder/%i.toml when the operator
+# --instance %I picks up /etc/psk-recorder/%I.toml when the operator
 # has run `sudo smd instance migrate` (Phase 8).  Until then, the
 # per-instance config doesn't exist and the daemon falls back to the
 # legacy /etc/psk-recorder/psk-recorder-config.toml with a one-line
-# deprecation warning.  --radiod-id %i stays for the legacy fallback
+# deprecation warning.  --radiod-id %I stays for the legacy fallback
 # path (selects the matching [[radiod]] block within the shared
 # config); ignored once per-instance config takes over.
 # Note: --config is intentionally omitted — passing it would force
 # the legacy path always (explicit_path wins in resolve_config_path).
 ExecStart=/opt/git/sigmond/psk-recorder/venv/bin/python3 -m psk_recorder.cli daemon \
-    --instance %i \
-    --radiod-id %i
+    --instance %I \
+    --radiod-id %I
 
 # 180s covers a typical 19-channel (FT8 × 10 bands + FT4 × 9 bands) startup
 # plus headroom: each channel triggers a setpolicy round-trip with radiod,
@@ -61,10 +61,10 @@ Restart=always
 RestartSec=5
 
 # Logs go to the systemd journal (sigmond standard) — query with
-# `journalctl -u psk-recorder@%i` or `smd log psk-recorder`.
+# `journalctl -u psk-recorder@%I` or `smd log psk-recorder`.
 StandardOutput=journal
 StandardError=inherit
-SyslogIdentifier=psk-recorder@%i
+SyslogIdentifier=psk-recorder@%I
 
 Nice=5
 # 19+ concurrent jt9 children at ~60 MB RSS each saturates 512M.  jt9
