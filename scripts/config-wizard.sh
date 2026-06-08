@@ -433,7 +433,7 @@ else:
         blocks = json.loads(out).get('radiod', [])
     except Exception:
         blocks = []
-ids = [b.get('id', '?') for b in blocks if isinstance(b, dict)]
+ids = [b.get('status', '?') for b in blocks if isinstance(b, dict)]
 print(','.join(ids) if ids else '(none)')
 PYEOF
 }

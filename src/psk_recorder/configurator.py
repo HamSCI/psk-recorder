@@ -799,18 +799,22 @@ def cmd_config_apply(args) -> int:
                     print(f"config apply: [[radiod]][{i}] must be a table, got {type(block).__name__}",
                           file=sys.stderr)
                     return 2
-                if not block.get("id"):
-                    print(f"config apply: [[radiod]][{i}].id is required",
+                # RADIOD-IDENTIFICATION.md §3.1 (Phase 6 cutover): `status`
+                # is the canonical field (the mDNS control/status name); the
+                # radiod id is derived from it.  The legacy `id` +
+                # `radiod_status` pair was removed everywhere else (runtime
+                # resolve_radiod_status, `config show`, the init template) --
+                # require `status` here too so the show -> edit -> apply
+                # round-trip is consistent.
+                if not block.get("status"):
+                    print(f"config apply: [[radiod]][{i}].status is required (mDNS hostname)",
                           file=sys.stderr)
                     return 2
-                if not block.get("radiod_status"):
-                    print(f"config apply: [[radiod]][{i}].radiod_status is required (mDNS hostname)",
-                          file=sys.stderr)
-                    return 2
-            # Reject duplicate ids -- recorder.py keys per-instance state on id.
-            ids = [b["id"] for b in fields]
-            if len(ids) != len(set(ids)):
-                print(f"config apply: [[radiod]] has duplicate ids: {ids}",
+            # Reject duplicate status names -- recorder.py keys per-instance
+            # state on the radiod id, which is derived from status.
+            statuses = [b["status"] for b in fields]
+            if len(statuses) != len(set(statuses)):
+                print(f"config apply: [[radiod]] has duplicate status names: {statuses}",
                       file=sys.stderr)
                 return 2
             continue
