@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
@@ -46,6 +47,20 @@ if TYPE_CHECKING:  # pragma: no cover
     from psk_recorder.core.stream import ChannelSink
 
 logger = logging.getLogger(__name__)
+
+# Channel-verify softening.  radiod's control plane is slow to confirm a
+# freshly-created channel while it is busy — a just-started (cold) RX888, or
+# one already serving many peer-client channels (wspr-recorder's 17 bands +
+# our 19).  The old behaviour used ka9q's 5 s hard verify and let the first
+# slow channel's TimeoutError abort the whole daemon, which systemd then
+# restart-looped — so a momentarily-busy radiod meant psk never came up at
+# all.  Give each channel a generous verify budget, retry a few times, and
+# treat a still-unverifiable channel as a skip (warn + continue) rather than
+# a fatal error.  Both knobs are env-overridable for tuning without a
+# redeploy.
+_VERIFY_TIMEOUT_S = float(os.environ.get("PSK_CHANNEL_VERIFY_TIMEOUT_S", "20"))
+_VERIFY_RETRIES = int(os.environ.get("PSK_CHANNEL_VERIFY_RETRIES", "2"))
+_VERIFY_RETRY_BACKOFF_S = 1.5
 
 
 def _resolve_encoding(enc_str: str) -> int:
@@ -195,6 +210,7 @@ class ReceiverManager:
             )
 
         multi_by_group: dict[tuple, object] = {}
+        failed: list = []
 
         for mode in ("ft8", "ft4"):
             freqs = get_freqs(self._radiod, mode)
@@ -245,8 +261,10 @@ class ReceiverManager:
                     keep_wav=keep_wav,
                     spool_spots=spool_spots,
                 )
-                self._add_sink_to_multi(sink, multi_by_group)
-                self._sinks.append(sink)
+                if self._provision_one_with_retry(sink, multi_by_group):
+                    self._sinks.append(sink)
+                else:
+                    failed.append((mode, freq_hz))
 
         self._multi_streams = list(multi_by_group.values())
         logger.info(
@@ -255,6 +273,57 @@ class ReceiverManager:
             self._radiod_id, len(self._sinks),
             len(self._multi_streams), status,
         )
+        if failed:
+            logger.warning(
+                "ReceiverManager %s: %d channel(s) could not be verified "
+                "after %d attempt(s) and were skipped (radiod busy?): %s",
+                self._radiod_id, len(failed), _VERIFY_RETRIES + 1,
+                ", ".join(f"{m.upper()} {f} Hz" for m, f in failed),
+            )
+        if not self._sinks:
+            raise RuntimeError(
+                f"ReceiverManager {self._radiod_id}: no channels could be "
+                f"provisioned on {status} ({len(failed)} verify attempt(s) "
+                f"timed out — is radiod streaming?)"
+            )
+
+    def _provision_one_with_retry(self, sink, multi_by_group) -> bool:
+        """Provision one channel, retrying on verify timeout.
+
+        Returns True once the channel is verified, or False if it could not
+        be verified after ``_VERIFY_RETRIES`` retries — the caller logs a
+        summary and skips it instead of aborting the whole daemon (a
+        momentarily-busy radiod must not take psk-recorder down).
+        """
+        attempts = _VERIFY_RETRIES + 1
+        for attempt in range(1, attempts + 1):
+            try:
+                self._add_sink_to_multi(sink, multi_by_group)
+                if attempt > 1:
+                    logger.info(
+                        "ReceiverManager %s: %s %d Hz verified on attempt "
+                        "%d/%d", self._radiod_id, sink.mode.upper(),
+                        sink.frequency_hz, attempt, attempts,
+                    )
+                return True
+            except TimeoutError as exc:
+                if attempt < attempts:
+                    logger.warning(
+                        "ReceiverManager %s: %s %d Hz verify timed out "
+                        "(attempt %d/%d): %s — retrying in %.1fs",
+                        self._radiod_id, sink.mode.upper(),
+                        sink.frequency_hz, attempt, attempts, exc,
+                        _VERIFY_RETRY_BACKOFF_S,
+                    )
+                    time.sleep(_VERIFY_RETRY_BACKOFF_S)
+                else:
+                    logger.error(
+                        "ReceiverManager %s: %s %d Hz could not be verified "
+                        "after %d attempts: %s",
+                        self._radiod_id, sink.mode.upper(),
+                        sink.frequency_hz, attempts, exc,
+                    )
+        return False
 
     def _add_sink_to_multi(
         self, sink: ChannelSink, multi_by_group: dict,
@@ -286,6 +355,7 @@ class ReceiverManager:
             sample_rate=sink.sample_rate,
             encoding=sink.encoding,
             lifetime=lifetime_arg,
+            timeout=_VERIFY_TIMEOUT_S,
         )
         key = (info.multicast_address, info.port)
         multi = multi_by_group.get(key)
@@ -302,6 +372,7 @@ class ReceiverManager:
             on_stream_dropped=sink.on_stream_dropped,
             on_stream_restored=sink.on_stream_restored,
             lifetime=lifetime_arg,
+            timeout=_VERIFY_TIMEOUT_S,
         )
         # Hand the freshly-discovered ChannelInfo (with GPS_TIME /
         # RTP_TIMESNAP / chain_delay_correction populated) to the sink
