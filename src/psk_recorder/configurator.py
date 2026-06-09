@@ -270,13 +270,20 @@ def _pick_radiod_status_from_discovery(
     # own configured-but-not-yet-running radiod instead of being forced to pick
     # an unrelated one off the LAN.
     discovered = list(discovered)
-    if env_status and not any(
-        d.get("hostname") == env_status for d in discovered
-    ):
-        discovered.insert(0, {
-            "hostname": env_status,
-            "name": "this host — configured, starts with bring-up",
-        })
+    if env_status:
+        # Put the host's own radiod (SIGMOND_RADIOD_STATUS) first so it is the
+        # default pick — whether mDNS already discovered it (radiod running) or
+        # not yet (still starting during bring-up, in which case we inject it).
+        local = next(
+            (d for d in discovered if d.get("hostname") == env_status), None)
+        if local is not None:
+            discovered.remove(local)
+            discovered.insert(0, local)
+        else:
+            discovered.insert(0, {
+                "hostname": env_status,
+                "name": "this host — configured, starts with bring-up",
+            })
 
     if not discovered:
         print("\033[33m⚠\033[0m  No radiod instances broadcasting on the "
