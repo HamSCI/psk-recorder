@@ -263,6 +263,21 @@ def _pick_radiod_status_from_discovery(
       1 discovered → confirm (default Y)
       ≥2 discovered → menu chooser; operator picks one
     """
+    # The host's own radiod (passed by sigmond as SIGMOND_RADIOD_STATUS) may
+    # not be broadcasting yet: during `smd bringup` the per-client config
+    # interviews run BEFORE radiod is started, so mDNS can't see it.  Inject it
+    # as the preferred (first/default) entry so the operator can select their
+    # own configured-but-not-yet-running radiod instead of being forced to pick
+    # an unrelated one off the LAN.
+    discovered = list(discovered)
+    if env_status and not any(
+        d.get("hostname") == env_status for d in discovered
+    ):
+        discovered.insert(0, {
+            "hostname": env_status,
+            "name": "this host — configured, starts with bring-up",
+        })
+
     if not discovered:
         print("\033[33m⚠\033[0m  No radiod instances broadcasting on the "
               "local network.")
