@@ -233,7 +233,14 @@ def _handle_inventory(args):
     )
     try:
         config = load_config(config_path)
-    except FileNotFoundError:
+    except OSError as exc:
+        # The contract requires `inventory` to always emit valid JSON with
+        # structured issues — never crash.  A config that is missing OR
+        # present-but-unreadable (e.g. mode 0640 owned by the service user
+        # while sigmond probes as the operator) both land here.
+        msg = (f"config not found: {config_path}"
+               if isinstance(exc, FileNotFoundError)
+               else f"config unreadable: {config_path} ({exc.strerror or exc})")
         payload = {
             "client": "psk-recorder",
             "version": "0.1.0",
@@ -244,7 +251,7 @@ def _handle_inventory(args):
                 {
                     "severity": "fail",
                     "instance": "all",
-                    "message": f"config not found: {config_path}",
+                    "message": msg,
                 }
             ],
         }
@@ -264,7 +271,12 @@ def _handle_validate(args):
     )
     try:
         config = load_config(config_path)
-    except FileNotFoundError:
+    except OSError as exc:
+        # See _handle_inventory: degrade gracefully on a missing OR
+        # unreadable config rather than crashing.
+        msg = (f"config not found: {config_path}"
+               if isinstance(exc, FileNotFoundError)
+               else f"config unreadable: {config_path} ({exc.strerror or exc})")
         payload = {
             "ok": False,
             "config_path": str(config_path),
@@ -272,13 +284,12 @@ def _handle_validate(args):
                 {
                     "severity": "fail",
                     "instance": "all",
-                    "message": f"config not found: {config_path}",
+                    "message": msg,
                 }
             ],
         }
         print(json.dumps(payload, indent=2))
         sys.exit(1)
-        return
 
     payload = build_validate(config, config_path)
     print(json.dumps(payload, indent=2))
