@@ -52,6 +52,32 @@ from psk_recorder.core.receiver_manager import (
 logger = logging.getLogger(__name__)
 
 
+def _supervise(name, alive, fn, *args):
+    """Run a background-thread loop, converting a silent thread death into a
+    loud log + backed-off auto-restart.
+
+    These loops already guard their expected per-iteration errors inline, so
+    an exception reaching here is unexpected -- and a bare daemon thread that
+    dies takes its subsystem (spot batching / channel-lifetime refresh /
+    stats) down silently, with no operator signal and (for the batcher) an
+    unbounded _batches backlog.  Re-invoke the loop after a capped backoff
+    while the daemon is still running.  ``alive`` is a predicate (e.g.
+    ``lambda: self._running``); ``fn`` returns normally only on a stop.
+    """
+    backoff = 1.0
+    while alive():
+        try:
+            fn(*args)
+            return
+        except Exception:
+            logger.exception("%s thread crashed unexpectedly", name)
+            if not alive():
+                return
+            time.sleep(backoff)
+            backoff = min(backoff * 2.0, 30.0)
+            logger.warning("%s thread restarting after crash", name)
+
+
 def _env_float(name: str, default: float, *, scale: float = 1.0) -> float:
     """Parse a positive float env var.  `scale` converts the env-var
     unit to the constant's unit (e.g. 1e-6 for µs→s) and is applied
@@ -681,7 +707,10 @@ class PskRecorder:
 
     def _start_stats_thread(self) -> None:
         self._stats_thread = threading.Thread(
-            target=self._stats_loop, daemon=True, name="stats",
+            target=lambda: _supervise(
+                "stats", lambda: self._running, self._stats_loop,
+            ),
+            daemon=True, name="stats",
         )
         self._stats_thread.start()
 
@@ -706,8 +735,10 @@ class PskRecorder:
             interval,
         )
         self._lifetime_thread = threading.Thread(
-            target=self._lifetime_loop,
-            args=(interval,),
+            target=lambda: _supervise(
+                "lifetime", lambda: self._running,
+                self._lifetime_loop, interval,
+            ),
             daemon=True,
             name="lifetime",
         )

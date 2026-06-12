@@ -251,5 +251,47 @@ class BatcherFlushTests(unittest.TestCase):
         self.assertEqual(len(writer.inserts[0]), 1)
 
 
+class SuperviseTests(unittest.TestCase):
+    """_supervise turns a silent background-thread death into a loud log +
+    backed-off auto-restart, so a crashing batcher/lifetime/stats loop does
+    not silently stop its subsystem."""
+
+    def test_restarts_loop_until_clean_return(self):
+        from unittest import mock
+        from psk_recorder.core import cycle_batcher as cb
+        calls = {"n": 0}
+
+        def fn():
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise RuntimeError("boom")
+            return  # clean stop on the 3rd attempt
+
+        with mock.patch.object(cb.time, "sleep", lambda *_a: None):
+            cb._supervise("t", lambda: True, fn)
+        self.assertEqual(calls["n"], 3)
+
+    def test_no_restart_once_not_alive(self):
+        from unittest import mock
+        from psk_recorder.core import cycle_batcher as cb
+        calls = {"n": 0}
+        alive = {"v": True}
+
+        def fn():
+            calls["n"] += 1
+            alive["v"] = False  # daemon shutting down
+            raise RuntimeError("crash during shutdown")
+
+        with mock.patch.object(cb.time, "sleep", lambda *_a: None):
+            cb._supervise("t", lambda: alive["v"], fn)
+        self.assertEqual(calls["n"], 1)
+
+    def test_clean_loop_runs_once(self):
+        from psk_recorder.core import cycle_batcher as cb
+        calls = {"n": 0}
+        cb._supervise("t", lambda: True, lambda: calls.__setitem__("n", calls["n"] + 1))
+        self.assertEqual(calls["n"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()
