@@ -78,6 +78,50 @@ def _supervise(name, alive, fn, *args):
             logger.warning("%s thread restarting after crash", name)
 
 
+class _ProgressGate:
+    """Decide whether to pet the systemd watchdog from a data-path progress
+    signal, so a *wedged* (not crashed) daemon stops pinging and gets
+    restarted while a healthy-but-idle one keeps pinging.
+
+    ``update(progress, now)`` returns True to ping, False to withhold.
+    Withholds only after the progress counter has stalled past ``stall_sec``;
+    enforcement of that threshold begins only once progress has advanced at
+    least once.  A separate, longer ``startup_grace_sec`` covers the
+    never-progressed case (dead-from-start) without false-firing during slow
+    provisioning.  ``progress is None`` means "unknown" -> always ping
+    (fail-safe: uncertainty must never withhold the ping).
+    """
+
+    def __init__(self, stall_sec, startup_grace_sec=None):
+        self._stall = stall_sec
+        self._startup_grace = (
+            startup_grace_sec if startup_grace_sec is not None
+            else stall_sec * 2
+        )
+        self._last = None
+        self._last_advance = None
+        self._seen = False
+        self._start = None
+
+    def update(self, progress, now) -> bool:
+        if self._start is None:
+            self._start = now
+        if progress is None:
+            return True
+        if self._last_advance is None:
+            self._last = progress
+            self._last_advance = now
+        if progress != self._last:
+            self._last = progress
+            self._last_advance = now
+            self._seen = True
+        if self._seen:
+            stalled = (now - self._last_advance) > self._stall
+        else:
+            stalled = (now - self._start) > self._startup_grace
+        return not stalled
+
+
 def _env_float(name: str, default: float, *, scale: float = 1.0) -> float:
     """Parse a positive float env var.  `scale` converts the env-var
     unit to the constant's unit (e.g. 1e-6 for µs→s) and is applied
@@ -842,17 +886,56 @@ class PskRecorder:
 
             time.sleep(60.0)
 
+    def _pipeline_progress(self):
+        """Monotonic count of decode slots processed across all channels:
+        sum of each SlotWorker's (decodes_ok + decodes_fail + slots_empty).
+
+        Advances every decode cadence (<=15 s) whenever RTP is flowing --
+        and, even if every decode hangs, at least every ~60 s via the
+        kill-deadline reap (see slot.DECODE_TIMEOUT_SEC) -- regardless of
+        whether anything actually decodes.  Freezes only when the
+        record->decode pipeline has wedged.  Returns None on any error so the
+        watchdog fails safe (keeps pinging).
+        """
+        try:
+            total = 0
+            for sink in self._iter_sinks():
+                snap = sink.stats_snapshot()
+                total += (snap.get("decodes_ok", 0)
+                          + snap.get("decodes_fail", 0)
+                          + snap.get("slots_empty", 0))
+            return total
+        except Exception:
+            return None
+
     def _main_loop(self) -> None:
-        """Block until signalled, petting the watchdog periodically."""
+        """Block until signalled, petting the systemd watchdog only while the
+        record->decode pipeline is making progress.
+
+        Pinging unconditionally would keep a wedged (not crashed) daemon alive
+        forever.  _ProgressGate withholds WATCHDOG=1 once the pipeline has
+        stalled past the threshold, so systemd's WatchdogSec restarts it;
+        a healthy-but-quiet recorder (no signal to decode) still advances the
+        slot counters and keeps pinging.
+        """
         watchdog_usec = os.environ.get("WATCHDOG_USEC")
         pet_interval = (
             int(watchdog_usec) / 1_000_000 / 2
             if watchdog_usec else 30.0
         )
+        # stall_sec < WatchdogSec(120) and comfortably > the worst-case
+        # ~60 s slot-progress interval and any radiod re-provision window.
+        gate = _ProgressGate(stall_sec=90.0)
 
         while self._running:
             time.sleep(min(pet_interval, 5.0))
-            self._pet_watchdog()
+            if gate.update(self._pipeline_progress(), time.monotonic()):
+                self._pet_watchdog()
+            else:
+                logger.error(
+                    "record->decode pipeline stalled; withholding systemd "
+                    "watchdog ping so the unit is restarted",
+                )
 
     def _pet_watchdog(self) -> None:
         try:
