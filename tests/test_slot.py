@@ -94,5 +94,72 @@ class SlotExtractionTickTests(unittest.TestCase):
             self.assertGreaterEqual(len(wav_files), 1, "Expected at least one WAV file")
 
 
+class DecodeTimeoutTests(unittest.TestCase):
+    """A hung decode_ft8 must be killed + reaped, not leaked forever.
+
+    Regression for the unbounded _pending_procs / FD / WAV leak that
+    otherwise grows until the MemoryMax cgroup OOM-kills the daemon.
+    """
+
+    def _worker(self, tmpdir, keep_wav=False):
+        import io
+        return SlotWorker(
+            ring=None,
+            mode="ft8",
+            frequency_hz=14074000,
+            cadence_sec=15.0,
+            spool_dir=Path(tmpdir),
+            log_fd=io.BytesIO(),
+            decoder_path="/usr/local/bin/decode_ft8",
+            keep_wav=keep_wav,
+        )
+
+    def test_hung_decode_killed_past_deadline(self):
+        import os
+        import subprocess
+        import time
+        with tempfile.TemporaryDirectory() as tmpdir:
+            worker = self._worker(tmpdir)
+            wav = Path(tmpdir) / "hung.wav"
+            wav.write_bytes(b"RIFFfake")
+            proc = subprocess.Popen(
+                ["sleep", "300"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.addCleanup(SlotWorker._kill_proc, proc)
+            fds_before = len(os.listdir("/proc/%d/fd" % os.getpid()))
+            # fork timestamp far enough in the past to be over any deadline
+            worker._pending_procs.append(
+                (proc, wav, 0.0, time.monotonic() - 10_000)
+            )
+            worker._reap_finished()
+            time.sleep(0.2)
+            self.assertIsNotNone(proc.poll(), "hung proc was not killed")
+            self.assertLess(proc.returncode, 0, "expected death by signal")
+            self.assertEqual(len(worker._pending_procs), 0, "not dropped from pending")
+            self.assertEqual(worker.decodes_fail, 1)
+            self.assertFalse(wav.exists(), "spool wav not cleaned up")
+            fds_after = len(os.listdir("/proc/%d/fd" % os.getpid()))
+            self.assertLessEqual(fds_after, fds_before, "FD leak on kill path")
+
+    def test_in_deadline_decode_left_pending(self):
+        import subprocess
+        import time
+        with tempfile.TemporaryDirectory() as tmpdir:
+            worker = self._worker(tmpdir, keep_wav=True)
+            wav = Path(tmpdir) / "young.wav"
+            wav.write_bytes(b"RIFFfake")
+            proc = subprocess.Popen(
+                ["sleep", "300"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.addCleanup(SlotWorker._kill_proc, proc)
+            worker._pending_procs.append((proc, wav, 0.0, time.monotonic()))
+            worker._reap_finished()
+            self.assertIsNone(proc.poll(), "in-deadline proc wrongly killed")
+            self.assertEqual(len(worker._pending_procs), 1, "in-deadline proc dropped")
+            self.assertEqual(worker.decodes_fail, 0, "false failure counted")
+
+
 if __name__ == "__main__":
     unittest.main()

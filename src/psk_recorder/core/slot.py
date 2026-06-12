@@ -34,6 +34,13 @@ logger = logging.getLogger(__name__)
 
 SETTLE_SEC = 1.5
 
+# A hung decode_ft8 (e.g. on a corrupt WAV) would otherwise sit in
+# _pending_procs forever, leaking its two stdio FDs + the spool WAV.
+# decode_ft8 finishes in well under a second on a 15 s/7.5 s slot, so any
+# proc still alive after this deadline is killed.  Generous (4x the FT8
+# cadence) to avoid false kills under top-of-minute CPU contention.
+DECODE_TIMEOUT_SEC = 60.0
+
 # decoder_kind values accepted by SlotWorker.
 DECODER_FT8_LIB = "decode_ft8"
 VALID_DECODER_KINDS = (DECODER_FT8_LIB,)
@@ -73,10 +80,9 @@ class SlotWorker:
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._next_slot_start: Optional[float] = None
-        # Each entry: (proc, wav_path, slot_start_utc).  slot_start is
-        # the UTC epoch the slot started at.
+        # Each entry: (proc, wav_path, slot_start_utc, fork_monotonic).
         self._pending_procs: list[tuple[subprocess.Popen, Path,
-                                        float]] = []
+                                        float, float]] = []
         # Counters read by the recorder's stats thread. int ops are atomic
         # under CPython GIL; no lock needed for the single-reader case.
         self.decodes_ok = 0
@@ -242,7 +248,7 @@ class SlotWorker:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
-            self._pending_procs.append((proc, wav_path, slot_start))
+            self._pending_procs.append((proc, wav_path, slot_start, time.monotonic()))
             logger.debug(
                 "%s %d Hz: decode_ft8 pid=%d on %s",
                 self._mode.upper(), self._frequency_hz, proc.pid, wav_path.name,
@@ -252,12 +258,48 @@ class SlotWorker:
             if not self._keep_wav:
                 wav_path.unlink(missing_ok=True)
 
+    @staticmethod
+    def _kill_proc(proc: subprocess.Popen) -> None:
+        """Kill a hung decoder and free its zombie + stdio FDs immediately."""
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=2.0)  # reap the zombie
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        for stream in (proc.stdout, proc.stderr):
+            try:
+                if stream is not None:
+                    stream.close()
+            except OSError:
+                pass
+
     def _reap_finished(self) -> None:
+        now = time.monotonic()
         still_pending = []
-        for proc, wav_path, slot_start in self._pending_procs:
+        for proc, wav_path, slot_start, fork_mono in self._pending_procs:
             ret = proc.poll()
             if ret is None:
-                still_pending.append((proc, wav_path, slot_start))
+                # Bound the leak: a proc still alive after DECODE_TIMEOUT_SEC
+                # is hung.  Left here it leaks its two stdio FDs + the spool
+                # WAV forever; across ~19 channels that grows until the
+                # MemoryMax cgroup OOM-kills the daemon and Restart=always
+                # re-enters the same state.  Kill, count a failure, drop it.
+                if now - fork_mono > DECODE_TIMEOUT_SEC:
+                    logger.warning(
+                        "%s %d Hz: decode_ft8 pid=%d on %s exceeded %.0fs "
+                        "deadline — killing (hung decode)",
+                        self._mode.upper(), self._frequency_hz, proc.pid,
+                        wav_path.name, DECODE_TIMEOUT_SEC,
+                    )
+                    self.decodes_fail += 1
+                    self._kill_proc(proc)
+                    if not self._keep_wav:
+                        wav_path.unlink(missing_ok=True)
+                    continue
+                still_pending.append((proc, wav_path, slot_start, fork_mono))
                 continue
             if ret == 0:
                 self.decodes_ok += 1
@@ -274,7 +316,7 @@ class SlotWorker:
         self._pending_procs = still_pending
 
     def _reap_all(self, wait: bool = False) -> None:
-        for proc, wav_path, slot_start in self._pending_procs:
+        for proc, wav_path, slot_start, _fork_mono in self._pending_procs:
             if wait:
                 try:
                     proc.wait(timeout=5.0)
