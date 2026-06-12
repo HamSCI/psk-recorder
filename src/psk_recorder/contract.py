@@ -14,6 +14,7 @@ from psk_recorder.config import (
     get_mode_params,
     load_config,
     resolve_radiod_status,
+    is_placeholder_status,
 )
 from psk_recorder.version import GIT_INFO
 
@@ -219,6 +220,16 @@ def _collect_issues(config: dict, paths: dict) -> list[dict]:
                 "message": (
                     "[[radiod]] block has no `status` field "
                     "(mDNS multicast name)"
+                ),
+            })
+        elif is_placeholder_status(block.get("status")):
+            issues.append({
+                "severity": "fail",
+                "instance": rid,
+                "message": (
+                    "[[radiod]] `status` is the unconfigured placeholder "
+                    f"{block.get('status')!r} — run `psk-recorder config "
+                    "init` to set the real radiod mDNS status name"
                 ),
             })
 

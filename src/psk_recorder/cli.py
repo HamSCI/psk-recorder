@@ -327,6 +327,8 @@ def _handle_daemon(args):
         load_config,
         resolve_config_path,
         resolve_radiod_block,
+        RADIOD_STATUS_PLACEHOLDER,
+        is_placeholder_status,
     )
     from psk_recorder.core.recorder import PskRecorder
 
@@ -407,6 +409,24 @@ def _handle_daemon(args):
             config_path,
             reporter_id or "<derived>",
         )
+
+    # Fail FAST (not crash-loop) when a radiod status address is still the
+    # unconfigured sentinel.  sigmond seeds new configs with
+    # RADIOD_STATUS_PLACEHOLDER, which can never resolve — without this the
+    # Type=notify daemon aborts in connect(), Restart=always respawns it,
+    # and it hammers ~10 restarts before StartLimit lockout.  Exit EX_CONFIG
+    # (78) — listed in the unit's RestartPreventExitStatus — so systemd stops
+    # cleanly.  A real-but-unreachable radiod is NOT caught here (stays
+    # transient -> keep retrying, correct for boot order).
+    if any(is_placeholder_status(b.get("status")) for b in blocks):
+        logger.error(
+            "radiod status address is unconfigured (placeholder %r). Run "
+            "`psk-recorder config init` (or `sudo smd bringup`) to set the "
+            "real radiod mDNS status name, then start the service. Exiting "
+            "without restart (EX_CONFIG 78).",
+            RADIOD_STATUS_PLACEHOLDER,
+        )
+        sys.exit(78)
 
     recorder = PskRecorder(config, blocks, reporter_id=reporter_id)
     recorder.run()

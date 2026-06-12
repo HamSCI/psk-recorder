@@ -188,6 +188,19 @@ def get_mode_params(radiod_block: dict, mode: str) -> dict:
     }
 
 
+# Unconfigured-radiod sentinel — sigmond bring-up seeds a fresh recorder
+# config with this placeholder in place of the radiod mDNS status name
+# (mirrors sigmond.harmonize._RADIOD_STATUS_PLACEHOLDER).  It can never
+# resolve, so a daemon started against it would crash-loop forever; the
+# daemon fails fast (EX_CONFIG 78) and `validate` flags it instead.
+RADIOD_STATUS_PLACEHOLDER = "<configure-via-config-init>"
+
+
+def is_placeholder_status(status) -> bool:
+    """True when a radiod `status` value is still the unconfigured sentinel."""
+    return (status or "").strip() == RADIOD_STATUS_PLACEHOLDER
+
+
 def resolve_radiod_status(radiod_block: dict) -> str:
     """Resolve the radiod mDNS control/status multicast name.
 
