@@ -105,6 +105,42 @@ class TestAnchorOnce(unittest.TestCase):
         finally:
             _cleanup_sink(sink)
 
+    def test_authority_offset_is_applied_to_anchor(self):
+        """A usable hf-timestd §18 offset is ADDED to the rtp_to_wallclock
+        anchor (S2), and the source records that it was applied."""
+        class _FakeSnap:
+            offset_usable = True
+            offset_seconds = 0.004250  # 4.25 ms
+        class _FakeReader:
+            def read(self):
+                return _FakeSnap()
+
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / "ft8").mkdir(exist_ok=True)
+        log_fd = open(tmp / "log", "ab")
+        sink = ChannelSink(
+            mode="ft8", frequency_hz=14_074_000, sample_rate=12_000,
+            preset="usb", encoding=0, spool_dir=tmp, log_fd=log_fd,
+            decoder_path="/nonexistent", keep_wav=False,
+            authority_reader=_FakeReader(),
+        )
+        sink.set_channel_info(_FakeChannelInfo())
+        try:
+            samples = np.zeros(2400, dtype=np.float32)
+            q = _FakeQuality(total_samples_delivered=2400,
+                             first_rtp_timestamp=1_000_000)
+            with mock.patch("ka9q.rtp_to_wallclock",
+                            return_value=1_700_000_500.0):
+                with mock.patch("psk_recorder.core.stream.time.time",
+                                return_value=1_700_000_500.0):
+                    with mock.patch.object(sink._ring, "push"):
+                        sink.on_samples(samples, q)
+            self.assertEqual(sink._anchor_source, "rtp_to_wallclock+authority")
+            # rtp_to_wallclock result (1_700_000_500.0) + 4.25 ms offset.
+            self.assertAlmostEqual(sink._anchor_utc, 1_700_000_500.00425, places=4)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_subsequent_batches_use_pure_sample_count_projection(self):
         """Second batch's UTC = anchor + delivered_since_anchor/sample_rate.
 
