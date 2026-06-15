@@ -173,11 +173,32 @@ Sections psk-recorder implements:
   `timing_authority_applied` per instance (null = RTP-default mode,
   populated = authority-corrected with source/tier/σ/age).
 
+## Compound-callsign hash resolution
+
+Unresolved compound calls are recovered via the shared **`callhash`**
+library — the same mechanism `meteor-scatter` and `wspr-recorder` use.
+`ch_tailer.py` feeds each chunk through `CallHashTable.observe()` then
+parses each line with `callhash.parse_message(line, table=...)`, which
+substitutes a hashed call back to plaintext from accumulated `<call>`
+sightings (and refuses to guess on ambiguous/colliding slots). A call
+learned on MSK144 or WSPR resolves an FT8/FT4 hash and vice-versa.
+
+**Requires the patched `decode_ft8`** (see ft8_lib fork below): upstream
+`decode_ft8` emits the opaque `<...>` for a 22-bit hashed call and throws
+the number away, leaving nothing to resolve. The patch (`ft8/unpack.c`)
+emits `<NNNNNNN>` instead — exactly like `jt9 -Y` — which the callhash
+table can reverse. Without the patch, hashed compounds simply stay
+unresolved (no regression; you just don't recover them).
+
 ## External dependencies (not pip-installable)
 
-- **decode_ft8** — from https://github.com/ka9q/ft8_lib. Built and
-  installed at `/usr/local/bin/decode_ft8`. Invoked as
-  `decode_ft8 -f <freq_mhz> [-4] <wavfile>` (`-4` for FT4 mode).
+- **decode_ft8** — built from a **fork** of https://github.com/ka9q/ft8_lib
+  (`mijahauan/ft8_lib`, branch `emit-numeric-callsign-hash` / pinned
+  commit `37484ad`) carrying the `<NNNNNNN>` hash-emission patch
+  (`ft8/unpack.c`). Built and installed at `/usr/local/bin/decode_ft8`
+  (`git checkout 37484ad && make && sudo make install`); must be rebuilt
+  per host across the fleet. Invoked as `decode_ft8 -f <freq_mhz> [-4]
+  <wavfile>` (`-4` for FT4 mode).
 - **ka9q-radio radiod** — the RTP source. psk-recorder talks to it
   exclusively via `ka9q-python`.
 

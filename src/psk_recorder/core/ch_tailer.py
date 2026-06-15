@@ -31,6 +31,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from callhash import parse_message
+
 logger = logging.getLogger(__name__)
 
 # decode_ft8 (ka9q/ft8_lib) reports a fixed ~0.65 s dt offset vs WSJT-X/jt9
@@ -50,35 +52,23 @@ _FT4_DT_CAL_SEC = float(os.environ.get("PSK_FT4_DT_CAL_SEC", "0.6"))
 
 # ── Line parser ─────────────────────────────────────────────────────────────
 
-# Standard callsigns + WSJT-X compound forms:
-#   * standard ITU call:                        K1ABC, AC0G, JA1AAA
-#   * suffix-form compound:                     K1ABC/QRP, K1ABC/MM
-#   * prefix-form compound (region/portable):   VE3/K1ABC, G/K1ABC, KH6/AC0G
-# The regex is intentionally lossy — it's a best-effort filter for
-# the freeform message field; the raw `message` text is always
-# preserved by the caller.
-_CALL_RE = re.compile(
-    r"^"
-    r"(?:[A-Z0-9]{1,3}/)?"               # optional prefix (e.g. "VE3/", "G/")
-    r"[A-Z0-9]{1,3}[0-9][A-Z0-9]{0,4}"    # standard call body (XX[X][D][YY[Y][Y]])
-    r"(?:/[A-Z0-9]{1,4})?"                # optional suffix (e.g. "/QRP", "/MM")
-    r"$"
-)
-# Maidenhead 6-char form has uppercase field+square but lowercase
-# subsquare (per IARU convention).  Tolerate either case for robustness.
-_GRID_RE = re.compile(r"^[A-R]{2}[0-9]{2}(?:[A-Xa-x]{2})?$")
-_REPORT_RE = re.compile(r"^R?([+-]?\d+)$")
-
 # Format-detection regex for the decoder line router.
 _DECODE_FT8_PREFIX = re.compile(r"^\d{4}/\d{2}/\d{2}\s")     # YYYY/MM/DD …
 
 
-def parse_decoder_line(line: str, *, mode: Optional[str] = None) -> Optional[dict]:
+def parse_decoder_line(
+    line: str, *, mode: Optional[str] = None, table: Optional[Any] = None,
+) -> Optional[dict]:
     """Detect the ``decode_ft8`` line format and parse.
 
     The per-mode log file (`<radiod_id>-<mode>.log`) carries lines from
     ``decode_ft8``.  We look at the leading byte run to confirm the
     structure before parsing.
+
+    ``table`` is the shared :class:`callhash.CallHashTable`; when given,
+    compound-callsign hashes (``<NNNNNNN>`` from the patched decode_ft8,
+    or already-resolved ``<CALL>`` brackets) are substituted back to
+    plaintext so we don't ship a spot whose call we actually know.
 
     Returns ``None`` on unrecognised structure (header line, blank,
     junk).  Caller should skip silently.
@@ -90,16 +80,20 @@ def parse_decoder_line(line: str, *, mode: Optional[str] = None) -> Optional[dic
         # decode_ft8 emits its own mode-agnostic format; if we don't
         # know the mode (router called without a hint), we leave it
         # blank — caller may set it from the log file path.
-        return parse_decode_ft8_line(stripped, mode=mode or "")
+        return parse_decode_ft8_line(stripped, mode=mode or "", table=table)
     return None
 
 
-def parse_decode_ft8_line(line: str, *, mode: str) -> Optional[dict]:
+def parse_decode_ft8_line(
+    line: str, *, mode: str, table: Optional[Any] = None,
+) -> Optional[dict]:
     """Parse one decode_ft8 stdout line into a psk.spots row.
 
     Returns None on any parse failure — callers should skip silently.
     `mode` is the mode tag from the slot worker ('ft8' or 'ft4'); the
-    decoder line itself doesn't carry it.
+    decoder line itself doesn't carry it.  Call/grid extraction and
+    compound-callsign hash substitution are delegated to the shared
+    :func:`callhash.parse_message` so all recorders behave identically.
     """
     line = line.strip()
     if not line or "~" not in line:
@@ -126,8 +120,7 @@ def parse_decode_ft8_line(line: str, *, mode: str) -> Optional[dict]:
     except (ValueError, IndexError):
         return None
 
-    message = message.strip()
-    parsed = _parse_message(message)
+    parsed = parse_message(message.strip(), table=table)
     return {
         "time":               ts,
         "mode":               mode,
@@ -138,91 +131,12 @@ def parse_decode_ft8_line(line: str, *, mode: str) -> Optional[dict]:
         "dt":                 dt,
         "frequency":          int(freq),
         "frequency_mhz":      freq / 1_000_000.0,
-        "message":            message,
+        "message":            parsed["message"],   # hash-resolved
         "tx_call":            parsed.get("tx_call", ""),
         "rx_call":            parsed.get("rx_call", ""),
         "grid":               parsed.get("grid", ""),
         "report":             parsed.get("report"),
     }
-
-
-def _parse_message(message: str) -> dict:
-    """Best-effort parse of a decoded FT8/FT4 message body.
-
-    Recognized shapes (all approximate; freeform messages return empty):
-      "CQ <tx_call> [<grid>]"           — directed CQ
-      "<rx_call> <tx_call> <grid>"      — first contact w/ grid
-      "<rx_call> <tx_call> [R]<report>" — signal report
-      "<rx_call> <tx_call> [73|RR73]"   — close
-
-    Anything not matching shape returns whatever fields we can pull
-    out, the rest empty.  The raw `message` text is always preserved
-    by the caller.
-    """
-    out: dict[str, Any] = {}
-    tokens = message.split()
-    if not tokens:
-        return out
-
-    # Slice off the first 1–3 tokens for call positions.
-    if tokens[0] == "CQ":
-        # "CQ [target] <tx_call> [grid]" — `target` may be a region
-        # tag like "DX", "EU", "POTA" that isn't a callsign.  Scan
-        # past non-call tokens until we hit the first call-shaped one
-        # (the sender), then look for a grid in the remaining tokens.
-        # Bracketed compound calls (`<K1ABC/QRP>`) are stripped before
-        # the regex match so they land as the tx_call.
-        for i, tok in enumerate(tokens[1:], start=1):
-            candidate = _strip_call_brackets(tok)
-            if candidate is not None and _CALL_RE.match(candidate):
-                out["tx_call"] = candidate
-                for later in tokens[i + 1:]:
-                    if _GRID_RE.match(later):
-                        out["grid"] = later
-                        break
-                break
-    else:
-        # <rx_call> <tx_call> [grid|report|RR73|73]
-        # Compound callsigns may appear bracketed (`<K1ABC/QRP>`) — that's
-        # what a WSJT-X-protocol decoder substitutes when it resolved a
-        # hash from its session table.  Strip the brackets before
-        # matching so the call lands in the row instead of being dropped.
-        rx_candidate = _strip_call_brackets(tokens[0])
-        if rx_candidate is not None and _CALL_RE.match(rx_candidate):
-            out["rx_call"] = rx_candidate
-        if len(tokens) >= 2:
-            tx_candidate = _strip_call_brackets(tokens[1])
-            if tx_candidate is not None and _CALL_RE.match(tx_candidate):
-                out["tx_call"] = tx_candidate
-        if len(tokens) >= 3:
-            tail = tokens[2]
-            if _GRID_RE.match(tail):
-                out["grid"] = tail
-            else:
-                m = _REPORT_RE.match(tail)
-                if m:
-                    try:
-                        out["report"] = int(m.group(1))
-                    except ValueError:
-                        pass
-    return out
-
-
-def _strip_call_brackets(token: str) -> Optional[str]:
-    """Strip surrounding ``<>`` from a token if it matches the WSJT-X
-    bracketed-call shape.
-
-    Returns the stripped call, or the original token if no brackets.
-    Returns ``None`` for the literal "<...>" placeholder (unresolved
-    hash, no recoverable callsign).
-    """
-    if not token:
-        return token
-    if token == "<...>":
-        return None
-    if token.startswith("<") and token.endswith(">") and len(token) > 2:
-        return token[1:-1]
-    return token
 
 
 # ── Tailer ──────────────────────────────────────────────────────────────────
@@ -461,7 +375,7 @@ class ChTailer:
 
         rows: list[dict] = []
         for line in text.splitlines():
-            row = parse_decoder_line(line, mode=self._mode)
+            row = parse_decoder_line(line, mode=self._mode, table=self._callhash)
             if row is None:
                 continue
             row["timing_authority"] = timing_authority

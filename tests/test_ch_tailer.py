@@ -2,7 +2,8 @@
 
 Covers:
   - parse_decode_ft8_line: line-format from `decode_ft8.c:363`
-  - _parse_message: best-effort callsign/grid/report extraction
+  - callhash.parse_message: best-effort callsign/grid/report extraction
+    (shared across all recorders) + compound-callsign hash substitution
   - ChTailer: tail/insert flow with a fake writer (no CH server needed)
 """
 from __future__ import annotations
@@ -18,11 +19,11 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from callhash import CallHashTable, hash22, parse_message
 from psk_recorder.core.ch_tailer import (
     ChTailer,
     parse_decode_ft8_line,
     parse_decoder_line,
-    _parse_message,
 )
 
 
@@ -93,52 +94,89 @@ class TestLineParser(unittest.TestCase):
 
 
 class TestMessageParser(unittest.TestCase):
+    """The shared callhash.parse_message is what every recorder uses.
+
+    It always returns the full key set (``message`` + the four call
+    fields), with empty/None defaults rather than omitting keys.
+    """
 
     def test_simple_first_contact(self):
-        out = _parse_message("K1ABC W1XYZ EM26")
+        out = parse_message("K1ABC W1XYZ EM26")
         self.assertEqual(out["rx_call"], "K1ABC")
         self.assertEqual(out["tx_call"], "W1XYZ")
         self.assertEqual(out["grid"], "EM26")
-        self.assertNotIn("report", out)
+        self.assertIsNone(out["report"])
 
     def test_six_char_grid(self):
-        out = _parse_message("K1ABC W1XYZ EM26ov")
+        out = parse_message("K1ABC W1XYZ EM26ov")
         self.assertEqual(out["grid"], "EM26ov")
 
     def test_signal_report(self):
-        out = _parse_message("K1ABC W1XYZ -15")
+        out = parse_message("K1ABC W1XYZ -15")
         self.assertEqual(out["rx_call"], "K1ABC")
         self.assertEqual(out["tx_call"], "W1XYZ")
         self.assertEqual(out["report"], -15)
 
     def test_signed_positive_report(self):
-        out = _parse_message("K1ABC W1XYZ +05")
+        out = parse_message("K1ABC W1XYZ +05")
         self.assertEqual(out["report"], 5)
 
     def test_roger_report(self):
-        out = _parse_message("K1ABC W1XYZ R-15")
+        out = parse_message("K1ABC W1XYZ R-15")
         self.assertEqual(out["report"], -15)
 
     def test_cq_message(self):
-        out = _parse_message("CQ K1ABC FN42")
+        out = parse_message("CQ K1ABC FN42")
         self.assertEqual(out["tx_call"], "K1ABC")
         self.assertEqual(out["grid"], "FN42")
-        self.assertNotIn("rx_call", out)
+        self.assertEqual(out["rx_call"], "")
 
     def test_cq_with_target(self):
         # "CQ DX K1ABC FN42" — "DX" is a region tag (not a callsign).
         # The parser scans past it and pulls K1ABC as the tx (sender).
-        out = _parse_message("CQ DX K1ABC FN42")
+        out = parse_message("CQ DX K1ABC FN42")
         self.assertEqual(out["tx_call"], "K1ABC")
         self.assertEqual(out["grid"], "FN42")
 
-    def test_freeform_returns_empty(self):
-        out = _parse_message("hello world")
-        self.assertEqual(out, {})
+    def test_freeform_returns_empty_calls(self):
+        out = parse_message("hello world")
+        self.assertEqual(out["tx_call"], "")
+        self.assertEqual(out["rx_call"], "")
+        self.assertEqual(out["grid"], "")
+        self.assertIsNone(out["report"])
+        self.assertEqual(out["message"], "hello world")
 
     def test_call_with_slash_suffix(self):
-        out = _parse_message("K1ABC/QRP W1XYZ FN42")
+        out = parse_message("K1ABC/QRP W1XYZ FN42")
         self.assertEqual(out["rx_call"], "K1ABC/QRP")
+
+
+class TestHashResolution(unittest.TestCase):
+    """End-to-end: a numeric hash from the patched decode_ft8 is resolved
+    back to the compound call once we've observed its announcement."""
+
+    def test_numeric_hash_resolved_after_announcement(self):
+        table = CallHashTable()
+        table.observe("<PJ4/K1ABC> CQ")
+        h = hash22("PJ4/K1ABC")
+        line = (
+            f"2026/05/07 12:34:56 -15 +0.50 14074131.2 ~ <{h:07d}> W1XYZ R-12"
+        )
+        row = parse_decode_ft8_line(line, mode="ft8", table=table)
+        self.assertIsNotNone(row)
+        self.assertEqual(row["rx_call"], "PJ4/K1ABC")     # substituted, not dropped
+        self.assertEqual(row["tx_call"], "W1XYZ")
+        self.assertEqual(row["report"], -12)
+        self.assertNotIn("<", row["message"])
+
+    def test_unknown_hash_left_as_placeholder(self):
+        table = CallHashTable()
+        line = "2026/05/07 12:34:56 -15 +0.50 14074131.2 ~ <1234567> W1XYZ 73"
+        row = parse_decode_ft8_line(line, mode="ft8", table=table)
+        self.assertIsNotNone(row)
+        self.assertEqual(row["rx_call"], "")              # unrecoverable
+        self.assertEqual(row["tx_call"], "W1XYZ")
+        self.assertIn("<1234567>", row["message"])        # raw preserved
 
 
 class TestDecoderLineRouter(unittest.TestCase):
