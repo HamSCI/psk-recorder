@@ -24,6 +24,7 @@ from psk_recorder.core.ch_tailer import (
     ChTailer,
     parse_decode_ft8_line,
     parse_decoder_line,
+    _FT8_DT_CAL_SEC,
 )
 
 
@@ -53,7 +54,9 @@ class TestLineParser(unittest.TestCase):
         self.assertIsNotNone(row)
         self.assertEqual(row["mode"], "ft8")
         self.assertEqual(row["score"], -15)
-        self.assertAlmostEqual(row["dt"], 0.50, places=2)
+        # FT8 dt is calibrated to the WSJT-X convention at parse time:
+        # raw 0.50 minus _FT8_DT_CAL_SEC (see the constant in ch_tailer).
+        self.assertAlmostEqual(row["dt"], 0.50 - _FT8_DT_CAL_SEC, places=2)
         self.assertEqual(row["frequency"], 14_074_131)
         self.assertAlmostEqual(row["frequency_mhz"], 14.0741312, places=4)
         self.assertEqual(row["message"], "K1ABC W1XYZ EM26")
