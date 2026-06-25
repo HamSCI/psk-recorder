@@ -35,7 +35,7 @@ External binaries must be present first:
 Then:
 
 ```bash
-git clone https://github.com/mijahauan/psk-recorder /opt/git/sigmond/psk-recorder
+git clone https://github.com/HamSCI/psk-recorder /opt/git/sigmond/psk-recorder
 sudo /opt/git/sigmond/psk-recorder/scripts/install.sh   # creates user, venv, config, units
 sudo psk-recorder config edit                           # interactive wizard (whiptail) -- see below
 sudo systemctl start psk-recorder@<radiod_id>
@@ -175,7 +175,7 @@ from* radiod, never specified by psk-recorder.
 MIT. See [LICENSE](LICENSE). Author: Michael Hauan, AC0G.
 
 [ka9q]: https://github.com/ka9q/ka9q-radio
-[ka9qpy]: https://github.com/mijahauan/ka9q-python
+[ka9qpy]: https://github.com/HamSCI/ka9q-python
 [ft8_lib]: https://github.com/ka9q/ft8_lib
 [ftlib]: https://github.com/pjsg/ftlib-pskreporter
-[contract]: https://github.com/mijahauan/sigmond/blob/main/docs/CLIENT-CONTRACT.md
+[contract]: https://github.com/HamSCI/sigmond/blob/main/docs/CLIENT-CONTRACT.md

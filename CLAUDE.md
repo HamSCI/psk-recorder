@@ -18,7 +18,7 @@ implements the HamSCI client contract.
 ## Authors
 
 - Michael Hauan (AC0G, GitHub: mijahauan)
-- Repo: https://github.com/mijahauan/psk-recorder
+- Repo: https://github.com/HamSCI/psk-recorder
 
 ## Quick reference
 
@@ -193,7 +193,7 @@ unresolved (no regression; you just don't recover them).
 ## External dependencies (not pip-installable)
 
 - **decode_ft8** — built from a **fork** of https://github.com/ka9q/ft8_lib
-  (`mijahauan/ft8_lib`, branch `emit-numeric-callsign-hash` / pinned
+  (`HamSCI/ft8_lib`, branch `emit-numeric-callsign-hash` / pinned
   commit `37484ad`) carrying the `<NNNNNNN>` hash-emission patch
   (`ft8/unpack.c`). Built and installed at `/usr/local/bin/decode_ft8`
   (`git checkout 37484ad && make && sudo make install`); must be rebuilt

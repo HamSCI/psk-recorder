@@ -1,5 +1,5 @@
 # psk-recorder configuration
-# See https://github.com/mijahauan/psk-recorder for documentation.
+# See https://github.com/HamSCI/psk-recorder for documentation.
 
 [station]
 callsign    = "YOURCALL"

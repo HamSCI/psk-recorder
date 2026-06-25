@@ -141,9 +141,9 @@ _ensure_sibling() {
     fi
 }
 
-_ensure_sibling callhash    https://github.com/mijahauan/callhash
-_ensure_sibling hs-uploader https://github.com/mijahauan/hs-uploader
-_ensure_sibling ka9q-python https://github.com/mijahauan/ka9q-python
+_ensure_sibling callhash    https://github.com/HamSCI/callhash
+_ensure_sibling hs-uploader https://github.com/HamSCI/hs-uploader
+_ensure_sibling ka9q-python https://github.com/HamSCI/ka9q-python
 
 # --- Phase 1.6: native FT8/FT4 decoder (ka9q/ft8_lib -> /usr/local/bin/decode_ft8) ---
 # psk-recorder forks decode_ft8 once per slot.  It is an upstream C binary, not
