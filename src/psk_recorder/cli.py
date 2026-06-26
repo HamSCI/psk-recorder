@@ -247,7 +247,7 @@ def _handle_inventory(args):
         payload = {
             "client": "psk-recorder",
             "version": "0.1.0",
-            "contract_version": "0.4",
+            "contract_version": "0.8",
             "config_path": str(config_path),
             "instances": [],
             "issues": [

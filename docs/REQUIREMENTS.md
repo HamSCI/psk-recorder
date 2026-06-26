@@ -252,9 +252,12 @@ lifecycle, CPU affinity, identity, status).
   `smd admin storage trim` (`PSK_RETENTION_MIN`, default 60 min, 30 min floor);
   the producer does **not** delete-on-commit, so multiple consumers can read the
   queue.
-- `PSK-Q-009` `[NEW]` 🟡 Decoder timestamp accuracy SHALL be `~1 s`
-  (slot-quantized); finer accuracy is explicitly not claimed and the §18
-  authority is read-but-not-applied (`uses_timing_calibration=false`).
+- `PSK-Q-009` `[NEW]` ✅ Decoder timestamp accuracy SHALL be `~1 s`
+  (slot-quantized); finer accuracy is explicitly not claimed. The §18 timing
+  authority is read and stamped for provenance only and intentionally NOT applied
+  to gate timing (`uses_timing_calibration=false`) — psk-recorder's products are
+  FT8 15 s / FT4 7.5 s slot-quantized, so RTP-default timing is sufficient. This
+  is a deliberate design decision (sigmond #36), not an open gap.
 
 ## 8. External interfaces
 

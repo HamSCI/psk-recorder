@@ -1,6 +1,6 @@
 # Sigmond client contract conformance
 
-psk-recorder implements the [HamSCI client contract][contract] (v0.4),
+psk-recorder implements the [HamSCI client contract][contract] (v0.8),
 maintained in the sigmond repository at
 [`docs/CLIENT-CONTRACT.md`][contract]. It is the contract's
 **greenfield v0.3 reference implementation** (per §9) and surfaced
@@ -34,22 +34,21 @@ psk-recorder's own — see [CONFIG.md](CONFIG.md). Cross-station
 concerns (chain-delay correction, log level) come from sigmond's
 coordination.env, not from this file.
 
-## §2 — Binding to radiod by id
+## §2 — Binding to radiod by status name
 
-Each `[[radiod]]` block in the config names its upstream radiod by an
-`id` field and a `radiod_status` mDNS hostname:
+Each `[[radiod]]` block in the config names its upstream radiod by its
+`status` mDNS multicast name — the canonical identifier. The Phase 6
+cutover removed the legacy `id` field; the status name IS the identifier:
 
 ```toml
 [[radiod]]
-id            = "bee1-rx888"
-radiod_status = "bee1-status.local"
+status = "bee1-status.local"
 ```
 
-Sigmond may override the status name at runtime by setting
-`RADIOD_BEE1_RX888_STATUS=...` in coordination.env. psk-recorder
-reads this in [src/psk_recorder/config.py:107](../src/psk_recorder/config.py)
-(`resolve_radiod_status`) before falling back to the config field.
-Standalone deployments work without the env var.
+psk-recorder resolves the status name in
+[src/psk_recorder/config.py](../src/psk_recorder/config.py)
+(`resolve_radiod_status`). Standalone deployments work without any
+sigmond env var.
 
 ## §3 — Self-describe CLI
 
@@ -70,7 +69,7 @@ psk-recorder version   --json
 {
   "client": "psk-recorder",
   "version": "0.1.0",
-  "contract_version": "0.4",
+  "contract_version": "0.8",
   "config_path": "/etc/psk-recorder/psk-recorder-config.toml",
   "git": {"sha": "...", "short": "...", "ref": "main", "dirty": false},
   "log_paths": {
@@ -107,7 +106,7 @@ Builders are in [src/psk_recorder/contract.py](../src/psk_recorder/contract.py).
 ## §4 — Systemd units
 
 Templated unit `psk-recorder@.service` with `%i` matching the
-`[[radiod]].id`. Sources both the sigmond coordination env and an
+`[[radiod]].status` name. Sources both the sigmond coordination env and an
 optional per-instance env file, both with the leading dash so the
 unit runs without sigmond installed:
 
