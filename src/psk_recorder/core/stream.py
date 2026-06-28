@@ -130,7 +130,7 @@ class ChannelSink:
         # RTP-reference re-validate the SlotClock anchor (_maybe_revalidate).
         self._channel_info = None
         # Diagnostic: how the current SlotClock anchor was derived.
-        self._anchor_source: str = ""        # "rtp_to_wallclock" | "wallclock_fallback"
+        self._anchor_source: str = ""        # "rtp_to_utc[+authority]" | "wallclock_fallback"
         # ChannelInfo.anchor_epoch observed when the anchor was set (diag).
         self._anchor_epoch: Optional[int] = None
         # §18 authority reader — supplies the dynamic RTP→UTC offset at anchor
@@ -299,43 +299,26 @@ class ChannelSink:
         self._latest_rtp = None
 
     def _anchor_utc_for(self, rtp_ts: int, n: int):
-        """Return (utc, source) mapping ``rtp_ts`` -> UTC, or (None, '').
+        """Return (utc, source) mapping ``rtp_ts`` -> UTC via the suite-shared
+        anchor helper.
 
-        Preferred: ``rtp_to_wallclock(rtp_ts, channel_info)`` — radiod's
-        GPS/RTP timebase — plus the hf-timestd §18 dynamic RTP→UTC offset
-        (0.0 when standalone).  Fallback: ``time.time() - n/sr`` (rtp_ts is
-        this just-received batch's first sample, ~n samples in the past).
-        This is the only wall-clock-ish read in the anchor path.
+        Preferred: radiod's GPS/RTP timebase (``ka9q.rtp_to_utc``) plus the
+        hf-timestd §18 dynamic RTP→UTC offset.  Fallback: the host wall clock
+        naming this batch's first sample (``n`` samples back).  The logic lives
+        once in ``hamsci_dsp.timing.acquire_anchor_utc`` so every sigmond
+        recorder anchors identically — no per-client copies to drift.
         """
-        offset_sec = 0.0
-        try:
-            snap = self._reader.read()
-            if snap is not None and snap.offset_usable:
-                offset_sec = snap.offset_seconds
-        except Exception as exc:                    # noqa: BLE001
-            logger.debug(
-                "%s %d Hz: authority read failed at anchor: %s",
-                self._mode.upper(), self._frequency_hz, exc,
-            )
-        if self._channel_info is not None:
-            try:
-                from ka9q import rtp_to_wallclock
-                utc = rtp_to_wallclock(
-                    rtp_ts, self._channel_info,
-                    wallclock_hint_sec=time.time() + offset_sec,
-                )
-                if utc is not None:
-                    source = (
-                        "rtp_to_wallclock+authority"
-                        if offset_sec else "rtp_to_wallclock"
-                    )
-                    return utc + offset_sec, source
-            except Exception as exc:                # noqa: BLE001
-                logger.warning(
-                    "%s %d Hz: rtp_to_wallclock raised on anchor: %s",
-                    self._mode.upper(), self._frequency_hz, exc,
-                )
-        return time.time() - n / self._sample_rate + offset_sec, "wallclock_fallback"
+        from ka9q import rtp_to_utc
+        from hamsci_dsp.timing import acquire_anchor_utc
+        a = acquire_anchor_utc(
+            first_rtp=rtp_ts,
+            channel_info=self._channel_info,
+            rtp_to_utc=rtp_to_utc,
+            authority_reader=self._reader,
+            samples_behind=n,
+            sample_rate=self._sample_rate,
+        )
+        return a.utc, a.source
 
     def on_stream_dropped(self, reason: str) -> None:
         logger.warning(

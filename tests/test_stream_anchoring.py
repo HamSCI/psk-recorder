@@ -76,13 +76,13 @@ class TestRtpAnchoring(unittest.TestCase):
         try:
             n = 2400
             q = _FakeQuality(last_rtp_timestamp=1_000_000 + n)
-            with mock.patch("ka9q.rtp_to_wallclock", return_value=1_700_000_500.0):
+            with mock.patch("ka9q.rtp_to_utc", return_value=1_700_000_500.0):
                 with mock.patch("psk_recorder.core.stream.time.time",
                                 return_value=1_700_000_500.0):
                     with mock.patch.object(sink._ring, "push") as push:
                         sink.on_samples(np.zeros(n, dtype=np.float32), q)
             self.assertTrue(sink._clock.anchored)
-            self.assertEqual(sink._anchor_source, "rtp_to_wallclock")
+            self.assertEqual(sink._anchor_source, "rtp_to_utc")
             self.assertAlmostEqual(sink._clock._anchor_utc, 1_700_000_500.0, places=3)
             # First batch's first sample is the anchor -> ring offset 0.
             push.assert_called_once()
@@ -93,11 +93,13 @@ class TestRtpAnchoring(unittest.TestCase):
             _cleanup_sink(sink)
 
     def test_wall_clock_fallback_without_channel_info(self):
-        sink = _make_sink()   # no channel_info set
+        # _NoAuthority + no channel_info -> the shared helper's bare wall-clock
+        # fallback.  Mock the helper's own clock (hamsci_dsp.timing.time.time).
+        sink = _make_sink(authority_reader=_NoAuthority())   # no channel_info set
         try:
             n = 2400          # 200 ms
             q = _FakeQuality(last_rtp_timestamp=500_000 + n)
-            with mock.patch("psk_recorder.core.stream.time.time",
+            with mock.patch("hamsci_dsp.timing.time.time",
                             return_value=1_700_000_000.0):
                 with mock.patch.object(sink._ring, "push"):
                     sink.on_samples(np.zeros(n, dtype=np.float32), q)
@@ -112,6 +114,7 @@ class TestRtpAnchoring(unittest.TestCase):
         class _FakeSnap:
             offset_usable = True
             offset_seconds = 0.004250
+            rtp_to_utc_offset_ns = 4_250_000
         class _FakeReader:
             def read(self):
                 return _FakeSnap()
@@ -121,12 +124,12 @@ class TestRtpAnchoring(unittest.TestCase):
         try:
             n = 2400
             q = _FakeQuality(last_rtp_timestamp=1_000_000 + n)
-            with mock.patch("ka9q.rtp_to_wallclock", return_value=1_700_000_500.0):
+            with mock.patch("ka9q.rtp_to_utc", return_value=1_700_000_500.0):
                 with mock.patch("psk_recorder.core.stream.time.time",
                                 return_value=1_700_000_500.0):
                     with mock.patch.object(sink._ring, "push"):
                         sink.on_samples(np.zeros(n, dtype=np.float32), q)
-            self.assertEqual(sink._anchor_source, "rtp_to_wallclock+authority")
+            self.assertEqual(sink._anchor_source, "rtp_to_utc+authority")
             self.assertAlmostEqual(sink._clock._anchor_utc,
                                    1_700_000_500.00425, places=4)
         finally:
@@ -140,7 +143,7 @@ class TestRtpAnchoring(unittest.TestCase):
         try:
             n1, n2 = SR, SR // 2     # 1.0 s then 0.5 s, contiguous in RTP
             r0 = 4_000_000
-            with mock.patch("ka9q.rtp_to_wallclock", return_value=2000.0):
+            with mock.patch("ka9q.rtp_to_utc", return_value=2000.0):
                 with mock.patch.object(sink._ring, "push") as push:
                     with mock.patch("psk_recorder.core.stream.time.time",
                                     return_value=1000.0):
@@ -163,7 +166,7 @@ class TestRtpAnchoring(unittest.TestCase):
         sink = _make_sink()
         sink.set_channel_info(_FakeChannelInfo())
         try:
-            with mock.patch("ka9q.rtp_to_wallclock", return_value=2000.0):
+            with mock.patch("ka9q.rtp_to_utc", return_value=2000.0):
                 with mock.patch.object(sink._ring, "push"):
                     sink.on_samples(
                         np.zeros(SR, dtype=np.float32),
