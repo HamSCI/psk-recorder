@@ -121,11 +121,9 @@ class ReceiverManager:
 
         self._control = None
         # Background listener that keeps each channel's (gps_time,
-        # rtp_timesnap) anchor fresh from radiod's status multicast, and the
-        # per-radiod reporter that turns a detected timing divergence into a
-        # loud operator alarm.  Both wired in provision_channels().
+        # rtp_timesnap) anchor fresh from radiod's status multicast so the ONE
+        # anchor read lands on a current snapshot.  Wired in provision_channels().
         self._status_listener = None
-        self._fault_reporter = None
         self._sinks: list[ChannelSink] = []
         self._multi_streams: list = []
         # (MultiStream, ssrc) pairs the process-global keepalive
@@ -193,13 +191,11 @@ class ReceiverManager:
         # v0.3 §7 / ka9q-python ≥ 3.14.0.
         self._control = RadiodControl(status, client_id="psk-recorder")
 
-        # Keep each channel's timing anchor fresh from radiod's status
-        # broadcasts (~2 Hz) so on_samples anchors/re-anchors off radiod's
-        # current GPS reference instead of a stale provisioning-time snapshot
-        # — and arm the per-radiod fault reporter.  Best-effort: a listener
-        # failure must not block provisioning (the detector simply idles).
-        from psk_recorder.core.timing_fault import TimingFaultReporter
-        self._fault_reporter = TimingFaultReporter(self._radiod_id, self._log_dir)
+        # Keep the channel_info fresh from radiod's status broadcasts (~2 Hz)
+        # so the ONE anchor read in on_samples lands on radiod's current GPS
+        # reference rather than a stale provisioning-time snapshot.  We do not
+        # re-read it per batch — the grid is RTP-driven and we defer to it.
+        # Best-effort: a listener failure must not block provisioning.
         try:
             from ka9q.status_listener import StatusListener
             self._status_listener = StatusListener(status)
@@ -294,8 +290,6 @@ class ReceiverManager:
                     decoder_kind=decoder_kind,
                     keep_wav=keep_wav,
                     spool_spots=spool_spots,
-                    radiod_id=self._radiod_id,
-                    fault_reporter=self._fault_reporter,
                 )
                 if self._provision_one_with_retry(
                         sink, multi_by_group, deadline):
