@@ -44,16 +44,19 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 
+from ka9q import SlotClock
+
 from psk_recorder.config import FT4_CADENCE_SEC, FT8_CADENCE_SEC
-from psk_recorder.core.authority_reader import AuthorityReader
+from hamsci_dsp.timing import AuthorityReader
 from psk_recorder.core.ring import Ring
-from psk_recorder.core.slot import SlotWorker
+from psk_recorder.core.slot import SlotWorker, SETTLE_SEC
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +97,17 @@ class ChannelSink:
             sample_rate=sample_rate,
         )
 
+        # Epoch-aligned, RTP-referenced slot timing.  The clock is anchored
+        # off radiod's GPS-true RTP timestamp (on_samples) and harvested by
+        # the SlotWorker thread; the lock guards the shared clock state.
+        self._clock = SlotClock(
+            cadence_sec=cadence, sample_rate=sample_rate, settle_sec=SETTLE_SEC,
+        )
+        self._clock_lock = threading.Lock()
+        # RTP timestamp just past the newest delivered sample (the clock's
+        # high-water mark).  Written by on_samples, read by the SlotWorker.
+        self._latest_rtp: Optional[int] = None
+
         self._slot_worker = SlotWorker(
             ring=self._ring,
             mode=mode,
@@ -102,32 +116,27 @@ class ChannelSink:
             spool_dir=spool_dir / mode,
             log_fd=log_fd,
             decoder_path=decoder_path,
+            clock=self._clock,
+            get_latest_rtp=lambda: self._latest_rtp,
+            clock_lock=self._clock_lock,
             decoder_kind=decoder_kind,
             keep_wav=keep_wav,
             spool_spots=spool_spots,
         )
 
         self._total_delivered: int = 0
-        # ChannelInfo carrying gps_time / rtp_timesnap / chain_delay
-        # — used ONCE to derive the initial anchor via rtp_to_wallclock.
-        # After the first batch the anchor is frozen; channel_info refreshes
-        # from on_stream_restored() are deliberately ignored.
+        # ChannelInfo carrying gps_time / rtp_timesnap / chain_delay — used to
+        # map RTP→UTC at anchor time and, kept fresh by the StatusListener, to
+        # RTP-reference re-validate the SlotClock anchor (_maybe_revalidate).
         self._channel_info = None
-        # Anchor-once state (see module docstring).  Set on the first
-        # on_samples() batch; never re-set afterwards.
-        self._anchor_utc: Optional[float] = None
-        self._anchor_total_samples: int = 0
-        self._anchor_source: str = ""        # diagnostic: "rtp_to_wallclock" | "wallclock_fallback"
-        # ChannelInfo.anchor_epoch observed when the current anchor was set.
-        # When the StatusListener bumps it (radiod stepped its RTP↔GPS
-        # offset), we re-anchor immediately off the fresh snapshot rather
-        # than waiting for the projection-divergence gate to trip.
+        # Diagnostic: how the current SlotClock anchor was derived.
+        self._anchor_source: str = ""        # "rtp_to_wallclock" | "wallclock_fallback"
+        # ChannelInfo.anchor_epoch observed when the anchor was set (diag).
         self._anchor_epoch: Optional[int] = None
-        # Authority reader is retained so other consumers (e.g., diags)
-        # can still inspect what hf-timestd is publishing.  Not used for
-        # anchoring anymore — the one-shot anchor read is the only path.
+        # §18 authority reader — supplies the dynamic RTP→UTC offset at anchor
+        # time (0.0 standalone); also inspectable by diags.
         self._reader = authority_reader if authority_reader is not None else AuthorityReader()
-        # Timing-fault detector state (see _maybe_check_timing).  A
+        # RTP-reference re-validation state (see _maybe_revalidate).  The
         # StatusListener keeps self._channel_info's (gps_time, rtp_timesnap)
         # fresh, so re-anchoring lands on radiod's current GPS reference.
         self._radiod_id = radiod_id
@@ -188,108 +197,84 @@ class ChannelSink:
         self._channel_info = channel_info
 
     def on_samples(self, samples: np.ndarray, quality) -> None:
-        """MultiStream callback — anchor once, then sample-count project.
+        """MultiStream callback — feed the RTP-referenced SlotClock + ring.
 
-        First batch sets `_anchor_utc` + `_anchor_total_samples` via
-        rtp_to_wallclock (preferred) or `time.time()` (fallback).  Every
-        subsequent batch's UTC is computed by pure sample-count
-        projection — no wall-clock reads, no channel_info refreshes.
+        Each batch is tagged with the absolute sample offset of its FIRST
+        sample, derived from radiod's GPS-true RTP timestamp
+        (``quality.last_rtp_timestamp``) via the shared ``ka9q.SlotClock`` —
+        NOT from a delivered-sample-count projection.  This is the fix for
+        the long-standing "decodes=N/N but spots=0" drift (the audio handed
+        to the decoder now always lines up with the RTP grid point its WAV
+        is labelled with).  The slot harvesting + WAV write happen on the
+        SlotWorker thread; here we only anchor, push, and re-validate.
         """
         n = len(samples)
         if n == 0:
             return
+        last_rtp = getattr(quality, "last_rtp_timestamp", None)
+        if not last_rtp:
+            # No RTP timestamp yet (pre-first-packet) — nothing to anchor to.
+            return
+        last_rtp = int(last_rtp) & 0xFFFFFFFF
+        # RTP timestamp of this batch's first sample.  The batch ends ~at the
+        # last packet's timestamp; first sample = last_rtp - n.  The <1-packet
+        # constant bias from ignoring the final packet's own length is
+        # harmless (decode_ft8 tolerates ±2.5 s) and does NOT accumulate —
+        # every batch is pinned to a true GPS-stamped RTP value.
+        batch_first_rtp = (last_rtp - n) & 0xFFFFFFFF
 
-        # ── Proactive re-anchor on a radiod offset step ──
-        # The StatusListener bumps channel_info.anchor_epoch the instant
-        # radiod reports a different RTP↔GPS offset.  Drop the frozen anchor
-        # so the same batch re-anchors off the fresh snapshot — no waiting
-        # for sample-count projection to drift past the divergence gate
-        # (whose wrap-epoch disambiguation can mask a gross step entirely).
-        if self._anchor_utc is not None and self._channel_info is not None:
-            cur_epoch = getattr(self._channel_info, "anchor_epoch", None)
-            if cur_epoch is not None and cur_epoch != self._anchor_epoch:
-                step = getattr(self._channel_info, "last_offset_step_sec", None)
-                logger.warning(
-                    "%s %d Hz: radiod RTP↔GPS offset STEPPED %s (anchor_epoch "
-                    "%s→%s) — re-anchoring off fresh status snapshot",
-                    self._mode.upper(), self._frequency_hz,
-                    ("%+.3fs" % step) if step is not None else "?",
-                    self._anchor_epoch, cur_epoch,
+        with self._clock_lock:
+            if not self._clock.anchored:
+                anchor_utc, source = self._anchor_utc_for(batch_first_rtp, n)
+                if anchor_utc is None:
+                    return
+                self._clock.anchor(batch_first_rtp, anchor_utc)
+                self._anchor_source = source
+                self._anchor_epoch = getattr(
+                    self._channel_info, "anchor_epoch", None)
+                logger.info(
+                    "%s %d Hz: SlotClock anchored via %s",
+                    self._mode.upper(), self._frequency_hz, source,
                 )
-                self._anchor_utc = None
+            start_off = self._clock.offset_of_rtp(batch_first_rtp)
 
-        if self._anchor_utc is None:
-            anchor, source = self._compute_initial_anchor(samples, quality)
-            if anchor is None:
-                # rtp_to_wallclock failed AND time.time() somehow returned
-                # something useless — extremely rare; defer to the next
-                # batch rather than push samples with a bogus UTC.
-                return
-            self._anchor_utc = anchor
-            self._anchor_total_samples = quality.total_samples_delivered - n
-            self._anchor_source = source
-            # Record the epoch this anchor was derived against so a later
-            # status step is detected as a change.
-            self._anchor_epoch = getattr(self._channel_info, "anchor_epoch", None)
-            logger.info(
-                "%s %d Hz: anchored via %s at UTC %.3f (sample %d, epoch %s)",
-                self._mode.upper(), self._frequency_hz, source,
-                self._anchor_utc, self._anchor_total_samples, self._anchor_epoch,
-            )
+        self._ring.push(samples, start_off)
+        self._latest_rtp = last_rtp
+        self._total_delivered += n
 
-        # Pure sample-count projection — the timing invariant the user
-        # asked for (and the same model wspr-recorder's BandRecorder uses).
-        delta_samples = (
-            quality.total_samples_delivered - n - self._anchor_total_samples
-        )
-        utc_of_first = (
-            self._anchor_utc + delta_samples / self._sample_rate
-        )
+        self._maybe_revalidate()
 
-        # Detect → alarm → re-anchor (operator principle 2026-06-05):
-        # compare this projection against radiod's fresh GPS reference for
-        # the same RTP value; on a gross divergence raise a loud fault AND
-        # drop the anchor so the next batch re-anchors off the fresh status
-        # snapshot, recovering decode timing instead of drifting silently.
-        self._maybe_check_timing(quality, n, utc_of_first)
+    def _maybe_revalidate(self) -> None:
+        """Throttled RTP-reference anchor check (~1 Hz).
 
-        self._ring.push(samples, utc_of_first)
-        self._total_delivered = quality.total_samples_delivered
-
-    def _maybe_check_timing(self, quality, n, projected_utc) -> None:
-        """Compare the sample-count projection against radiod's fresh GPS
-        reference (rtp_to_wallclock on the StatusListener-refreshed
-        channel_info) for the same RTP value.  Throttled to ~1 Hz.  On a
-        divergence past ``_fault_threshold_sec`` raise a loud fault and
-        re-anchor; a cooldown stops one fault re-anchoring every batch."""
-        if self._fault_reporter is None or self._channel_info is None:
+        Recompute the next boundary's true UTC from the StatusListener-
+        refreshed ``channel_info`` via ``rtp_to_wallclock`` and compare to the
+        SlotClock's grid projection.  A sustained gross divergence means the
+        INITIAL anchor was wrong (stale GPS snapshot / wrap mis-
+        disambiguation) — re-anchor off the fresh reference and flush the
+        ring (whose offsets are anchor-relative).  Cheap and rare; the grid
+        itself never drifts, so this only ever fires on a bad anchor.
+        """
+        if self._channel_info is None:
             return
         mono = time.monotonic()
         if mono - self._last_check_mono < 1.0:
             return
         self._last_check_mono = mono
-        first_rtp = getattr(quality, "first_rtp_timestamp", 0)
-        if not first_rtp:
-            return
         try:
             from ka9q import rtp_to_wallclock
-            batch_start_sample = quality.total_samples_delivered - n
-            rtp_ts = (first_rtp + batch_start_sample) & 0xFFFFFFFF
-            reference = rtp_to_wallclock(
-                rtp_ts, self._channel_info, wallclock_hint_sec=projected_utc,
-            )
-        except Exception as e:  # noqa: BLE001 — detection must not crash audio
-            logger.debug("%s %d Hz: timing check raised: %s",
-                         self._mode.upper(), self._frequency_hz, e)
+            with self._clock_lock:
+                div = self._clock.divergence_sec(
+                    self._channel_info, rtp_to_wallclock)
+        except Exception as exc:  # noqa: BLE001 — detection must not crash audio
+            logger.debug("%s %d Hz: divergence check raised: %s",
+                         self._mode.upper(), self._frequency_hz, exc)
             return
-        if reference is None:
+        if div is None:
             return
-        divergence = projected_utc - reference
-        if abs(divergence) <= self._fault_threshold_sec:
+        if abs(div) <= self._fault_threshold_sec:
             self._fault_strikes = 0
             return
-        # Persistence: require _fault_after consecutive over-threshold checks
-        # (~1 s apart) before acting, so a lone jitter spike doesn't re-anchor.
         self._fault_strikes += 1
         if self._fault_strikes < self._fault_after:
             return
@@ -297,26 +282,31 @@ class ChannelSink:
         if mono - self._last_reanchor_mono < self._reanchor_cooldown_sec:
             return
         self._last_reanchor_mono = mono
-        self._fault_reporter.report(self._mode, self._frequency_hz, divergence)
-        # Re-anchor: clear the frozen anchor; the next batch recomputes it
-        # from the fresh (StatusListener-refreshed) channel_info.
-        self._anchor_utc = None
+        if self._fault_reporter is not None:
+            try:
+                self._fault_reporter.report(
+                    self._mode, self._frequency_hz, div)
+            except Exception:  # noqa: BLE001
+                pass
+        logger.error(
+            "TIMING FAULT rx=%s mode=%s %d Hz: SlotClock anchor diverged "
+            "%+.3fs from radiod GPS reference — re-anchoring + flushing ring",
+            self._radiod_id, self._mode, self._frequency_hz, div,
+        )
+        with self._clock_lock:
+            self._clock.reset()
+        self._ring.clear()
+        self._latest_rtp = None
 
-    def _compute_initial_anchor(self, samples: np.ndarray, quality):
-        """Return (anchor_utc, source) for the very first batch.
+    def _anchor_utc_for(self, rtp_ts: int, n: int):
+        """Return (utc, source) mapping ``rtp_ts`` -> UTC, or (None, '').
 
-        Preferred: rtp_to_wallclock (radiod's GPS/RTP timebase) plus the
-        hf-timestd §18 dynamic RTP→UTC offset from authority.json, applied
-        once here — the GPSDO-clocked RTP counter carries the cadence
-        thereafter.  This matches codar/wspr; previously psk applied only
-        ka9q's §8 chain-delay (via channel_info) and ignored the dynamic
-        offset.  Fallback: time.time() adjusted to "UTC of first sample in
-        this batch".  Either way, this is the ONLY wall-clock read for the
-        recorder's lifetime.
+        Preferred: ``rtp_to_wallclock(rtp_ts, channel_info)`` — radiod's
+        GPS/RTP timebase — plus the hf-timestd §18 dynamic RTP→UTC offset
+        (0.0 when standalone).  Fallback: ``time.time() - n/sr`` (rtp_ts is
+        this just-received batch's first sample, ~n samples in the past).
+        This is the only wall-clock-ish read in the anchor path.
         """
-        n = len(samples)
-        # §18 dynamic offset (seconds), 0.0 when hf-timestd is absent or
-        # has no usable offset (standalone).  Read once at anchor time.
         offset_sec = 0.0
         try:
             snap = self._reader.read()
@@ -330,31 +320,22 @@ class ChannelSink:
         if self._channel_info is not None:
             try:
                 from ka9q import rtp_to_wallclock
-                first_rtp = getattr(quality, "first_rtp_timestamp", 0)
-                if first_rtp != 0:
-                    batch_start_sample = quality.total_samples_delivered - n
-                    rtp_ts = (first_rtp + batch_start_sample) & 0xFFFFFFFF
-                    # Offset-corrected hint for wrap disambiguation only
-                    # (±period/2 tolerance); the real correction is the
-                    # explicit add below.  See ka9q rtp_to_wallclock docs.
-                    utc = rtp_to_wallclock(
-                        rtp_ts, self._channel_info,
-                        wallclock_hint_sec=time.time() + offset_sec,
+                utc = rtp_to_wallclock(
+                    rtp_ts, self._channel_info,
+                    wallclock_hint_sec=time.time() + offset_sec,
+                )
+                if utc is not None:
+                    source = (
+                        "rtp_to_wallclock+authority"
+                        if offset_sec else "rtp_to_wallclock"
                     )
-                    if utc is not None:
-                        source = (
-                            "rtp_to_wallclock+authority"
-                            if offset_sec else "rtp_to_wallclock"
-                        )
-                        return utc + offset_sec, source
+                    return utc + offset_sec, source
             except Exception as exc:                # noqa: BLE001
                 logger.warning(
                     "%s %d Hz: rtp_to_wallclock raised on anchor: %s",
                     self._mode.upper(), self._frequency_hz, exc,
                 )
-        # Wall-clock fallback: time.time() *is* the UTC of "right now",
-        # so the UTC of this batch's FIRST sample is (now - n/sample_rate).
-        return time.time() - n / self._sample_rate, "wallclock_fallback"
+        return time.time() - n / self._sample_rate + offset_sec, "wallclock_fallback"
 
     def on_stream_dropped(self, reason: str) -> None:
         logger.warning(
@@ -382,8 +363,10 @@ class ChannelSink:
         # never fires on_stream_restored.  Re-anchoring is the
         # intended behavior.
         self._channel_info = channel_info
-        self._anchor_utc = None
-        self._anchor_total_samples = 0
+        with self._clock_lock:
+            self._clock.reset()
+        self._ring.clear()
+        self._latest_rtp = None
         self._anchor_source = ""
         logger.info(
             "%s %d Hz: stream restored — re-anchoring on next batch",

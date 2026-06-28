@@ -214,7 +214,7 @@ class ReceiverManager:
         # Surface the Fusion governor identity at startup so the journal
         # record makes multi-radiod attribution clear.
         try:
-            from psk_recorder.core.authority_reader import AuthorityReader
+            from hamsci_dsp.timing import AuthorityReader
             snap = AuthorityReader().read()
             governor = snap.governor_radiod if snap is not None else None
         except Exception as e:

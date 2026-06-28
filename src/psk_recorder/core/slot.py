@@ -25,7 +25,9 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
+
+from ka9q import SlotClock
 
 from psk_recorder.core.ring import Ring
 from psk_recorder.core.wav import write_wav
@@ -58,6 +60,9 @@ class SlotWorker:
         spool_dir: Path,
         log_fd,
         decoder_path: str,
+        clock: SlotClock,
+        get_latest_rtp: Callable[[], Optional[int]],
+        clock_lock: threading.Lock,
         keep_wav: bool = False,
         decoder_kind: str = DECODER_FT8_LIB,
         spool_spots: bool = False,
@@ -74,12 +79,18 @@ class SlotWorker:
         self._spool_dir = spool_dir
         self._log_fd = log_fd
         self._decoder_path = decoder_path
+        # Epoch-aligned, RTP-referenced slot timing (shared ka9q.SlotClock).
+        # The clock is anchored by ChannelSink.on_samples off the GPS-true RTP
+        # timestamp; this worker only harvests completed slots and extracts
+        # their exact sample windows by absolute offset.
+        self._clock = clock
+        self._get_latest_rtp = get_latest_rtp
+        self._clock_lock = clock_lock
         self._decoder_kind = decoder_kind
         self._keep_wav = keep_wav
         self._spool_spots = spool_spots
         self._running = False
         self._thread: Optional[threading.Thread] = None
-        self._next_slot_start: Optional[float] = None
         # Each entry: (proc, wav_path, slot_start_utc, fork_monotonic).
         self._pending_procs: list[tuple[subprocess.Popen, Path,
                                         float, float]] = []
@@ -114,60 +125,37 @@ class SlotWorker:
     def _tick(self) -> None:
         self._reap_finished()
 
-        head = self._ring.head_utc()
-        if head is None:
+        latest_rtp = self._get_latest_rtp()
+        if latest_rtp is None:
             return
 
-        if self._next_slot_start is None:
-            self._next_slot_start = self._last_completed_boundary(head)
-            logger.info(
-                "%s %d Hz: first slot at %.1f (head=%.1f)",
-                self._mode.upper(), self._frequency_hz,
-                self._next_slot_start, head,
-            )
-            return
+        # Harvest every epoch-aligned slot that has fully arrived.  The clock
+        # is shared with on_samples (which anchors / re-anchors it), so guard
+        # all clock state with the lock.
+        with self._clock_lock:
+            if not self._clock.anchored:
+                return
+            slots = self._clock.advance(latest_rtp)
+            # Resolve each slot's absolute ring offset while we hold the lock
+            # (offset_of_rtp reads the anchor).
+            resolved = [
+                (self._clock.offset_of_rtp(s.start_rtp), s) for s in slots
+            ]
 
-        slot_end = self._next_slot_start + self._cadence_sec
-        if head < slot_end + SETTLE_SEC:
-            return
+        for start_off, slot in resolved:
+            samples = self._ring.extract_by_offset(start_off, slot.n_samples)
+            if samples is None:
+                self.slots_empty += 1
+                logger.warning(
+                    "%s %d Hz: slot %d at %.1f — insufficient samples, skipping",
+                    self._mode.upper(), self._frequency_hz,
+                    slot.index, slot.start_utc,
+                )
+                continue
+            wav_path = self._write_spool_wav(samples, slot.start_utc)
+            self._fork_decoder(wav_path, slot.start_utc)
 
-        samples = self._ring.extract_slot(
-            self._next_slot_start, self._cadence_sec
-        )
-        if samples is None:
-            self.slots_empty += 1
-            logger.warning(
-                "%s %d Hz: slot at %.1f — insufficient samples, skipping",
-                self._mode.upper(), self._frequency_hz, self._next_slot_start,
-            )
-            self._next_slot_start = slot_end
-            return
-
-        wav_path = self._write_spool_wav(samples)
-        self._fork_decoder(wav_path)
-
-        self._next_slot_start = slot_end
-
-    def _align_to_cadence(self, utc: float) -> float:
-        """Find the next cadence boundary at or after utc."""
-        cadence = self._cadence_sec
-        return math.ceil(utc / cadence) * cadence
-
-    def _last_completed_boundary(self, head_utc: float) -> float:
-        """Find the start of the most recent slot whose end + settle <= head.
-
-        This means: floor((head - settle - cadence) / cadence) * cadence,
-        clamped so we never go negative. We start decoding from the most
-        recently completed slot, not some future one.
-        """
-        cadence = self._cadence_sec
-        latest_end = head_utc - SETTLE_SEC
-        latest_start = latest_end - cadence
-        if latest_start < 0:
-            return 0.0
-        return math.floor(latest_start / cadence) * cadence
-
-    def _write_spool_wav(self, samples) -> Path:
+    def _write_spool_wav(self, samples, slot_start_utc: float) -> Path:
         # Filename HHMMSS must be an integer second AND must parse via
         # ka9q/ft8_lib's `sscanf("%04d%02d%02d%c%02d%02d%02d", ...)`.
         # Three constraints together:
@@ -191,7 +179,7 @@ class SlotWorker:
         #
         # WAV content is still extracted at the true slot_start_utc.
         # Only the FILENAME label is rounded.
-        ceiled = int(math.ceil(self._next_slot_start))
+        ceiled = int(math.ceil(slot_start_utc))
         slot_time = time.gmtime(ceiled)
         freq_khz = self._frequency_hz // 1000
         filename = time.strftime("%Y%m%d_%H%M%S", slot_time) + f"_{freq_khz}.wav"
@@ -205,23 +193,8 @@ class SlotWorker:
         )
         return wav_path
 
-    def _fork_decoder(self, wav_path: Path) -> None:
-        if self._next_slot_start is None:
-            # Should never happen — the ring buffer always carries a
-            # sample-count-projected UTC for the slot once the recorder
-            # has anchored.  Falling back to time.time() here means the
-            # slot label is now off the RTP-reference path; log so the
-            # operator sees the degraded mode (METROLOGY.md §4.5).
-            logger.warning(
-                "%s %d Hz: slot_start unset at decode fork — falling back "
-                "to wall clock for slot label.  Pipeline anchor is missing; "
-                "decode-time labeling may be wrong.",
-                self._mode.upper(), self._frequency_hz,
-            )
-            slot_start = time.time()
-        else:
-            slot_start = self._next_slot_start
-        self._fork_decoder_ft8_lib(wav_path, slot_start)
+    def _fork_decoder(self, wav_path: Path, slot_start_utc: float) -> None:
+        self._fork_decoder_ft8_lib(wav_path, slot_start_utc)
 
     def _fork_decoder_ft8_lib(self, wav_path: Path, slot_start: float) -> None:
         """ka9q/ft8_lib decode_ft8 — captures stdout for tee on reap.
