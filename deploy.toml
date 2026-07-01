@@ -108,7 +108,12 @@ parser_attr  = "parse_receiver_channels"
 # hs_uploader.pipeline_factory consumes.
 # ---------------------------------------------------------------------------
 
-# PSK (FT8/FT4) spot rows -> pskreporter.info (TCP)
+# PSK (FT8/FT4) + MSK144 spot rows -> pskreporter.info (TCP).
+# This is the SHARED PSKReporter egress for the whole psk.spots stream:
+# meteor-scatter writes its MSK144 rows into psk.spots (mode="msk144") too, so
+# the mode filter includes msk144 and one pipeline delivers all three modes —
+# the same unification the wsprdaemon server (wd30) uses. meteor-scatter
+# declares an identical block; the generator dedups by name.
 [[hs_uploader.pipeline]]
 name = "psk-pskreporter"
 batch_limit = 500
@@ -120,7 +125,7 @@ accepted_schema_versions = [2]
 start_at = "now"
 delete_on_commit = false
 select_columns = ["time", "frequency", "mode", "snr_db", "tx_call", "grid", "score", "message", "rx_source", "frequency_bucket_hz"]
-extra_where = [["tx_call", "!=", ""], ["mode", "IN", ["ft8", "ft4"]]]
+extra_where = [["tx_call", "!=", ""], ["mode", "IN", ["ft8", "ft4", "msk144"]]]
 [hs_uploader.pipeline.transport]
 type = "pskreporter"
 decoding_software = "psk-recorder/0.1 (radiod={radiod_status})"
