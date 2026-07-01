@@ -98,3 +98,32 @@ description  = "FT4/FT8 spot channels (per-mode freqs_hz)"
 per_instance = true
 parser_file  = "src/psk_recorder/sigmond_tui.py"
 parser_attr  = "parse_receiver_channels"
+
+# ---------------------------------------------------------------------------
+# Single-host uploader pipeline (Stage 6).  `smd admin uploader manifest`
+# reads this [[hs_uploader.pipeline]] block from every enabled client,
+# substitutes per-site identity ({radiod_status} resolved from
+# coordination.toml), and renders /etc/hs-uploader/pipelines.toml for the
+# single-host daemon.  The block shape IS the [[pipeline]] shape
+# hs_uploader.pipeline_factory consumes.
+# ---------------------------------------------------------------------------
+
+# PSK (FT8/FT4) spot rows -> pskreporter.info (TCP)
+[[hs_uploader.pipeline]]
+name = "psk-pskreporter"
+batch_limit = 500
+[hs_uploader.pipeline.source]
+type = "sqlite"
+database = "psk"
+table = "spots"
+accepted_schema_versions = [2]
+start_at = "now"
+delete_on_commit = false
+select_columns = ["time", "frequency", "mode", "snr_db", "tx_call", "grid", "score", "message", "rx_source", "frequency_bucket_hz"]
+extra_where = [["tx_call", "!=", ""], ["mode", "IN", ["ft8", "ft4"]]]
+[hs_uploader.pipeline.transport]
+type = "pskreporter"
+decoding_software = "psk-recorder/0.1 (radiod={radiod_status})"
+[hs_uploader.pipeline.retry]
+base = 2.0
+cap_sec = 300.0
