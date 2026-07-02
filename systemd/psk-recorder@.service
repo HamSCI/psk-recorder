@@ -14,6 +14,11 @@ WatchdogSec=120
 NotifyAccess=main
 
 EnvironmentFile=-/etc/sigmond/coordination.env
+# %i (literal instance) is the working key: %I "unescapes" systemd
+# escaping, turning dashes into slashes (B4-100-rx888mk2 ->
+# B4/100/rx888mk2), so the %I path never matches a real flat file.
+# Same bug + fix as wspr-recorder@ and meteor-scatter@.
+EnvironmentFile=-/etc/psk-recorder/env/%i.env
 EnvironmentFile=-/etc/psk-recorder/env/%I.env
 
 WorkingDirectory=/opt/git/sigmond/psk-recorder
