@@ -153,11 +153,15 @@ quiet bands, jt9-deep on 1–2 priority bands) is a deliberate follow-up, not v1
 
 ## 8. Native dependency
 
-Our **forked** `jt9_decode` (triggered mode, §3) must be built + installed like
-`jt9`/`wsprd`. It needs `jt9` + Qt5 (both already in `_build_wsjtx_decoders`'
-dep set in sigmond `bin/smd`), so fold it into that same recipe. The fork lives
-in sigmond's tree (pinned), not the upstream madpsy repo. Separate sigmond/smd
-change.
+Our **forked** `jt9_decode` (triggered mode, §3) is vendored here at
+`vendor/jt9-decode/` (GPLv3; PROVENANCE.md). **Wired into sigmond `bin/smd`**
+(`_build_jt9_decode`, called from `_build_wsjtx_decoders`): built out-of-tree as
+a cheap Qt5 add-on to the WSJT-X toolchain and installed to
+`/usr/local/bin/jt9_decode`, idempotent via a source-hash marker, best-effort so
+it can't fail wspr-recorder. Both wspr-recorder and psk-recorder installs
+trigger it (order-independent). Open policy item for mjh: every psk-recorder
+install then builds the WSJT-X toolchain even for the common decode_ft8 case —
+flagged inline in smd to gate on `decoder_kind=jt9` if desired.
 
 ## 9. Bench probe (2026-07-22) + remaining validation
 
