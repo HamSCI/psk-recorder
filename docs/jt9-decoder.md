@@ -177,10 +177,22 @@ change.
   (§3), not feed the stock streaming path.
 * The trigger handshake is small/clean ⇒ the fork is low-risk.
 
-**Remaining (needs the forked wrapper + jt9 deployed):**
+**Triggered-mode fork — DONE + validated 2026-07-22** (`vendor/jt9-decode/`):
 
-1. Build the triggered-mode fork; confirm one decode per slot with our
-   supplied nutc, FT8 15 s and FT4 7.5 s.
+* Added `-T`/`--triggered`: decode each fed slot in stream order, immediately,
+  no wall-clock timer; caller writes one aligned slot per cadence and owns the
+  UTC. Emits exactly one terminal `<DecodeStats cycle_num=N …>` per slot.
+* Fixed a latent ipc handshake race (idle-gate on `ipc[1]/ipc[2]`) that hung
+  back-to-back resident decodes — never exercised by the stock one-shot/15 s
+  stream paths. Root-caused against `jt9a.f90`'s ack loop.
+* Bench: 3 distinct reference slots as one stdin stream → 3 in-order decodes
+  (1/5/2), each `watchdog=0`, clean EOF exit; a live `<...>` compound-call hash
+  appeared (the case resident jt9 resolves over a session).
+
+**Remaining (needs jt9 + the fork installed, then the SlotWorker producer):**
+
+1. FT4 path: confirm triggered mode at the 7.5 s cadence (`-m FT4`, 90 000
+   samples/slot) as cleanly as FT8.
 2. Supervision: restart a crashed wrapper without losing the whole band; on
    restart the hash table resets (accepted) — log it.
 3. dt sanity: same on-time WAV, jt9 dt ≈ +0.17 vs decode_ft8 +0.82 (measured);
