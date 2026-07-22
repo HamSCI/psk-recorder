@@ -81,6 +81,14 @@ DEFAULTS: dict[str, Any] = {
         "decoder": "/usr/local/bin/decode_ft8",
         "pskreporter": "/usr/local/bin/pskreporter-sender",
         "keep_wav": False,
+        # Decoder selection.  Default is ka9q/ft8_lib's decode_ft8.  jt9 is an
+        # opt-in, resource-heavier, more-sensitive alternative that must run
+        # resident to resolve compound-callsign hashes — see
+        # docs/jt9-decoder.md.  decoder_depth is jt9 -d (1 fast … 3 deep);
+        # decoder_jt9 is the jt9_decode wrapper path (falls back to PATH).
+        "decoder_kind": "decode_ft8",
+        "decoder_jt9": "/usr/local/bin/jt9_decode",
+        "decoder_depth": 3,
     },
     "processing": {
         # radiod LIFETIME tag (ka9q-python ≥3.13.0, ka9q-radio ≥0f8b622).

@@ -52,18 +52,22 @@ _FT4_DT_CAL_SEC = float(os.environ.get("PSK_FT4_DT_CAL_SEC", "0.6"))
 
 # ── Line parser ─────────────────────────────────────────────────────────────
 
-# Format-detection regex for the decoder line router.
-_DECODE_FT8_PREFIX = re.compile(r"^\d{4}/\d{2}/\d{2}\s")     # YYYY/MM/DD …
+# Format-detection regexes for the decoder line router.  The two formats are
+# mutually exclusive on their leading token (decode_ft8 uses a ``/``-separated
+# date; jt9's canonical log line starts with two whitespace-separated 6-digit
+# fields then the integer band frequency).
+_DECODE_FT8_PREFIX = re.compile(r"^\d{4}/\d{2}/\d{2}\s")       # YYYY/MM/DD …
+_JT9_PREFIX = re.compile(r"^\d{6}\s+\d{6}\s+\d+\s")            # YYMMDD HHMMSS BAND_HZ …
 
 
 def parse_decoder_line(
     line: str, *, mode: Optional[str] = None, table: Optional[Any] = None,
 ) -> Optional[dict]:
-    """Detect the ``decode_ft8`` line format and parse.
+    """Detect the decoder line format (decode_ft8 or jt9) and parse.
 
     The per-mode log file (`<radiod_id>-<mode>.log`) carries lines from
-    ``decode_ft8``.  We look at the leading byte run to confirm the
-    structure before parsing.
+    whichever decoder is configured.  We look at the leading byte run to
+    route to the right parser.
 
     ``table`` is the shared :class:`callhash.CallHashTable`; when given,
     compound-callsign hashes (``<NNNNNNN>`` from the patched decode_ft8,
@@ -81,6 +85,8 @@ def parse_decoder_line(
         # know the mode (router called without a hint), we leave it
         # blank — caller may set it from the log file path.
         return parse_decode_ft8_line(stripped, mode=mode or "", table=table)
+    if _JT9_PREFIX.match(stripped):
+        return parse_jt9_line(stripped, mode=mode, table=table)
     return None
 
 
@@ -131,6 +137,76 @@ def parse_decode_ft8_line(
         "dt":                 dt,
         "frequency":          int(freq),
         "frequency_mhz":      freq / 1_000_000.0,
+        "message":            parsed["message"],   # hash-resolved
+        "tx_call":            parsed.get("tx_call", ""),
+        "rx_call":            parsed.get("rx_call", ""),
+        "grid":               parsed.get("grid", ""),
+        "report":             parsed.get("report"),
+    }
+
+
+def parse_jt9_line(
+    line: str, *, mode: Optional[str] = None, table: Optional[Any] = None,
+) -> Optional[dict]:
+    """Parse one canonical jt9 log line into a psk.spots row.
+
+    ``slot.SlotWorker`` normalizes the resident jt9 wrapper's relayed stdout
+    into this whitespace-delimited form (see ``docs/jt9-decoder.md`` §4)::
+
+        YYMMDD HHMMSS BAND_FREQ_HZ SYNC SNR DT FREQ_OFFSET_HZ MARKER MESSAGE… MODE
+
+    ``BAND_FREQ_HZ`` is the channel dial; absolute receive frequency =
+    ``BAND_FREQ_HZ + FREQ_OFFSET_HZ`` (jt9 reports an audio offset, not RF).
+    ``SNR`` is calibrated dB.  ``DT`` is already in the WSJT-X convention, so —
+    unlike decode_ft8 — **no** dt calibration is applied here (jt9 *is*
+    WSJT-X; ``_FT8_DT_CAL_SEC``/``_FT4_DT_CAL_SEC`` are decode_ft8→WSJT-X
+    offsets).  Returns ``None`` on any parse failure.
+    """
+    parts = line.strip().split()
+    # 10 = YYMMDD HHMMSS BAND SYNC SNR DT FREQ MARKER MSG_ONE_TOKEN MODE
+    if len(parts) < 10:
+        return None
+    try:
+        # slot.py emits date+time in UTC; tag tz-aware so the sink writer
+        # doesn't reinterpret them in a local timezone.
+        ts = datetime.strptime(
+            parts[0] + parts[1], "%y%m%d%H%M%S"
+        ).replace(tzinfo=timezone.utc)
+        band_freq_hz = int(parts[2])
+        sync_score = int(parts[3])
+        snr_db = int(parts[4])
+        dt = float(parts[5])
+        # jt9 emits the offset with a trailing '.' ("1234.").
+        freq_offset_hz = int(float(parts[6]))
+    except (ValueError, IndexError):
+        return None
+
+    abs_freq_hz = band_freq_hz + freq_offset_hz
+
+    # parts[7] is the MARKER ('0'/'?'/'~') — not stored.  The last token is the
+    # MODE tag; the message is everything between the marker and MODE.
+    last = parts[-1]
+    if last.upper() in ("FT8", "FT4"):
+        detected_mode = last.lower()
+        message_end = len(parts) - 1
+    else:
+        detected_mode = ""
+        message_end = len(parts)
+    message_tokens = parts[8:message_end]
+    if not message_tokens:
+        return None
+
+    parsed = parse_message(" ".join(message_tokens), table=table)
+    return {
+        "time":               ts,
+        "mode":               detected_mode or (mode or ""),
+        "decoder_kind":       "jt9",
+        "score":              sync_score,
+        "snr_db":             snr_db,        # jt9 SNR is calibrated dB
+        "spectral_width_hz":  None,          # not surfaced by jt9 stdout
+        "dt":                 dt,            # WSJT-X convention; no calibration
+        "frequency":          abs_freq_hz,
+        "frequency_mhz":      abs_freq_hz / 1_000_000.0,
         "message":            parsed["message"],   # hash-resolved
         "tx_call":            parsed.get("tx_call", ""),
         "rx_call":            parsed.get("rx_call", ""),

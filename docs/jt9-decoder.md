@@ -1,0 +1,158 @@
+# jt9 as an FT8/FT4 decoder option
+
+Status: **in progress** (branch `feat/jt9-decoder-option`). Draft for mjh review.
+
+Re-adds WSJT-X's `jt9` as a selectable FT8/FT4 decoder alongside the default
+`decode_ft8` (ka9q/ft8_lib). jt9 was psk-recorder's default through v0.4.0 and
+was removed in `ead51ca` (2026-05-19) as a "dormant, resource-heavy opt-in".
+This brings it back on the current architecture, but with a fundamentally
+different — and correct — process model (see §2).
+
+## 1. Why jt9
+
+* **Sensitivity.** On live busy bands jt9-deep finds ~2–3× the decodes of
+  decode_ft8 (measured 2026-07-22, `jt9-experiment/FINDINGS.md`): e.g. 20 m
+  14074 kHz, decode_ft8 15 vs jt9-d3 45.
+* **Calibrated SNR.** jt9 reports real dB SNR; decode_ft8 reports only an
+  uncalibrated internal "score". jt9 rows therefore populate `snr_db`
+  (decode_ft8 leaves it `NULL`).
+* **WSJT-X dt convention** natively (no calibration offset — see §5).
+
+Cost: jt9 is 3–8× the CPU of decode_ft8 (~0.4 CPU-s/15 s today) — jt9-fast
+≈ 1.2 cores continuous fleet-wide, jt9-deep ≈ 3.3 cores. It must stay pinned
+off radiod's HT pair (cores 2–13 on B4). So it is **opt-in**; the default
+stays `decode_ft8`.
+
+## 2. The load-bearing decision: jt9 MUST run resident
+
+FT8/FT4 nonstandard (compound) callsigns are transmitted as a 22-bit hash
+after the full call has been sent once. The decoder resolves the hash from a
+table it accumulates as it hears full calls.
+
+In WSJT-X that table (`lib/77bit/packjt77.f90`) is a **module-level in-RAM
+array** — `nzhash` counter, `save_hash_call` appends, `hash22` linear-searches
+it — marked `save` (per-process lifetime) with **no disk persistence anywhere**
+(verified in the 3.0.2 source: the only `fopen(hash_fname)` is in `wsprd.c`,
+WSPR's unrelated type-3 table; the GUI writes no FT8 hashcalls file either).
+
+Consequences:
+
+* A fresh `jt9` process **always** starts at `nzhash=0`. The removed
+  per-slot-fork code (new `mkdtemp` `-a` dir every slot) could therefore
+  **never** resolve a hash learned in a prior slot — it emitted `<...>` and
+  the spot was effectively lost.
+* Unlike ka9q's `decode_ft8` — which was *patched* to emit the numeric hash
+  `<NNNNNNN>` so sigmond's `callhash` library can resolve it tailer-side —
+  **stock jt9 emits only `<...>`** for an unresolved hash. There is nothing
+  for `callhash` to key on. Tailer-side rescue is impossible for jt9.
+* Therefore the **only** way to resolve compound-call hashes with jt9 is to
+  keep the jt9 process **resident** so its in-RAM table persists across slots.
+  A persistent `-a` data dir cannot help (no file exists). The longer a
+  resident jt9 lives, the more it resolves — so its processes should be
+  long-lived and not restarted casually.
+
+This is why the integration is a resident-process model, not the old fork.
+
+## 3. Process model
+
+One **resident `jt9`** per `(band, mode)`, driven over WSJT-X's `QSharedMemory`
+IPC. We reuse the already-written `jt9_decode` wrapper
+(`jt9-experiment/jt9-decode`, madpsy) which implements exactly that GUI-side
+protocol: it holds one `jt9` via `QProcess`, fills the shmem `dec_data` ring,
+triggers a decode per cycle, and relays jt9's decode lines on its own stdout.
+(~19–20 resident processes for B4's FT8+FT4 band set.)
+
+**Timing authority stays with psk-recorder.** We do *not* free-run the
+wrapper off a continuous stdin stream (its own sample-counting cycle clock is
+not GPS-anchored and would drift the dt). Instead `SlotWorker` — which already
+extracts each cadence slot's exact sample window from the RTP/GPS-anchored ring
+— feeds that one aligned slot's PCM to the resident wrapper and stamps the
+authoritative slot UTC itself. jt9 contributes only *relative* quantities
+(dt, snr, audio-frequency offset, message); psk-recorder supplies the absolute
+time and frequency anchor.
+
+## 4. Wire formats (captured 2026-07-22 from jt9 3.0.2)
+
+jt9's stdout decode line (what the wrapper relays):
+
+```
+110115   9  0.9 1234 ~  GJ0KYZ RK9AX MO05
+HHMMSS  SNR  DT  FREQ ~  MESSAGE
+```
+
+* `HHMMSS`  — time of day only, **no date**, and in resident mode driven by
+  the params we set. psk-recorder ignores it and uses the slot's true UTC.
+* `SNR`     — calibrated dB (signed int).
+* `DT`      — seconds within the slot (signed float).
+* `FREQ`    — **audio offset** in Hz (0–3000), *not* absolute RF. Absolute =
+  channel dial (`SlotWorker._frequency_hz`) + offset.
+* control line `<DecodeFinished> …` is filtered by the wrapper (not a spot).
+
+`SlotWorker` normalizes each relayed line into the canonical jt9 log line the
+tailer parses (SYNC is unavailable on stdout → placeholder `0`; MODE from the
+worker's mode):
+
+```
+YYMMDD HHMMSS BAND_FREQ_HZ SYNC SNR DT FREQ_OFFSET_HZ MARKER MESSAGE… MODE
+```
+
+`ch_tailer.parse_jt9_line` reads that, computes absolute freq = BAND_FREQ +
+OFFSET, and emits a `psk.spots` row.
+
+## 5. Field mapping & dt calibration
+
+| psk.spots field | jt9 source | note |
+|---|---|---|
+| `time` | slot start UTC (SlotWorker) | authoritative, GPS-anchored |
+| `dt` | jt9 DT | **no calibration** — jt9 *is* WSJT-X. `_FT8_DT_CAL_SEC`/`_FT4_DT_CAL_SEC` are decode_ft8→WSJT-X offsets and MUST NOT be applied to jt9 rows. |
+| `snr_db` | jt9 SNR | real dB (decode_ft8 → `None`) |
+| `score` | SYNC | `None`/`0` in resident-stdout mode (SYNC not on stdout) |
+| `frequency` | BAND_FREQ + OFFSET | absolute Hz |
+| `spectral_width_hz` | — | not surfaced |
+| `decoder_kind` | `"jt9"` | tags the row |
+| message/calls | `callhash.parse_message` | jt9 self-resolves compound calls it has heard; `<...>` stays unresolved |
+
+## 6. Config surface
+
+`[paths]` in the recorder config / deploy.toml:
+
+```toml
+decoder_kind  = "jt9"          # default "decode_ft8"
+decoder_depth = 3              # jt9 -d: 1 fast (~1.2 cores) … 3 deep (~3.3 cores)
+decoder_jt9   = "/usr/local/bin/jt9_decode"   # wrapper path (falls back to PATH)
+```
+
+v1 is **process-global** (recorder resolves one decoder per instance — matches
+the existing "one decoder binary" assumption). Per-band mixing (decode_ft8 on
+quiet bands, jt9-deep on 1–2 priority bands) is a deliberate follow-up, not v1.
+
+## 7. Touch points
+
+* `core/slot.py` — `DECODER_JT9`; `VALID_DECODER_KINDS`; resident-wrapper
+  producer (spawn/supervise per (band,mode), feed slot PCM, relay+normalize
+  stdout); thread `decoder_depth`.
+* `core/ch_tailer.py` — `parse_jt9_line` + router branch; dt-cal branched by
+  kind; `callhash` table arg.
+* `core/recorder.py`, `core/stream.py`, `core/receiver_manager.py` — resolve +
+  thread `decoder_kind`/`decoder_depth`; wire the resident path when kind=jt9.
+* `config.py` — `decoder_kind`/`decoder_depth`/`decoder_jt9` defaults.
+* `tests/test_jt9.py` — recovered + adapted to the resident wire format.
+
+## 8. Native dependency
+
+`jt9_decode` (the wrapper) must be built + installed like `jt9`/`wsprd`. It
+needs `jt9` + Qt5 (both already in `_build_wsjtx_decoders`' dep set in sigmond
+`bin/smd`), so fold it into that same recipe. Separate sigmond/smd change.
+
+## 9. Open items / validation (needs jt9 deployed — not yet on B4)
+
+1. **Feeding the resident wrapper slot-aligned** vs its free-running cycle
+   clock — confirm it tolerates being fed one aligned slot's PCM per cadence
+   and emits exactly one decode per slot (FT8 15 s and FT4 7.5 s).
+2. Supervision: restart a crashed wrapper without losing the whole band; on
+   restart the hash table resets (accepted) — log it.
+3. dt sanity: same on-time WAV, jt9 dt ≈ +0.17 vs decode_ft8 +0.82 (measured);
+   confirm jt9 rows land near 0 with no calibration applied.
+4. Absolute-frequency reconstruction matches decode_ft8 on the same slot.
+5. CPU sizing on cores 2–13 at the chosen depth; B3 stage then live A/B on one
+   band before fleet.
