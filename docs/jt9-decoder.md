@@ -206,6 +206,22 @@ B4 yet) + the smd native-dep build (§8).
 
 **Remaining (needs jt9 + the fork installed):**
 
+0. **From-source toolchain parity — do NOT skip.** The B3 `smd install` doesn't
+   just build jt9/wsprd/jt9_decode; it *installs* them to `/usr/local/bin`,
+   shadowing Debian's `wsjtx` package (`wspr-recorder/deploy.toml` dropped the
+   `wsjtx` apt dep). So this run is the first time the from-source decoders
+   actually *run* in a real pipeline — validate them, don't assume the build
+   test covered it. This is a **correctness/parity** check, not performance
+   (from-source `wsprd` is Fano-bound → ~same speed; the win is version 3.0.2
+   vs Debian 2.7.0 / reproducibility / GPLv3 provenance — `FINDINGS.md`).
+   * Confirm `/usr/local/bin/{jt9,wsprd,jt9_decode}` are the from-source builds
+     (provenance markers present) and lead `/usr/bin` on PATH.
+   * **wsprd (WSPR):** decode the same audio with from-source vs Debian `wsprd`
+     and confirm spot count + calls match; capture a before/after WSPR spot
+     comparison against wsprnet / wd30 so parity is *proven*, not assumed —
+     we must not regress WSPR while focused on FT8.
+   * **jt9 (FST4W):** wspr-recorder decodes FST4W normally with from-source jt9.
+
 1. FT4 path: confirm triggered mode at the 7.5 s cadence (`-m FT4`, 90 000
    samples/slot) as cleanly as FT8.
 2. Supervision: exercise restart-on-crash live without losing the whole band; on
