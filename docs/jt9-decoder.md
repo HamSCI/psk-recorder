@@ -63,13 +63,26 @@ triggers a decode per cycle, and relays jt9's decode lines on its own stdout.
 (~19–20 resident processes for B4's FT8+FT4 band set.)
 
 **Timing authority stays with psk-recorder.** We do *not* free-run the
-wrapper off a continuous stdin stream (its own sample-counting cycle clock is
-not GPS-anchored and would drift the dt). Instead `SlotWorker` — which already
-extracts each cadence slot's exact sample window from the RTP/GPS-anchored ring
-— feeds that one aligned slot's PCM to the resident wrapper and stamps the
-authoritative slot UTC itself. jt9 contributes only *relative* quantities
-(dt, snr, audio-frequency offset, message); psk-recorder supplies the absolute
-time and frequency anchor.
+wrapper off a continuous stdin stream. The stock `jt9_decode` self-times: a
+wall-clock `QTimer` fires at UTC-aligned `cycle_ms` boundaries and grabs "the
+last N samples" from a circular buffer, stamping the decode with `nutc =
+gmtime()`. That clock is not GPS-anchored — when radiod's RTP↔UTC steps (the
+fault psk-recorder's re-anchoring absorbs) it would grab the wrong span and
+drift dt, uncorrectably. **Confirmed by bench probe 2026-07-22** (§9): fed a
+reference slot, the wrapper emitted the decode stamped with the run's
+wall-clock minute, not the audio's true time, and in stream mode waited for the
+wall-clock boundary before decoding.
+
+So we **fork the wrapper into a triggered mode**: remove the wall-clock timer
+and the last-N grab; instead decode exactly the one slot's worth of PCM that
+`SlotWorker` writes to its stdin, immediately, and loop. `SlotWorker` — which
+already extracts each cadence slot's exact sample window from the RTP/GPS-
+anchored ring — feeds that aligned slot and stamps the authoritative slot UTC
+itself. jt9 contributes only *relative* quantities (dt, snr, audio-frequency
+offset, message); psk-recorder supplies the absolute time and frequency anchor.
+The change is small and well-bounded: the shmem trigger handshake (memcpy →
+`dec_data->d2`, set `params.nutc/kin/newdat`, poke `ipc[]`) is reused verbatim;
+only its *driver* (wall-clock timer → per-slot stdin) is replaced.
 
 ## 4. Wire formats (captured 2026-07-22 from jt9 3.0.2)
 
@@ -140,15 +153,34 @@ quiet bands, jt9-deep on 1–2 priority bands) is a deliberate follow-up, not v1
 
 ## 8. Native dependency
 
-`jt9_decode` (the wrapper) must be built + installed like `jt9`/`wsprd`. It
-needs `jt9` + Qt5 (both already in `_build_wsjtx_decoders`' dep set in sigmond
-`bin/smd`), so fold it into that same recipe. Separate sigmond/smd change.
+Our **forked** `jt9_decode` (triggered mode, §3) must be built + installed like
+`jt9`/`wsprd`. It needs `jt9` + Qt5 (both already in `_build_wsjtx_decoders`'
+dep set in sigmond `bin/smd`), so fold it into that same recipe. The fork lives
+in sigmond's tree (pinned), not the upstream madpsy repo. Separate sigmond/smd
+change.
 
-## 9. Open items / validation (needs jt9 deployed — not yet on B4)
+## 9. Bench probe (2026-07-22) + remaining validation
 
-1. **Feeding the resident wrapper slot-aligned** vs its free-running cycle
-   clock — confirm it tolerates being fed one aligned slot's PCM per cadence
-   and emits exactly one decode per slot (FT8 15 s and FT4 7.5 s).
+**Bench probe — DONE**, on the experiment jt9 3.0.2 + compiled `jt9_decode`
+(no jt9 on B4 yet). Findings:
+
+* Resident jt9+shmem decodes correctly through the wrapper: one-shot on
+  `191111_110115.wav` → `... 11  0.9 1234 ~ GJ0KYZ RK9AX MO05` (matches bare
+  jt9's message/dt/offset; SNR in dB).
+* Stdout decode-line format confirmed: `HHMMSS SNR DT FREQ_OFFSET ~ MESSAGE`
+  plus a `<DecodeFinished>`/`<DecodeStats>` control line the wrapper emits.
+* **The wrapper self-times on wall-clock and is unusable as-is** — it stamped
+  the decode with the run's wall-clock minute (`nutc=gmtime`, `001814`), not
+  the audio's true time (`110115`), and in stream mode logged "Waiting … for
+  cycle boundary" then "Triggering decode #1 … +30.000s" at the wall-clock
+  boundary. ⇒ resolves the old open item: we must fork it to triggered mode
+  (§3), not feed the stock streaming path.
+* The trigger handshake is small/clean ⇒ the fork is low-risk.
+
+**Remaining (needs the forked wrapper + jt9 deployed):**
+
+1. Build the triggered-mode fork; confirm one decode per slot with our
+   supplied nutc, FT8 15 s and FT4 7.5 s.
 2. Supervision: restart a crashed wrapper without losing the whole band; on
    restart the hash table resets (accepted) — log it.
 3. dt sanity: same on-time WAV, jt9 dt ≈ +0.17 vs decode_ft8 +0.82 (measured);
@@ -156,3 +188,5 @@ needs `jt9` + Qt5 (both already in `_build_wsjtx_decoders`' dep set in sigmond
 4. Absolute-frequency reconstruction matches decode_ft8 on the same slot.
 5. CPU sizing on cores 2–13 at the chosen depth; B3 stage then live A/B on one
    band before fleet.
+6. Compound-call hash resolution actually improves across a multi-slot session
+   (the whole point of resident jt9) — verify `<...>` counts fall over time.
