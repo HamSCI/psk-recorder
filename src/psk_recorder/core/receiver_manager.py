@@ -164,6 +164,7 @@ class ReceiverManager:
         decoder_kind: str,
         keep_wav: bool,
         spool_spots: bool,
+        decoder_depth: int = 3,
     ) -> None:
         """Create ChannelSinks and register them with MultiStream(s).
 
@@ -290,6 +291,7 @@ class ReceiverManager:
                     decoder_kind=decoder_kind,
                     keep_wav=keep_wav,
                     spool_spots=spool_spots,
+                    decoder_depth=decoder_depth,
                 )
                 if self._provision_one_with_retry(
                         sink, multi_by_group, deadline):

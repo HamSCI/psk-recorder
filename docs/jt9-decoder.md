@@ -189,12 +189,23 @@ change.
   (1/5/2), each `watchdog=0`, clean EOF exit; a live `<...>` compound-call hash
   appeared (the case resident jt9 resolves over a session).
 
-**Remaining (needs jt9 + the fork installed, then the SlotWorker producer):**
+**SlotWorker producer — DONE (code-complete, unit-tested 2026-07-22).** For
+`decoder_kind="jt9"`, SlotWorker spawns one resident `jt9_decode -T` per (band,
+mode), feeds each GPS-aligned slot's PCM to its stdin, and a reader thread
+normalizes the relayed decode lines into the canonical jt9 log line (stamping
+the authoritative slot UTC + dial+offset), mapping decodes to slots by order via
+the terminal `<DecodeStats>` FIFO. Crash → restart (hash table resets, logged).
+`decoder_depth` threaded recorder→manager→stream→worker; recorder resolves the
+wrapper path for kind=jt9; `VALID_DECODER_KINDS` now includes jt9. Unit tests
+round-trip stdout→canonical→`parse_jt9_line`. Pending live validation (no jt9 on
+B4 yet) + the smd native-dep build (§8).
+
+**Remaining (needs jt9 + the fork installed):**
 
 1. FT4 path: confirm triggered mode at the 7.5 s cadence (`-m FT4`, 90 000
    samples/slot) as cleanly as FT8.
-2. Supervision: restart a crashed wrapper without losing the whole band; on
-   restart the hash table resets (accepted) — log it.
+2. Supervision: exercise restart-on-crash live without losing the whole band; on
+   restart the hash table resets (accepted) — already logged.
 3. dt sanity: same on-time WAV, jt9 dt ≈ +0.17 vs decode_ft8 +0.82 (measured);
    confirm jt9 rows land near 0 with no calibration applied.
 4. Absolute-frequency reconstruction matches decode_ft8 on the same slot.

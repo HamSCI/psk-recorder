@@ -24,13 +24,14 @@ import os
 import subprocess
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Callable, Optional
 
 from ka9q import SlotClock
 
 from psk_recorder.core.ring import Ring
-from psk_recorder.core.wav import write_wav
+from psk_recorder.core.wav import write_wav, _float32_to_int16
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +46,53 @@ DECODE_TIMEOUT_SEC = 60.0
 
 # decoder_kind values accepted by SlotWorker.
 DECODER_FT8_LIB = "decode_ft8"
-VALID_DECODER_KINDS = (DECODER_FT8_LIB,)
+DECODER_JT9 = "jt9"
+VALID_DECODER_KINDS = (DECODER_FT8_LIB, DECODER_JT9)
+
+# How long to wait for jt9_decode to drain + decode its last fed slot on stop
+# before terminating it (a deep FT8 slot is a few seconds; be generous).
+JT9_STOP_DRAIN_SEC = 10.0
+
+
+def _build_jt9_log_line(
+    jt9_line: str, slot_utc: float, frequency_hz: int, mode: str,
+) -> Optional[str]:
+    """Normalize one resident-jt9 stdout decode line into the canonical jt9
+    log line that ``ch_tailer.parse_jt9_line`` parses.
+
+    jt9's stdout decode line is::
+
+        HHMMSS  SNR  DT  FREQ_OFFSET ~  MESSAGE
+
+    Its HHMMSS is jt9's own (wall-clock) label and is discarded — psk-recorder
+    stamps the authoritative slot UTC (``slot_utc``) and supplies the channel
+    dial (``frequency_hz``), so jt9 contributes only the relative snr / dt /
+    audio-frequency-offset / message.  Emits::
+
+        YYMMDD HHMMSS BAND_FREQ_HZ SYNC SNR DT FREQ_OFFSET MARKER MESSAGE… MODE
+
+    with SYNC=0 (jt9 stdout carries no sync column) and MARKER='~'.  Returns
+    ``None`` on an unrecognised line so the caller skips control/diagnostic
+    output.
+    """
+    if slot_utc is None or "~" not in jt9_line:
+        return None
+    head, _, message = jt9_line.partition("~")
+    parts = head.split()
+    # jt9: HHMMSS(0) SNR(1) DT(2) FREQ_OFFSET(3)
+    if len(parts) < 4:
+        return None
+    snr, dt, freq_offset = parts[1], parts[2], parts[3]
+    message = message.strip()
+    if not message:
+        return None
+    t = time.gmtime(int(math.floor(slot_utc)))
+    yymmdd = time.strftime("%y%m%d", t)
+    hhmmss = time.strftime("%H%M%S", t)
+    return (
+        f"{yymmdd} {hhmmss} {frequency_hz} 0 {snr} {dt} {freq_offset} "
+        f"~ {message} {mode.upper()}"
+    )
 
 
 class SlotWorker:
@@ -67,6 +114,7 @@ class SlotWorker:
         keep_wav: bool = False,
         decoder_kind: str = DECODER_FT8_LIB,
         spool_spots: bool = False,
+        decoder_depth: int = 3,
     ):
         if decoder_kind not in VALID_DECODER_KINDS:
             raise ValueError(
@@ -97,6 +145,7 @@ class SlotWorker:
         self._next_boundary_utc: Optional[float] = None
         self._sr = clock.sample_rate
         self._decoder_kind = decoder_kind
+        self._decoder_depth = decoder_depth
         self._keep_wav = keep_wav
         self._spool_spots = spool_spots
         self._running = False
@@ -104,6 +153,19 @@ class SlotWorker:
         # Each entry: (proc, wav_path, slot_start_utc, fork_monotonic).
         self._pending_procs: list[tuple[subprocess.Popen, Path,
                                         float, float]] = []
+        # --- resident jt9 state (decoder_kind == DECODER_JT9) -----------------
+        # One long-lived `jt9_decode -T` per (band, mode) — this worker.  Slots
+        # are fed to its stdin in cadence order; it decodes each in order and
+        # emits exactly one terminal <DecodeStats> per slot.  We map decode
+        # lines to the slot that produced them purely by ORDER: _jt9_pending is
+        # the FIFO of authoritative slot UTCs we fed (appended by the harvest
+        # loop, popped by the reader thread on each <DecodeStats>).  Keeping
+        # jt9 resident is what preserves its in-RAM compound-callsign hash
+        # table across slots (see docs/jt9-decoder.md §2).
+        self._jt9_proc: Optional[subprocess.Popen] = None
+        self._jt9_reader: Optional[threading.Thread] = None
+        self._jt9_pending: deque[float] = deque()
+        self._jt9_restarts = 0
         # Counters read by the recorder's stats thread. int ops are atomic
         # under CPython GIL; no lock needed for the single-reader case.
         self.decodes_ok = 0
@@ -118,6 +180,8 @@ class SlotWorker:
 
     def start(self) -> None:
         self._running = True
+        if self._decoder_kind == DECODER_JT9:
+            self._start_jt9_process()
         self._thread = threading.Thread(
             target=self._loop, daemon=True,
             name=f"slot-{self._mode}-{self._frequency_hz}",
@@ -128,7 +192,10 @@ class SlotWorker:
         self._running = False
         if self._thread:
             self._thread.join(timeout=5.0)
-        self._reap_all(wait=True)
+        if self._decoder_kind == DECODER_JT9:
+            self._stop_jt9_process()
+        else:
+            self._reap_all(wait=True)
 
     def _loop(self) -> None:
         while self._running:
@@ -139,7 +206,10 @@ class SlotWorker:
             time.sleep(0.5)
 
     def _tick(self) -> None:
-        self._reap_finished()
+        # decode_ft8 forks one proc per slot to reap here; jt9 uses a resident
+        # process (no per-slot procs to reap).
+        if self._decoder_kind != DECODER_JT9:
+            self._reap_finished()
 
         latest_rtp = self._get_latest_rtp()
         if latest_rtp is None:
@@ -187,8 +257,11 @@ class SlotWorker:
                     self._mode.upper(), self._frequency_hz, start_utc,
                 )
                 continue
-            wav_path = self._write_spool_wav(samples, start_utc)
-            self._fork_decoder(wav_path, start_utc)
+            if self._decoder_kind == DECODER_JT9:
+                self._feed_jt9(samples, start_utc)
+            else:
+                wav_path = self._write_spool_wav(samples, start_utc)
+                self._fork_decoder(wav_path, start_utc)
 
     def _write_spool_wav(self, samples, slot_start_utc: float) -> Path:
         # Filename HHMMSS must be an integer second AND must parse via
@@ -386,3 +459,182 @@ class SlotWorker:
                     "%s: failed writing per-slot spots file %s: %s",
                     self._mode.upper(), spots_path, exc,
                 )
+
+    # ----- resident jt9 (decoder_kind == DECODER_JT9) ------------------------
+
+    def _start_jt9_process(self) -> None:
+        """Spawn the long-lived ``jt9_decode -T`` for this (band, mode).
+
+        The jt9 binary is the sibling of the wrapper (both installed to
+        /usr/local/bin by sigmond's wsjtx-decoders build).  Reads decode output
+        on a daemon reader thread bound to this specific process, so a restart's
+        new reader owns the new process and the old one exits on its EOF.
+        """
+        wrapper = self._decoder_path
+        jt9_bin = str(Path(wrapper).with_name("jt9"))
+        mode_arg = "FT4" if self._mode == "ft4" else "FT8"
+        cmd = [wrapper, "-j", jt9_bin, "-m", mode_arg,
+               "-d", str(self._decoder_depth), "-T"]
+        try:
+            self._jt9_proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                bufsize=0,
+            )
+        except OSError as exc:
+            logger.error("%s %d Hz: failed to start jt9_decode %s: %s",
+                         self._mode.upper(), self._frequency_hz, cmd, exc)
+            self._jt9_proc = None
+            return
+        self._jt9_reader = threading.Thread(
+            target=self._jt9_reader_loop, args=(self._jt9_proc,),
+            daemon=True, name=f"jt9-read-{self._mode}-{self._frequency_hz}",
+        )
+        self._jt9_reader.start()
+        logger.info(
+            "%s %d Hz: resident jt9_decode pid=%d (%s -d%d -T, jt9=%s)",
+            self._mode.upper(), self._frequency_hz, self._jt9_proc.pid,
+            mode_arg, self._decoder_depth, jt9_bin,
+        )
+
+    def _feed_jt9(self, samples, slot_start_utc: float) -> None:
+        """Write one cadence-aligned slot's PCM to the resident jt9_decode.
+
+        The extracted window is exactly cadence_samples — one jt9_decode cycle
+        (FT8 180000 / FT4 90000 at 12 kHz).  We push the authoritative slot UTC
+        onto the FIFO first so the reader can stamp decodes as they return.
+        """
+        proc = self._jt9_proc
+        if proc is None or proc.poll() is not None:
+            self._restart_jt9()
+            proc = self._jt9_proc
+            if proc is None or proc.poll() is not None:
+                self.decodes_fail += 1
+                return
+        pcm = _float32_to_int16(samples).tobytes()
+        self._jt9_pending.append(slot_start_utc)
+        try:
+            proc.stdin.write(pcm)
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError) as exc:
+            logger.warning(
+                "%s %d Hz: jt9_decode stdin write failed: %s — restarting",
+                self._mode.upper(), self._frequency_hz, exc,
+            )
+            try:
+                self._jt9_pending.pop()   # the slot we just failed to feed
+            except IndexError:
+                pass
+            self.decodes_fail += 1
+            self._restart_jt9()
+            return
+        if self._keep_wav:
+            self._write_spool_wav(samples, slot_start_utc)
+
+    def _jt9_reader_loop(self, proc: subprocess.Popen) -> None:
+        """Read `proc`'s stdout, normalize decode lines to the canonical jt9 log
+        line, and pop the FIFO on each terminal <DecodeStats>.
+
+        jt9_decode processes slots strictly in fed order and emits exactly one
+        <DecodeStats cycle_num=N …> per slot, so the FIFO front is always the
+        slot the current decode lines belong to — no cycle_num arithmetic
+        needed (which would break across restarts anyway).
+        """
+        stream = proc.stdout
+        if stream is None:
+            return
+        for raw in iter(stream.readline, b""):
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            if line.startswith("<DecodeStats>"):
+                if self._jt9_pending:
+                    try:
+                        self._jt9_pending.popleft()
+                    except IndexError:
+                        pass
+                # watchdog=1 → jt9 hung on that slot (counted a failure).
+                if "watchdog=1" in line:
+                    self.decodes_fail += 1
+                else:
+                    self.decodes_ok += 1
+                continue
+            if line.startswith("<"):
+                continue   # <DecodeFinished> / other control lines
+            slot_utc = self._jt9_pending[0] if self._jt9_pending else None
+            canonical = _build_jt9_log_line(
+                line, slot_utc, self._frequency_hz, self._mode,
+            )
+            if canonical is None:
+                continue
+            try:
+                self._log_fd.write(canonical + "\n")
+                self._log_fd.flush()
+            except OSError as exc:
+                logger.warning("%s %d Hz: jt9 log write failed: %s",
+                               self._mode.upper(), self._frequency_hz, exc)
+        # stdout closed → the resident process exited.  _feed_jt9 will restart
+        # it on the next slot while we're still running.
+        if self._running:
+            logger.warning(
+                "%s %d Hz: jt9_decode stdout closed (process exited)",
+                self._mode.upper(), self._frequency_hz,
+            )
+
+    def _restart_jt9(self) -> None:
+        """Tear down a dead/wedged jt9_decode and start a fresh one.
+
+        The new process starts with an empty hash table (compound-call
+        resolution resets) — logged, per docs/jt9-decoder.md §2.  Any slots we
+        fed the old process that were never acked are dropped: without their
+        <DecodeStats> the FIFO would desync, so we clear it.
+        """
+        self._jt9_restarts += 1
+        logger.warning(
+            "%s %d Hz: restarting jt9_decode (#%d) — hash table resets; "
+            "%d unacked slot(s) dropped",
+            self._mode.upper(), self._frequency_hz, self._jt9_restarts,
+            len(self._jt9_pending),
+        )
+        self._jt9_pending.clear()
+        old = self._jt9_proc
+        self._jt9_proc = None
+        if old is not None:
+            try:
+                if old.stdin:
+                    old.stdin.close()
+            except OSError:
+                pass
+            try:
+                old.kill()
+            except OSError:
+                pass
+        self._start_jt9_process()
+
+    def _stop_jt9_process(self) -> None:
+        """Close stdin so jt9_decode drains + decodes its last slot, then exits.
+
+        Called from stop() after the harvest loop thread has joined, so no
+        _feed_jt9 races this.
+        """
+        proc = self._jt9_proc
+        self._jt9_proc = None
+        if proc is None:
+            return
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=JT9_STOP_DRAIN_SEC)
+        except subprocess.TimeoutExpired:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        if self._jt9_reader is not None:
+            self._jt9_reader.join(timeout=5.0)

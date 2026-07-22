@@ -468,22 +468,30 @@ class PskRecorder:
         decoder_kind = str(
             self._paths.get("decoder_kind", "decode_ft8"),
         ).lower()
-        # jt9 decoder + decoder_depth were removed on main during the
-        # ClickHouse-removal sweep; only ka9q/ft8_lib's decode_ft8 is
-        # supported.
-        decoder = self._paths.get(
-            "decoder_decode_ft8", self._paths.get(
-                "decoder", "/usr/local/bin/decode_ft8",
-            ),
-        )
+        decoder_depth = int(self._paths.get("decoder_depth", 3))
+        # Decoder path depends on the kind.  jt9 runs via the resident
+        # jt9_decode wrapper (which needs its sibling jt9 binary alongside it);
+        # decode_ft8 is ka9q/ft8_lib's one-shot binary.  jt9 keeps a resident
+        # process per (band, mode) to resolve compound-call hashes — see
+        # docs/jt9-decoder.md.
+        if decoder_kind == "jt9":
+            decoder = self._paths.get(
+                "decoder_jt9", "/usr/local/bin/jt9_decode",
+            )
+        else:
+            decoder = self._paths.get(
+                "decoder_decode_ft8", self._paths.get(
+                    "decoder", "/usr/local/bin/decode_ft8",
+                ),
+            )
         keep_wav = self._paths.get("keep_wav", False)
         # Tee per-slot decoder output into <wav>.spots.txt files only
         # when there is no SQLite sink for the uploader's shim to read
         # — that's the file-fallback mode FileTreeSource picks up.
         spool_spots = not _sqlite_sink_available()
         logger.info(
-            "decoder_kind=%s path=%s spool_spots=%s sources=%d",
-            decoder_kind, decoder, spool_spots,
+            "decoder_kind=%s path=%s depth=%s spool_spots=%s sources=%d",
+            decoder_kind, decoder, decoder_depth, spool_spots,
             len(self._receivers),
         )
 
@@ -493,6 +501,7 @@ class PskRecorder:
                 decoder_kind=decoder_kind,
                 keep_wav=keep_wav,
                 spool_spots=spool_spots,
+                decoder_depth=decoder_depth,
             )
             # Gather this manager's lifetime entries for the global
             # keepalive thread.  Each manager's list is stable after
