@@ -120,6 +120,7 @@ class ChannelSink:
             keep_wav=keep_wav,
             spool_spots=spool_spots,
             decoder_depth=decoder_depth,
+            on_timing_fault=self._on_wallclock_timing_fault,
         )
 
         self._total_delivered: int = 0
@@ -311,6 +312,33 @@ class ChannelSink:
         logger.info(
             "%s %d Hz: stream restored — re-anchoring on next batch",
             self._mode.upper(), self._frequency_hz,
+        )
+
+    def _on_wallclock_timing_fault(self, early_by_sec: float) -> None:
+        """Wall-clock slot guard recovery (SlotWorker._wallclock_guard).
+
+        Harvested slots are finishing before their nominal end — the
+        RTP→UTC anchor runs ahead of true UTC (B4 2026-07-23: anchors
+        grabbed during radiod startup were +10 min ahead; zero decodes,
+        so no dt-based guard could see it).  Recover with the same reset
+        as on_stream_restored, but keep the existing channel_info: the
+        StatusListener refreshes its (gps_time, rtp_timesnap) in place,
+        so the next batch re-anchors off radiod's LIVE mapping rather
+        than the corrupt startup snapshot.  If the fresh anchor is also
+        bad, the guard re-fires (strike pacing bounds the loop) and each
+        firing is a LOUD announced incident, never a silent stall.
+        """
+        with self._clock_lock:
+            self._clock.reset()
+        self._ring.clear()
+        self._latest_rtp = None
+        self._anchor_source = ""
+        self._anchor_rtp = None
+        self._slot_worker.reset_boundary()
+        logger.error(
+            "%s %d Hz: wall-clock timing fault (%.1fs ahead) — anchor "
+            "dropped; re-anchoring on next batch from live channel_info",
+            self._mode.upper(), self._frequency_hz, early_by_sec,
         )
 
     @property

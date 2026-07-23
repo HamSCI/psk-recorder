@@ -180,5 +180,92 @@ class DecodeTimeoutTests(unittest.TestCase):
             self.assertEqual(worker.decodes_fail, 0, "false failure counted")
 
 
+class WallClockGuardTests(unittest.TestCase):
+    """Wall-clock slot guard: impossibly-early harvests → alarm + recover.
+
+    A complete slot labeled start_utc cannot finish before wall time
+    start_utc + cadence; beyond-jitter early completion means the
+    RTP→UTC anchor runs ahead of true UTC (B4 2026-07-23: +10 min,
+    zero decodes, dt-based guards blind).
+    """
+
+    def _guarded_worker(self, tmpdir, threshold=5.0, strikes=3):
+        worker, clock, ring, box = _make_worker(tmpdir)
+        worker._wallclock_threshold = threshold
+        worker._wallclock_max_strikes = strikes
+        worker._wallclock_strikes = 0
+        fired = []
+        worker._on_timing_fault = fired.append
+        return worker, fired
+
+    def test_plausible_slot_no_strike(self):
+        import time
+        with tempfile.TemporaryDirectory() as tmpdir:
+            worker, fired = self._guarded_worker(tmpdir)
+            # Slot finishing right at its nominal end (started cadence ago).
+            start_utc = time.time() - worker._cadence_sec
+            self.assertFalse(worker._wallclock_guard(start_utc))
+            self.assertEqual(worker._wallclock_strikes, 0)
+            self.assertEqual(fired, [])
+
+    def test_late_slot_is_plausible(self):
+        import time
+        with tempfile.TemporaryDirectory() as tmpdir:
+            worker, fired = self._guarded_worker(tmpdir)
+            worker._wallclock_strikes = 2
+            # Harvest backlog: slot finished long after its nominal end.
+            self.assertFalse(worker._wallclock_guard(time.time() - 300))
+            self.assertEqual(worker._wallclock_strikes, 0, "late slot clears")
+
+    def test_impossible_slots_accumulate_then_fire(self):
+        import time
+        with tempfile.TemporaryDirectory() as tmpdir:
+            worker, fired = self._guarded_worker(tmpdir, strikes=3)
+            start_utc = time.time() + 600  # anchor ~10 min ahead
+            self.assertFalse(worker._wallclock_guard(start_utc))
+            self.assertFalse(worker._wallclock_guard(start_utc))
+            self.assertEqual(fired, [])
+            self.assertTrue(worker._wallclock_guard(start_utc))
+            self.assertEqual(len(fired), 1)
+            self.assertGreater(fired[0], 600)   # early_by ≈ 600 + cadence
+            self.assertEqual(worker._wallclock_strikes, 0, "clean slate")
+
+    def test_disabled_by_threshold(self):
+        import time
+        with tempfile.TemporaryDirectory() as tmpdir:
+            worker, fired = self._guarded_worker(tmpdir, threshold=0.0)
+            for _ in range(5):
+                self.assertFalse(worker._wallclock_guard(time.time() + 600))
+            self.assertEqual(fired, [])
+
+    def test_fire_without_callback_does_not_raise(self):
+        import time
+        with tempfile.TemporaryDirectory() as tmpdir:
+            worker, _ = self._guarded_worker(tmpdir, strikes=1)
+            worker._on_timing_fault = None
+            self.assertTrue(worker._wallclock_guard(time.time() + 600))
+
+    def test_env_parsing(self):
+        import os
+        from psk_recorder.core.slot import _wallclock_guard_env
+        saved = {k: os.environ.get(k) for k in
+                 ("PSK_WALLCLOCK_GUARD_SEC", "PSK_WALLCLOCK_GUARD_STRIKES")}
+        try:
+            os.environ["PSK_WALLCLOCK_GUARD_SEC"] = "7.5"
+            os.environ["PSK_WALLCLOCK_GUARD_STRIKES"] = "2"
+            self.assertEqual(_wallclock_guard_env(), (7.5, 2))
+            os.environ["PSK_WALLCLOCK_GUARD_SEC"] = "garbage"
+            os.environ["PSK_WALLCLOCK_GUARD_STRIKES"] = "0"
+            threshold, strikes = _wallclock_guard_env()
+            self.assertEqual(threshold, 5.0)
+            self.assertEqual(strikes, 1, "strikes floor is 1")
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+
 if __name__ == "__main__":
     unittest.main()

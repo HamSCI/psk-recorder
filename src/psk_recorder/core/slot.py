@@ -53,6 +53,33 @@ VALID_DECODER_KINDS = (DECODER_FT8_LIB, DECODER_JT9)
 # before terminating it (a deep FT8 slot is a few seconds; be generous).
 JT9_STOP_DRAIN_SEC = 10.0
 
+# ─── wall-clock slot guard defaults ──────────────────────────────────────
+# A complete slot labeled start_utc with cadence C cannot finish filling
+# before wall time start_utc+C — samples arrive in real time.  A harvest
+# earlier than that (beyond jitter) means the RTP→UTC anchor runs AHEAD
+# of true UTC; with a gross fault (minutes) there are zero decodes, so
+# no dt-based guard can see it.  Observed B4 2026-07-23: recorders that
+# anchored during radiod startup ran +10 min ahead — every slot silent,
+# fleet watchdog inert (single-instance host has no decoding peer).
+# Env: PSK_WALLCLOCK_GUARD_SEC (<=0 disables), PSK_WALLCLOCK_GUARD_STRIKES.
+WALLCLOCK_GUARD_SEC_DEFAULT = 5.0
+WALLCLOCK_GUARD_STRIKES_DEFAULT = 3
+
+
+def _wallclock_guard_env() -> tuple[float, int]:
+    try:
+        threshold = float(os.environ.get(
+            "PSK_WALLCLOCK_GUARD_SEC", str(WALLCLOCK_GUARD_SEC_DEFAULT)))
+    except ValueError:
+        threshold = WALLCLOCK_GUARD_SEC_DEFAULT
+    try:
+        strikes = int(os.environ.get(
+            "PSK_WALLCLOCK_GUARD_STRIKES",
+            str(WALLCLOCK_GUARD_STRIKES_DEFAULT)))
+    except ValueError:
+        strikes = WALLCLOCK_GUARD_STRIKES_DEFAULT
+    return threshold, max(1, strikes)
+
 
 def _build_jt9_log_line(
     jt9_line: str, slot_utc: float, frequency_hz: int, mode: str,
@@ -115,6 +142,7 @@ class SlotWorker:
         decoder_kind: str = DECODER_FT8_LIB,
         spool_spots: bool = False,
         decoder_depth: int = 3,
+        on_timing_fault: Optional[Callable[[float], None]] = None,
     ):
         if decoder_kind not in VALID_DECODER_KINDS:
             raise ValueError(
@@ -166,6 +194,13 @@ class SlotWorker:
         self._jt9_reader: Optional[threading.Thread] = None
         self._jt9_pending: deque[float] = deque()
         self._jt9_restarts = 0
+        # Wall-clock slot guard (module docstring above _wallclock_guard_env):
+        # strikes count consecutive impossibly-early harvests; firing invokes
+        # on_timing_fault (ChannelSink re-anchor) — detect + alarm + recover.
+        self._wallclock_threshold, self._wallclock_max_strikes = (
+            _wallclock_guard_env())
+        self._wallclock_strikes = 0
+        self._on_timing_fault = on_timing_fault
         # Counters read by the recorder's stats thread. int ops are atomic
         # under CPython GIL; no lock needed for the single-reader case.
         self.decodes_ok = 0
@@ -257,11 +292,59 @@ class SlotWorker:
                     self._mode.upper(), self._frequency_hz, start_utc,
                 )
                 continue
+            if self._wallclock_guard(start_utc):
+                # Fired: the sink dropped the anchor + ring — remaining
+                # harvested offsets are from the dead reference space.
+                break
             if self._decoder_kind == DECODER_JT9:
                 self._feed_jt9(samples, start_utc)
             else:
                 wav_path = self._write_spool_wav(samples, start_utc)
                 self._fork_decoder(wav_path, start_utc)
+
+    def _wallclock_guard(self, start_utc: float) -> bool:
+        """Wall-clock slot guard step for one COMPLETE harvested slot.
+
+        Returns True when the guard fired (anchor dropped via
+        on_timing_fault) so the harvest loop stops consuming offsets
+        from the now-dead reference space.  A plausible slot clears the
+        strikes; late slots (harvest backlog) are plausible by
+        construction — only the impossible early direction strikes.
+        """
+        if self._wallclock_threshold <= 0:
+            return False
+        early_by = (start_utc + self._cadence_sec) - time.time()
+        if early_by <= self._wallclock_threshold:
+            self._wallclock_strikes = 0
+            return False
+        self._wallclock_strikes += 1
+        if self._wallclock_strikes < self._wallclock_max_strikes:
+            logger.warning(
+                "wallclock-guard %s %d Hz: slot at %.1f completed %.1fs "
+                "before its nominal end [strike %d/%d]",
+                self._mode.upper(), self._frequency_hz, start_utc,
+                early_by, self._wallclock_strikes,
+                self._wallclock_max_strikes,
+            )
+            return False
+        self._wallclock_strikes = 0
+        logger.error(
+            "TIMING FAULT %s %d Hz: slots completing %.1fs BEFORE their "
+            "nominal end — physically impossible unless the RTP→UTC "
+            "anchor runs ahead of true UTC (anchor grabbed during radiod "
+            "startup?); dropping anchor to re-anchor from radiod's live "
+            "mapping; INVESTIGATE radiod restart/startup timing",
+            self._mode.upper(), self._frequency_hz, early_by,
+        )
+        if self._on_timing_fault is not None:
+            try:
+                self._on_timing_fault(early_by)
+            except Exception:
+                logger.exception(
+                    "%s %d Hz: on_timing_fault recovery failed",
+                    self._mode.upper(), self._frequency_hz,
+                )
+        return True
 
     def _write_spool_wav(self, samples, slot_start_utc: float) -> Path:
         # Filename HHMMSS must be an integer second AND must parse via
