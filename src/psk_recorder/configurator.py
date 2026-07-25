@@ -154,7 +154,15 @@ def _legacy_config_init(args) -> int:
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(body)
     _ok(f"wrote {target}")
-    _enable_instance(values["radiod_id"])
+    # Only enable a unit for an id that came from an explicit source
+    # (interactive entry or SIGMOND_INSTANCE).  In sigmond's non-interactive
+    # flow the reporter-keyed instance is created and enabled by sigmond
+    # itself, and radiod_id here can be a guessed placeholder ("my-rx888") —
+    # enabling that mints a phantom instance that races the real one for the
+    # shared WAV spool at every boot (VM101 greenfield, 2026-07-25).
+    if (not getattr(args, "non_interactive", False)
+            or os.environ.get("SIGMOND_INSTANCE")):
+        _enable_instance(values["radiod_id"])
     _info(f"reporter: {values['callsign']}    grid: {values['grid']}")
     _info(f"radiod:   id={values['radiod_id']}  status={values['radiod_status']}")
     _info("")
