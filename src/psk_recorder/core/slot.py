@@ -28,7 +28,7 @@ from collections import deque
 from pathlib import Path
 from typing import Callable, Optional
 
-from ka9q import SlotClock
+from ka9q import SlotClock, SlotClockDesyncError
 
 from psk_recorder.core.ring import Ring
 from psk_recorder.core.wav import write_wav, _float32_to_int16
@@ -143,6 +143,7 @@ class SlotWorker:
         spool_spots: bool = False,
         decoder_depth: int = 3,
         on_timing_fault: Optional[Callable[[float], None]] = None,
+        on_desync: Optional[Callable[[], None]] = None,
     ):
         if decoder_kind not in VALID_DECODER_KINDS:
             raise ValueError(
@@ -201,6 +202,7 @@ class SlotWorker:
             _wallclock_guard_env())
         self._wallclock_strikes = 0
         self._on_timing_fault = on_timing_fault
+        self._on_desync = on_desync
         # Counters read by the recorder's stats thread. int ops are atomic
         # under CPython GIL; no lock needed for the single-reader case.
         self.decodes_ok = 0
@@ -260,28 +262,38 @@ class SlotWorker:
         cadence_samples = self._clock.cadence_samples
         settle_samples = self._clock.settle_samples
         harvested: list[tuple[int, float]] = []
-        with self._clock_lock:
-            if not self._clock.anchored:
-                return
-            latest_off = self._clock.offset_of_rtp(latest_rtp)
-            # Seed the next boundary at the first clean cadence multiple at/after
-            # the STREAM START (anchor_rtp is the first sample, so anchor_utc_now
-            # ~ the stream-start UTC).  A stream that starts mid-slot correctly
-            # begins at the next clean boundary, skipping the partial slot.
-            if self._next_boundary_utc is None:
-                self._next_boundary_utc = (
-                    math.ceil(anchor_utc_now / self._cadence_sec) * self._cadence_sec
-                )
-            # Harvest each completed clean slot, computing its RTP window offset
-            # from radiod's CURRENT mapping (anchor_utc_now) — not a frozen grid.
-            while True:
-                start_off = round(
-                    (self._next_boundary_utc - anchor_utc_now) * self._sr
-                )
-                if latest_off < start_off + cadence_samples + settle_samples:
-                    break
-                harvested.append((start_off, self._next_boundary_utc))
-                self._next_boundary_utc += self._cadence_sec
+        try:
+            with self._clock_lock:
+                if not self._clock.anchored:
+                    return
+                latest_off = self._clock.offset_of_rtp(latest_rtp)
+                # Seed the next boundary at the first clean cadence multiple at/after
+                # the STREAM START (anchor_rtp is the first sample, so anchor_utc_now
+                # ~ the stream-start UTC).  A stream that starts mid-slot correctly
+                # begins at the next clean boundary, skipping the partial slot.
+                if self._next_boundary_utc is None:
+                    self._next_boundary_utc = (
+                        math.ceil(anchor_utc_now / self._cadence_sec) * self._cadence_sec
+                    )
+                # Harvest each completed clean slot, computing its RTP window offset
+                # from radiod's CURRENT mapping (anchor_utc_now) — not a frozen grid.
+                while True:
+                    start_off = round(
+                        (self._next_boundary_utc - anchor_utc_now) * self._sr
+                    )
+                    if latest_off < start_off + cadence_samples + settle_samples:
+                        break
+                    harvested.append((start_off, self._next_boundary_utc))
+                    self._next_boundary_utc += self._cadence_sec
+        except SlotClockDesyncError as exc:
+            logger.error(
+                "%s %d Hz: SlotClock desync in harvest — %s; requesting "
+                "anchor reset (audit F18)",
+                self._mode.upper(), self._frequency_hz, exc,
+            )
+            if self._on_desync is not None:
+                self._on_desync()
+            return
 
         for start_off, start_utc in harvested:
             samples = self._ring.extract_by_offset(start_off, cadence_samples)
