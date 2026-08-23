@@ -230,7 +230,7 @@ WAV is gone before it returns from `wait()` because the decoder
 deleted it first. To retain WAVs for debugging, snapshot the file
 *before* forking (e.g. by holding a hardlink in a separate dir under
 `ReadWritePaths`). This is documented in
-[OPERATIONS.md](OPERATIONS.md#debugging-with-keep_wav).
+[OPERATIONS.md](OPERATIONS.md#debugging-wavs--the-decoder-shim-pattern).
 
 ### §12.5 Pattern A canonical layout (SHOULD) — implemented
 

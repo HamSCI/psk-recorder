@@ -1,6 +1,9 @@
 # jt9 as an FT8/FT4 decoder option
 
-Status: **in progress** (branch `feat/jt9-decoder-option`). Draft for mjh review.
+> **Audience:** contributor
+> **Status:** shipped — jt9 is a selectable decoder; this page is the design record
+> **Verified against:** psk-recorder f6f4dc5 on 2026-08-23 — code
+> **Canonical for:** the jt9 decoder option: design, process model, and operation
 
 Re-adds WSJT-X's `jt9` as a selectable FT8/FT4 decoder alongside the default
 `decode_ft8` (ka9q/ft8_lib). jt9 was psk-recorder's default through v0.4.0 and
@@ -207,7 +210,7 @@ B4 yet) + the smd native-dep build (§8).
 **Remaining (needs jt9 + the fork installed):**
 
 0. **From-source toolchain parity — DONE off-production 2026-07-22** (live audio
-   captured read-only off B4 radiod; full data in `docs/decoder-findings.md`).
+   captured read-only off B4 radiod; full data in `docs/archive/decoder-findings.md`).
    Did NOT need B3: captured real slots and bench-decoded Debian vs from-source.
    **It caught a WSPR-killer before any deployment** — the exact reason this
    check existed:
