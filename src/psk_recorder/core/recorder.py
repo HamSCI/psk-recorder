@@ -37,6 +37,7 @@ from psk_recorder.config import (
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:  # pragma: no cover
     from psk_recorder.core.stream import ChannelSink
+from psk_recorder.core.backlog import BacklogMonitors
 from psk_recorder.core.ch_tailer import ChTailer, _default_writer_factory
 from psk_recorder.core.cycle_batcher import PskCycleBatcher
 # PskReporterUploader (legacy subprocess shim) was removed on main
@@ -884,6 +885,7 @@ class PskRecorder:
         prev_fail: dict[str, int] = {}
         prev_empty: dict[str, int] = {}
         prev_spot_lines: dict[str, int] = {}
+        backlog_monitors = BacklogMonitors()
 
         def count_lines(p: Path) -> int:
             try:
@@ -925,6 +927,9 @@ class PskRecorder:
                 agg["decodes_ok"] += snap["decodes_ok"]
                 agg["decodes_fail"] += snap["decodes_fail"]
                 agg["slots_empty"] += snap["slots_empty"]
+                agg["inflight"] = agg.get("inflight", 0) + snap.get("inflight", 0)
+                agg["oldest_inflight_s"] = max(agg.get("oldest_inflight_s", 0.0),
+                                               snap.get("oldest_inflight_s", 0.0))
 
             for (rid, mode), agg in by_key.items():
                 spot_log = log_dir / f"{rid}-{mode}.log"
@@ -940,13 +945,20 @@ class PskRecorder:
                 # Include the radiod_id tag so multi-source operators
                 # can tell which source is producing what; single-
                 # source readers can still grep ``stats FT8`` etc.
+                inflight = agg.get("inflight", 0)
+                oldest_s = agg.get("oldest_inflight_s", 0.0)
                 logger.info(
                     "stats %s rx=%s: spots=%d decodes=%d/%d "
-                    "slots_empty=%d freqs=%d (60s window)",
+                    "slots_empty=%d freqs=%d inflight=%d oldest=%.0fs (60s window)",
                     mode.upper(), rid, spots_delta,
                     ok_delta, ok_delta + fail_delta,
-                    empty_delta, agg["freqs"],
+                    empty_delta, agg["freqs"], inflight, oldest_s,
                 )
+                # Decode-backlog monitor (core/backlog.py): warn when decodes
+                # pile up behind the slot cadence, before the 60 s kill
+                # deadline is the only thing that notices.
+                backlog_monitors.observe(f"{rid}:{mode.upper()}", inflight, oldest_s,
+                                         agg["freqs"], time.monotonic())
 
                 prev_ok[prev_key] = agg["decodes_ok"]
                 prev_fail[prev_key] = agg["decodes_fail"]
