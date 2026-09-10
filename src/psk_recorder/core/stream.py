@@ -52,7 +52,7 @@ import numpy as np
 from ka9q import SlotClock, SlotClockDesyncError
 
 from psk_recorder.config import FT4_CADENCE_SEC, FT8_CADENCE_SEC
-from hamsci_dsp.timing import AuthorityReader
+from hamsci_dsp.timing import AnchorUTC, AuthorityReader
 from psk_recorder.core.ring import Ring
 from psk_recorder.core.slot import SlotWorker, SETTLE_SEC
 
@@ -134,6 +134,10 @@ class ChannelSink:
         self._channel_info = None
         # Diagnostic: how the current SlotClock anchor was derived.
         self._anchor_source: str = ""        # "rtp_to_utc[+authority]" | "wallclock_fallback"
+        # The anchor itself — its UTC is the wrap hint for every re-pin, and
+        # its snapshot is what the §3 timing_authority_applied report
+        # describes (the registration the labels ride, not a fresh read).
+        self._anchor: Optional[AnchorUTC] = None
         # The fixed RTP reference the ring + grid are keyed to (set once at the
         # first anchor; reset only on a genuine stream restart).
         self._anchor_rtp: Optional[int] = None
@@ -156,14 +160,28 @@ class ChannelSink:
             return None
         from ka9q import rtp_to_utc
         from hamsci_dsp.timing import acquire_anchor_utc
+        # The wrap hint must be the anchor's OWN instant, never "now": the
+        # anchor RTP is fixed and ages, and once it is older than P/2
+        # (49.7 h at 12 kHz) a "now" hint picks the wrong wrap epoch and the
+        # whole grid jumps by one period.  AC0G-B4 2026-09-08: +99.42 h,
+        # ~24k empty slots per channel, 136 spots uploaded four days ahead.
+        anchor = self._anchor
         a = acquire_anchor_utc(
             first_rtp=self._anchor_rtp,
             channel_info=self._channel_info,
             rtp_to_utc=rtp_to_utc,
             authority_reader=self._reader,
             sample_rate=self._sample_rate,
+            anchor_hint_utc=anchor.utc if anchor is not None else None,
         )
         return a.utc if a.rtp_referenced else None
+
+    @property
+    def anchor(self) -> Optional[AnchorUTC]:
+        """The anchor the SlotClock is pinned to (None until the first batch
+        or after a reset).  Its ``timing_authority_applied()`` is this
+        channel's honest §3 report."""
+        return self._anchor
 
     @property
     def mode(self) -> str:
@@ -242,10 +260,10 @@ class ChannelSink:
         try:
             with self._clock_lock:
                 if not self._clock.anchored:
-                    anchor_utc, source = self._anchor_utc_for(batch_first_rtp, n)
-                    if anchor_utc is None:
-                        return
+                    anchor = self._anchor_utc_for(batch_first_rtp, n)
+                    anchor_utc, source = anchor.utc, anchor.source
                     self._clock.anchor(batch_first_rtp, anchor_utc)
+                    self._anchor = anchor
                     self._anchor_source = source
                     # The fixed RTP reference for the ring + the slide-follow
                     # re-pin (see _anchor_utc_now).  Set once; only changes on a
@@ -273,9 +291,8 @@ class ChannelSink:
         self._latest_rtp = last_rtp
         self._total_delivered += n
 
-    def _anchor_utc_for(self, rtp_ts: int, n: int):
-        """Return (utc, source) mapping ``rtp_ts`` -> UTC via the suite-shared
-        anchor helper.
+    def _anchor_utc_for(self, rtp_ts: int, n: int) -> AnchorUTC:
+        """Map ``rtp_ts`` -> UTC via the suite-shared anchor helper.
 
         Preferred: radiod's GPS/RTP timebase (``ka9q.rtp_to_utc``) plus the
         hf-timestd §18 dynamic RTP→UTC offset.  Fallback: the host wall clock
@@ -293,7 +310,7 @@ class ChannelSink:
             samples_behind=n,
             sample_rate=self._sample_rate,
         )
-        return a.utc, a.source
+        return a
 
     def on_stream_dropped(self, reason: str) -> None:
         logger.warning(
@@ -340,6 +357,7 @@ class ChannelSink:
         self._latest_rtp = None
         self._anchor_source = ""
         self._anchor_rtp = None
+        self._anchor = None
         # New RTP reference space -> the SlotWorker must re-seed its boundary.
         self._slot_worker.reset_boundary()
 

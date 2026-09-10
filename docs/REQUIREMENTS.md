@@ -301,8 +301,9 @@ lifecycle, CPU affinity, identity, status).
 - **Uploader state:** `/var/lib/hs-uploader/watermarks.db`.
 - **Self-description:** `inventory`/`validate`/`version --json` (live:
   `client=psk-recorder`, `version=0.4.0`, `contract_version=0.8`, 19 channels,
-  modes `[ft8,ft4]`, `uses/provides_timing_calibration=false`,
-  `timing_authority_applied=null`, `issues=[]`).
+  modes `[ft8,ft4]`, `uses_timing_calibration=true`,
+  `provides_timing_calibration=false`, `timing_authority_applied` from the
+  daemon's applied-state file, `issues=[]`).
 
 ### 8.3 Contracts / APIs (reference, not restated)
 - `PSK-I-001` `[CODE]` ✅ Conforms to **client contract v0.8** (`contract.py`
@@ -313,12 +314,15 @@ lifecycle, CPU affinity, identity, status).
   (`watch`/`verifier`/`receiver_channels`, verb `psk`). Field semantics:
   contract §1–§7, §10–§14, §17. Full spec:
   [CLIENT-CONTRACT.md](https://github.com/HamSCI/sigmond/blob/main/docs/CLIENT-CONTRACT.md).
-- `PSK-I-002` `[CODE]` 🟡 **Timing-authority consumer (partial, §18):** reads
-  hf-timestd's authority via `authority_reader.py` and stamps a `timing_authority`
-  block on every row, falling back to `standalone_timing_authority` when absent —
-  **but does not consume it to gate/correct timing** (`uses_timing_calibration=false`,
-  `timing_authority_applied=null`). Subscriber obligations are defined by the
-  contract, not here.
+- `PSK-I-002` `[CODE]` ✅ **Timing-authority subscriber (§18):** every channel
+  anchors through `hamsci_dsp.timing.acquire_anchor_utc`, which applies
+  hf-timestd's published RTP→UTC offset to the slot labels whenever
+  `authority.json` is fresh, and stamps a `timing_authority` block on every row
+  (standalone marker when absent).  `inventory` reports
+  `uses_timing_calibration=true` and `timing_authority_applied` from the block
+  the running daemon writes once a minute (`core/applied_state.py`), per the
+  §18.5 amendment of 2026-09-04: the field describes the labels.  A stale file
+  reads as null.  Subscriber obligations remain the contract's.
 - `PSK-I-003` `[DOC]` ✅ The `server-merge` delivery path's wire/endpoint contract
   is governed by
   [PHASE-D-SERVER-MERGE-ENDPOINT.md](https://github.com/HamSCI/sigmond/blob/main/docs/PHASE-D-SERVER-MERGE-ENDPOINT.md)
