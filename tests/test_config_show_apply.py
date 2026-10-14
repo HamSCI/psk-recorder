@@ -486,7 +486,7 @@ def _env_apply(payload, tmp_path: Path, monkeypatch, *,
 def test_env_apply_writes_new_file(tmp_path: Path, monkeypatch) -> None:
     rv = _env_apply({"PSK_DELIVERY_PIPELINES": "direct"}, tmp_path, monkeypatch)
     assert rv == 0
-    text = (tmp_path / "rx0.env").read_text()
+    text = (tmp_path / "RX0.env").read_text()
     assert "PSK_DELIVERY_PIPELINES=direct" in text
 
 
@@ -495,7 +495,7 @@ def test_env_apply_merges_with_existing(tmp_path: Path, monkeypatch) -> None:
                     tmp_path, monkeypatch,
                     existing="PSK_USE_HS_UPLOADER=1\nPSK_DIRECT_DEDUP=0\n")
     assert rv == 0
-    parsed = configurator._parse_env_file(tmp_path / "rx0.env")
+    parsed = configurator._parse_env_file(tmp_path / "RX0.env")
     assert parsed["PSK_DELIVERY_PIPELINES"] == "direct,server-raw"
     assert parsed["PSK_USE_HS_UPLOADER"]    == "1"   # preserved
     assert parsed["PSK_DIRECT_DEDUP"]       == "0"   # preserved
@@ -506,7 +506,7 @@ def test_env_apply_null_value_deletes_key(tmp_path: Path, monkeypatch) -> None:
                     tmp_path, monkeypatch,
                     existing="PSK_USE_HS_UPLOADER=1\nPSK_DIRECT_DEDUP=1\n")
     assert rv == 0
-    parsed = configurator._parse_env_file(tmp_path / "rx0.env")
+    parsed = configurator._parse_env_file(tmp_path / "RX0.env")
     assert "PSK_DIRECT_DEDUP" not in parsed
     assert parsed["PSK_USE_HS_UPLOADER"] == "1"
 
@@ -534,7 +534,7 @@ def test_env_apply_rejects_non_01_bool(tmp_path: Path, monkeypatch, capsys) -> N
 def test_env_apply_accepts_legacy_delivery_mode(tmp_path: Path, monkeypatch) -> None:
     rv = _env_apply({"PSK_DELIVERY_MODE": "both"}, tmp_path, monkeypatch)
     assert rv == 0
-    parsed = configurator._parse_env_file(tmp_path / "rx0.env")
+    parsed = configurator._parse_env_file(tmp_path / "RX0.env")
     assert parsed["PSK_DELIVERY_MODE"] == "both"
 
 

@@ -50,6 +50,7 @@ try:
 except ModuleNotFoundError:
     import tomli as tomllib  # type: ignore[no-redef]
 
+from ._reporter_id import to_storage, unescape_systemd_instance
 from .config import DEFAULT_CONFIG_PATH, DEFAULTS, load_config
 
 
@@ -1078,7 +1079,26 @@ _VALID_DELIVERY_PIPELINES = {"direct", "server-merge", "server-raw"}
 
 
 def _env_file_path(instance: str) -> Path:
-    return _ENV_DIR / f"{instance}.env"
+    """The env file for an instance named in any spelling.
+
+    A reporter id in any spelling (AC0G/B4, AC0G=B4, AC0G\\x3dB4, ac0g/b4)
+    names AC0G=B4.env.  A radiod id, which is no reporter id
+    (bee1-status.local), names its own file.  One fallback for a legacy
+    instance: when the storage-form file is absent and a file named
+    exactly as typed exists (my-rx888.env), use it and say so on stderr.
+    """
+    exact = unescape_systemd_instance(instance.strip())
+    try:
+        stem = to_storage(instance)
+    except ValueError:
+        return _ENV_DIR / f"{exact}.env"
+    path = _ENV_DIR / f"{stem}.env"
+    legacy = _ENV_DIR / f"{exact}.env"
+    if exact != stem and not path.exists() and legacy.exists():
+        print(f"legacy instance name {exact}; run: smd admin instance migrate",
+              file=sys.stderr)
+        return legacy
+    return path
 
 
 def _parse_env_file(path: Path) -> "dict[str, str]":
