@@ -495,7 +495,7 @@ def test_env_apply_merges_with_existing(tmp_path: Path, monkeypatch) -> None:
                     tmp_path, monkeypatch,
                     existing="PSK_USE_HS_UPLOADER=1\nPSK_DIRECT_DEDUP=0\n")
     assert rv == 0
-    parsed = configurator._parse_env_file(tmp_path / "RX0.env")
+    parsed = configurator._parse_env_file(tmp_path / "rx0.env")
     assert parsed["PSK_DELIVERY_PIPELINES"] == "direct,server-raw"
     assert parsed["PSK_USE_HS_UPLOADER"]    == "1"   # preserved
     assert parsed["PSK_DIRECT_DEDUP"]       == "0"   # preserved
@@ -506,7 +506,7 @@ def test_env_apply_null_value_deletes_key(tmp_path: Path, monkeypatch) -> None:
                     tmp_path, monkeypatch,
                     existing="PSK_USE_HS_UPLOADER=1\nPSK_DIRECT_DEDUP=1\n")
     assert rv == 0
-    parsed = configurator._parse_env_file(tmp_path / "RX0.env")
+    parsed = configurator._parse_env_file(tmp_path / "rx0.env")
     assert "PSK_DIRECT_DEDUP" not in parsed
     assert parsed["PSK_USE_HS_UPLOADER"] == "1"
 
