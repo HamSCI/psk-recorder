@@ -301,6 +301,12 @@ install -o root -g root -m 644 \
     /etc/systemd/system/psk-recorder@.service
 systemctl daemon-reload
 
+# --- Phase 5.5: stray per-instance directories ---
+# The unit template before v3.72 built /var/lib/psk-recorder/%i, and %i
+# keeps systemd's spelling (AC0G\x3dB4).  Nothing reads those directories;
+# the spool keys on the radiod id.  Removed only while empty.
+bash "$REPO_SOURCE/scripts/remove-stray-instance-dirs.sh" "$SPOOL_DIR"
+
 # --- Phase 6: disable native ka9q-radio FT services ---
 for unit in ft8-record.service ft4-record.service; do
     if systemctl is-active --quiet "$unit" 2>/dev/null; then
