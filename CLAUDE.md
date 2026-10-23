@@ -246,13 +246,15 @@ radiod_status = "bee1-status.local"          # mDNS, never IP
 [radiod.ft8]
 sample_rate = 12000
 preset      = "usb"
-encoding    = "s16be"
+# radiod streams F32; wav.py converts to 16-bit per slot for the decoder
+encoding    = "f32"
 freqs_hz    = [14074000, 7074000, ...]
 
 [radiod.ft4]
 sample_rate = 12000
 preset      = "usb"
-encoding    = "s16be"
+# radiod streams F32; wav.py converts to 16-bit per slot for the decoder
+encoding    = "f32"
 freqs_hz    = [14080000, 7047500, ...]
 ```
 

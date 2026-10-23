@@ -40,7 +40,8 @@ status = "<configure-via-config-init>"
 [radiod.ft8]
 sample_rate = 12000
 preset      = "usb"
-encoding    = "s16be"
+# radiod streams F32; wav.py converts to 16-bit per slot for the decoder
+encoding    = "f32"
 freqs_hz    = [
   1_840_000,  3_573_000,  5_357_000,  7_074_000, 10_136_000,
   14_074_000, 18_100_000, 21_074_000, 24_915_000, 28_074_000,
@@ -49,7 +50,8 @@ freqs_hz    = [
 [radiod.ft4]
 sample_rate = 12000
 preset      = "usb"
-encoding    = "s16be"
+# radiod streams F32; wav.py converts to 16-bit per slot for the decoder
+encoding    = "f32"
 # 160m FT4 is intentionally absent: WSJT-X's standard FT4 frequency
 # table doesn't include it (the band is too narrow for FT4's keying),
 # and putting 1_840_000 here makes FT4's channel collide with FT8's
