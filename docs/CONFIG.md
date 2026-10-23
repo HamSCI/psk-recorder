@@ -60,7 +60,7 @@ one should have frequencies or the instance has nothing to do.
 |---|---|---|---|
 | `sample_rate` | int | `12000` | Hz. `decode_ft8` requires 12000. |
 | `preset` | string | `"usb"` | radiod preset name. |
-| `encoding` | string | `"s16be"` | RTP payload encoding. |
+| `encoding` | string | `"f32"` | RTP payload encoding. radiod streams F32; wav.py converts to 16-bit per slot for the decoder. |
 | `freqs_hz` | int[] | `[]` | List of dial frequencies in Hz. Each becomes one channel (one RTP stream, one ring buffer, one slot worker). |
 
 ## Resolution rules

@@ -5,7 +5,7 @@ For contributors. The high-level pipeline:
 ```
 radiod (ka9q-radio)
   │  RadiodControl.ensure_channel() via ka9q-python
-  │  preset=usb, samprate=12000, encoding=s16be
+  │  preset=usb, samprate=12000, encoding=f32 (radiod streams F32; wav.py converts to 16-bit per slot for the decoder)
   ▼
 RTP multicast
   │  one MultiStream per radiod (shared socket, demux on SSRC)

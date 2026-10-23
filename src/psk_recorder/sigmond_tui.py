@@ -24,7 +24,7 @@ def parse_receiver_channels(
     psk-recorder lays out one or more [[radiod]] blocks; each radiod
     binds an FT8 sub-block and an FT4 sub-block with their own
     ``freqs_hz`` lists.  Encoding may be set per-mode; defaults to
-    s16be when neither mode declares it.
+    f32 when neither mode declares it (radiod streams F32).
     """
     blocks = cfg.get("radiod") or []
     if isinstance(blocks, dict):
@@ -45,5 +45,5 @@ def parse_receiver_channels(
             if encoding is None and m.get("encoding"):
                 encoding = encoding_to_int(m["encoding"])
     if encoding is None and freqs:
-        encoding = ENCODING_INTS["s16be"]
+        encoding = ENCODING_INTS["f32"]
     return status, freqs, encoding

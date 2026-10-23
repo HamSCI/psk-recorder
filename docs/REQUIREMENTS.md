@@ -119,7 +119,7 @@ lifecycle, CPU affinity, identity, status).
 ### 6.1 Acquisition & channel provisioning
 - `PSK-F-001` `[DOC]` ✅ SHALL provision one ka9q-python channel per configured
   FT8/FT4 frequency on the bound radiod via `RadiodControl.ensure_channel`
-  (`preset=usb`, `sample_rate=12000`, `encoding=s16be`), **never** passing
+  (`preset=usb`, `sample_rate=12000`, `encoding=f32`; radiod streams F32 and wav.py converts to 16-bit per slot for the decoder), **never** passing
   `destination=`.
 - `PSK-F-002` `[CODE]` ✅ SHALL maintain a process-local ring buffer
   (`collections.deque` behind a lock) per channel feeding a per-channel
@@ -131,7 +131,7 @@ lifecycle, CPU affinity, identity, status).
 
 ### 6.2 Slotting & decode
 - `PSK-F-010` `[DOC]` ✅ SHALL slot-align each channel's audio to the FT8 (15 s)
-  or FT4 (7.5 s) cadence, write one mono `s16be` WAV per slot, and fork
+  or FT4 (7.5 s) cadence, write one mono 16-bit WAV per slot (radiod streams F32; wav.py converts to 16-bit per slot for the decoder), and fork
   `decode_ft8` (`-f <freq_mhz>`, `-4` for FT4).
 - `PSK-F-011` `[CODE]` ✅ SHALL bound each decode with a watchdog timeout and
   reap the child, so a hung decoder on a corrupt WAV cannot accumulate.
@@ -263,7 +263,7 @@ lifecycle, CPU affinity, identity, status).
 
 ### 8.1 Inputs (derived from deploy.toml + config + inventory --json)
 - **RF/data:** radiod RTP via ka9q-python; one channel per freq,
-  `preset=usb`, `sample_rate=12000`, `encoding=s16be`. Bound radiod = the
+  `preset=usb`, `sample_rate=12000`, `encoding=f32` (radiod streams F32; wav.py converts to 16-bit per slot for the decoder). Bound radiod = the
   `[[radiod]].status` mDNS name (live: `sigma-rx888mk2-status.local`).
 - **External binary:** `decode_ft8` (ka9q/ft8_lib fork `37484ad`) at
   `decoder_decode_ft8` (default `/usr/local/bin/decode_ft8`).

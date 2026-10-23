@@ -108,7 +108,8 @@ FT8_CADENCE_SEC = 15.0
 FT4_CADENCE_SEC = 7.5
 DEFAULT_SAMPLE_RATE = 12000
 DEFAULT_PRESET = "usb"
-DEFAULT_ENCODING = "s16be"
+# radiod streams F32; wav.py converts to 16-bit per slot for the decoder
+DEFAULT_ENCODING = "f32"
 
 
 def load_config(path: Path | None = None) -> dict:
