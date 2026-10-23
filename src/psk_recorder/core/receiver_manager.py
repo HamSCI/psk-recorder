@@ -407,6 +407,8 @@ class ReceiverManager:
             preset=sink.preset,
             sample_rate=sink.sample_rate,
             encoding=sink.encoding,
+            agc_enable=0,    # policy 2026-10-23: never per-channel AGC,
+            gain=0.0,        # fixed 0 dB; do not inherit the preset's agc=yes
             lifetime=lifetime_arg,
             timeout=timeout,
         )
@@ -424,6 +426,8 @@ class ReceiverManager:
             on_samples=sink.on_samples,
             on_stream_dropped=sink.on_stream_dropped,
             on_stream_restored=sink.on_stream_restored,
+            agc_enable=0,
+            gain=0.0,
             lifetime=lifetime_arg,
             timeout=timeout,
         )
