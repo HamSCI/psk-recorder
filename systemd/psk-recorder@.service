@@ -88,7 +88,10 @@ MemoryMax=2G
 MemorySwapMax=0
 
 NoNewPrivileges=true
-PrivateTmp=false
+# jt9 -s uses Qt5 QSharedMemory, which creates a key file under /tmp. With
+# ProtectSystem=strict the host /tmp is read-only; a private /tmp is
+# writable and shared by this instance's jt9 children.
+PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
 # /var/lib/sigmond holds the shared hamsci_sink queue (sink.db); without
