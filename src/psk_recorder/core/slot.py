@@ -81,6 +81,10 @@ def _wallclock_guard_env() -> tuple[float, int]:
     return threshold, max(1, strikes)
 
 
+# jt9 stdout mode markers (WSJT-X lib/decoder.f90): FT8 prints '~', FT4 '+'.
+_JT9_MARKERS = frozenset({"~", "+"})
+
+
 def _build_jt9_log_line(
     jt9_line: str, slot_utc: float, frequency_hz: int, mode: str,
 ) -> Optional[str]:
@@ -89,7 +93,7 @@ def _build_jt9_log_line(
 
     jt9's stdout decode line is::
 
-        HHMMSS  SNR  DT  FREQ_OFFSET ~  MESSAGE
+        HHMMSS  SNR  DT  FREQ_OFFSET MARKER  MESSAGE      (MARKER '~' FT8, '+' FT4)
 
     Its HHMMSS is jt9's own (wall-clock) label and is discarded — psk-recorder
     stamps the authoritative slot UTC (``slot_utc``) and supplies the channel
@@ -98,19 +102,25 @@ def _build_jt9_log_line(
 
         YYMMDD HHMMSS BAND_FREQ_HZ SYNC SNR DT FREQ_OFFSET MARKER MESSAGE… MODE
 
-    with SYNC=0 (jt9 stdout carries no sync column) and MARKER='~'.  Returns
+    with SYNC=0 (jt9 stdout carries no sync column) and MARKER='~' for both
+    modes (the mode rides in the trailing MODE tag; the tailer ignores the
+    marker).  Returns
     ``None`` on an unrecognised line so the caller skips control/diagnostic
     output.
     """
-    if slot_utc is None or "~" not in jt9_line:
+    if slot_utc is None:
         return None
-    head, _, message = jt9_line.partition("~")
-    parts = head.split()
-    # jt9: HHMMSS(0) SNR(1) DT(2) FREQ_OFFSET(3)
-    if len(parts) < 4:
+    # jt9: HHMMSS(0) SNR(1) DT(2) FREQ_OFFSET(3) MARKER(4) MESSAGE(5…).  The
+    # marker is WSJT-X's mode flag: '~' for FT8 but '+' for FT4 (decoder.f90
+    # ft8_decoded / ft4_decoded).  Split on whitespace, never on the marker
+    # character — an FT4 report such as "+05" also contains '+'.  Until
+    # 2026-10-28 this required '~', so every FT4 decode from the resident
+    # jt9 was silently dropped (KJ6MKI: FT4 = 0 under decoder_kind="jt9").
+    parts = jt9_line.split(None, 5)
+    if len(parts) < 6 or parts[4] not in _JT9_MARKERS:
         return None
     snr, dt, freq_offset = parts[1], parts[2], parts[3]
-    message = message.strip()
+    message = parts[5].strip()
     if not message:
         return None
     t = time.gmtime(int(math.floor(slot_utc)))

@@ -132,13 +132,35 @@ class BuildJt9LogLineTest(unittest.TestCase):
         self.assertIn("GJ0KYZ", row["message"])
 
     def test_negative_snr_and_ft4(self):
+        # WSJT-X marks FT4 decodes with '+', not '~' (lib/decoder.f90
+        # ft4_decoded).  Requiring '~' dropped every FT4 decode from the
+        # resident jt9 — KJ6MKI 2026-10-28: FT4 = 0 for 2.5 h under jt9.
         line = _build_jt9_log_line(
-            "001826  -3  0.9 1291 ~  CQ R7IW LN35", self.SLOT_UTC, 7074000, "ft4",
+            "001826  -3  0.9 1291 +  CQ R7IW LN35", self.SLOT_UTC, 7047500, "ft4",
         )
+        self.assertIsNotNone(line)
+        self.assertTrue(line.startswith("260722 110115 7047500 0 -3 0.9 1291 ~ "))
         row = parse_jt9_line(line)
         self.assertEqual(row["snr_db"], -3)
         self.assertEqual(row["mode"], "ft4")
-        self.assertEqual(row["frequency"], 7075291)
+        self.assertEqual(row["frequency"], 7048791)
+        self.assertEqual(row["message"], "CQ R7IW LN35")
+
+    def test_ft4_report_with_plus_sign_keeps_whole_message(self):
+        # The message itself may contain '+' (a signal report); the marker
+        # is the 5th whitespace token, never "the first '+' in the line".
+        line = _build_jt9_log_line(
+            "001826 -10  0.5 1500 +  K1ABC W9XYZ +05", self.SLOT_UTC, 7047500, "ft4",
+        )
+        self.assertIsNotNone(line)
+        row = parse_jt9_line(line)
+        self.assertEqual(row["message"], "K1ABC W9XYZ +05")
+        self.assertEqual(row["frequency"], 7049000)
+
+    def test_unknown_marker_returns_none(self):
+        self.assertIsNone(_build_jt9_log_line(
+            "001826 -10  0.5 1500 &  K1ABC W9XYZ EN37", self.SLOT_UTC, 7074000, "ft8",
+        ))
 
     def test_none_slot_utc_returns_none(self):
         self.assertIsNone(_build_jt9_log_line(self.JT9_STDOUT, None, 14074000, "ft8"))
