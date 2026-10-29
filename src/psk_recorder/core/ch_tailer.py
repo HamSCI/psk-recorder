@@ -547,11 +547,11 @@ class ChTailer:
 
 
 def _default_writer_factory(batch_rows: int):
-    """Lazy-import `sigmond.hamsci_sink.Writer` for `psk.spots`.
+    """Lazy-import `hs_uploader.sink.Writer` for `psk.spots`.
 
-    Sigmond core stays stdlib-only; this import only happens when a
-    tailer actually starts.  `Writer.from_env()` resolves the backend
-    (sigmond's SQLite sink by default); the writer is itself a no-op
+    This import only happens when a tailer actually starts (falling back
+    to `sigmond.hamsci_sink` for one release).  `Writer.from_env()`
+    resolves the backend (the SQLite sink by default); the writer is itself a no-op
     when the sink path is unwritable.
 
     `schema_version=2` is the tag every staged row carries.  The
@@ -560,7 +560,11 @@ def _default_writer_factory(batch_rows: int):
     version or the source silently treats them as stale-schema and
     yields nothing.
     """
-    from sigmond.hamsci_sink import Writer
+    try:
+        from hs_uploader.sink import Writer
+    except ImportError:
+        # Fallback for one release: sigmond's older import name.
+        from sigmond.hamsci_sink import Writer
     return Writer.from_env(
         table="spots", mode="psk",
         schema_version=2, batch_rows=batch_rows,
