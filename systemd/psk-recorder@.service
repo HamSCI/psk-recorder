@@ -94,9 +94,10 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-# /var/lib/sigmond holds the shared hs_uploader sink queue (sink.db); without
-# it RW, ProtectSystem=strict makes the dir read-only and the psk Writer
-# silently no-ops (every decoded spot dropped before it reaches the queue).
+# /var/lib/sigmond holds the shared hs_uploader sink queue (sink.db) on a
+# station that keeps its sink there.  Where it exists and is not RW,
+# ProtectSystem=strict makes it read-only and the psk Writer no-ops.  The "-"
+# prefix makes the path optional, so the unit starts on a host without sigmond.
 ReadWritePaths=/var/lib/psk-recorder /var/log/psk-recorder -/var/lib/hs-uploader -/var/lib/sigmond
 ReadOnlyPaths=/etc/psk-recorder
 PrivateNetwork=false
