@@ -46,6 +46,7 @@ from psk_recorder.core.cycle_batcher import PskCycleBatcher
 # but with the file gone we drop it cleanly.
 from psk_recorder.core.hs_uploader_shim import HsPskReporterUploader
 from psk_recorder.core.receiver_manager import (
+    RadiodUnavailable,
     ReceiverManager,
     _resolve_encoding,  # re-exported for any external importer
 )
@@ -289,6 +290,33 @@ def _sqlite_sink_available() -> bool:
     return Path("/var/lib/sigmond/sink.db").exists()
 
 
+class _StopRequested(Exception):
+    """A stop signal arrived while waiting for radiod at startup."""
+
+
+class _quiet_ka9q:
+    """Drop ka9q's own per-try failure records for a waiting episode.
+
+    RadiodControl._connect logs an ERROR with a traceback each time the
+    radiod name will not resolve; the client logs the episode once instead.
+    """
+
+    LOGGERS = ("ka9q.control", "ka9q.utils")
+
+    class _Drop(logging.Filter):
+        def filter(self, record):
+            return record.levelno > logging.ERROR
+
+    def __init__(self):
+        self._filter = self._Drop()
+        for name in self.LOGGERS:
+            logging.getLogger(name).addFilter(self._filter)
+
+    def remove(self):
+        for name in self.LOGGERS:
+            logging.getLogger(name).removeFilter(self._filter)
+
+
 class PskRecorder:
     """Orchestrates one or more ReceiverManagers from a single process.
 
@@ -459,6 +487,8 @@ class PskRecorder:
             self._start_lifetime_keepalive()
             self._notify_ready()
             self._main_loop()
+        except _StopRequested:
+            logger.info("Stopped while waiting for radiod")
         except Exception:
             logger.exception("Fatal error in recorder")
         finally:
@@ -757,51 +787,80 @@ class PskRecorder:
     CONNECT_RETRY_DELAYS = (5, 10, 20, 40, 60)
 
     def _wait(self, seconds: float) -> bool:
-        """Sleep up to ``seconds``; True if a stop signal arrived."""
-        return self._stop_event.wait(seconds)
+        """Sleep up to ``seconds``; True if a stop signal arrived.
+
+        Waits in slices of half the watchdog interval and sends WATCHDOG=1
+        after each, because systemd enforces WatchdogSec from READY=1 and
+        only _main_loop pets it otherwise.
+        """
+        wd = os.environ.get("WATCHDOG_USEC")
+        try:
+            slice_s = int(wd) / 1_000_000 / 2 if wd else 30.0
+        except ValueError:
+            slice_s = 30.0
+        end = time.monotonic() + seconds
+        while True:
+            left = end - time.monotonic()
+            if left <= 0:
+                return False
+            if self._stop_event.wait(min(left, slice_s)):
+                return True
+            self._sd_notify(b"WATCHDOG=1")
 
     def _provision_with_backoff(self, rx) -> None:
         """provision_channels(), retrying while radiod is unreachable.
 
-        Sends READY=1 and a waiting STATUS before the first wait, so
-        Type=notify's start timeout never fires.  Logs one WARNING when
-        the episode starts and one INFO when it ends.  Retries one
-        receiver at a time, so a later source waits behind an absent
-        earlier one.  A stop signal ends the wait and raises
-        ConnectionError into run()'s normal shutdown path.
+        Retries ConnectionError (name will not resolve) and
+        RadiodUnavailable (resolved, but no channel verified).  Sends
+        READY=1 and a waiting STATUS before the first wait, so Type=notify's
+        start timeout never fires, and WATCHDOG=1 during it.  Logs one
+        WARNING when the episode starts and one INFO when it ends; ka9q's
+        per-try ERROR records are filtered for the episode.  A stop signal
+        raises _StopRequested.  Retries one receiver at a time, so a later
+        source waits behind an absent earlier one.
         """
         from ka9q import ConnectionError as RadiodConnectionError
         waiting_since = None
         attempt = 0
-        while True:
-            try:
-                rx.provision_channels(**self._provision_kwargs)
-            except RadiodConnectionError as exc:
-                if waiting_since is None:
-                    waiting_since = time.monotonic()
-                    logger.warning(
-                        "radiod %s unreachable (%s); staying up and retrying "
-                        "(5 s, doubling to 60 s, without end)",
-                        getattr(rx, "_radiod_id", "?"), exc,
+        quiet = None
+        try:
+            while True:
+                try:
+                    rx.provision_channels(**self._provision_kwargs)
+                except (RadiodConnectionError, RadiodUnavailable) as exc:
+                    try:
+                        rx.stop()   # drop the half-built control/listener
+                    except Exception:
+                        logger.debug("teardown after failed try", exc_info=True)
+                    if waiting_since is None:
+                        waiting_since = time.monotonic()
+                        quiet = _quiet_ka9q()
+                        logger.warning(
+                            "radiod %s unreachable (%s); staying up and "
+                            "retrying (5 s, doubling to 60 s, without end)",
+                            getattr(rx, "_radiod_id", "?"), exc,
+                        )
+                        self._sd_notify(
+                            b"READY=1\nSTATUS=waiting for radiod "
+                            + str(getattr(rx, "_radiod_id", "?")).encode()
+                        )
+                    delay = self.CONNECT_RETRY_DELAYS[
+                        min(attempt, len(self.CONNECT_RETRY_DELAYS) - 1)
+                    ]
+                    attempt += 1
+                    if self._wait(delay):
+                        raise _StopRequested() from exc
+                    continue
+                if waiting_since is not None:
+                    logger.info(
+                        "radiod reachable after %.0f s; resuming startup",
+                        time.monotonic() - waiting_since,
                     )
-                    self._sd_notify(
-                        b"READY=1\nSTATUS=waiting for radiod "
-                        + str(getattr(rx, "_radiod_id", "?")).encode()
-                    )
-                delay = self.CONNECT_RETRY_DELAYS[
-                    min(attempt, len(self.CONNECT_RETRY_DELAYS) - 1)
-                ]
-                attempt += 1
-                if self._wait(delay):
-                    raise
-                continue
-            if waiting_since is not None:
-                logger.info(
-                    "radiod reachable after %.0f s; resuming startup",
-                    time.monotonic() - waiting_since,
-                )
-                self._sd_notify(b"STATUS=running")
-            return
+                    self._sd_notify(b"STATUS=running")
+                return
+        finally:
+            if quiet is not None:
+                quiet.remove()
 
     @staticmethod
     def _sd_notify(message: bytes) -> None:
