@@ -849,6 +849,7 @@ class PskRecorder:
                         guard = _EpisodeGuard(
                             lambda m: self._sd_notify(m),
                             ("ka9q.control", "ka9q.utils",
+                             "ka9q.status_listener",
                              ReceiverManager.__module__),
                         )
                         guard.start()
