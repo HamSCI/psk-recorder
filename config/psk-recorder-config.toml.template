@@ -14,12 +14,15 @@ log_dir     = "/var/log/psk-recorder"
 pskreporter = "/usr/local/bin/pskreporter-sender"
 keep_wav    = false
 
-# Decoder.  psk-recorder decodes with ka9q/ft8_lib's `decode_ft8`: it
-# streams to stdout, reports an ft8_lib-internal "score" rather than a
-# calibrated dB SNR, and costs ~0.05 s CPU / ~4 MB RSS per slot per
-# band — essentially invisible at idle for the standard 19-channel
-# layout.  Rows self-identify via `decoder_kind` in `psk.spots`.
-decoder_kind        = "decode_ft8"
+# Decoder.  Default is "jt9": sigmond's /usr/local/bin/jt9 is the UberSDR
+# build, run resident over shared memory (jt9 -s) by the jt9_decode
+# wrapper — calibrated dB SNR, more decodes, and compound-call hashes
+# resolve.  "decode_ft8" (ka9q/ft8_lib) is the near-zero-CPU option
+# (~0.05 s CPU / ~4 MB RSS per slot per band), and what psk-recorder falls
+# back to when jt9_decode is not installed.  Rows self-identify via
+# `decoder_kind` in `psk.spots`.
+decoder_kind        = "jt9"
+decoder_jt9         = "/usr/local/bin/jt9_decode"
 decoder_decode_ft8  = "/usr/local/bin/decode_ft8"
 
 # Optional standalone fallback for chain-delay correction (contract v0.3 §8).

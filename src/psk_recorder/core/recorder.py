@@ -54,6 +54,12 @@ from psk_recorder.core.receiver_manager import (
 logger = logging.getLogger(__name__)
 
 
+def _executable(path: str) -> bool:
+    """True when ``path`` names an executable file, directly or on PATH."""
+    import shutil
+    return bool(shutil.which(path))
+
+
 def _supervise(name, alive, fn, *args):
     """Run a background-thread loop, converting a silent thread death into a
     loud log + backed-off auto-restart.
@@ -531,7 +537,7 @@ class PskRecorder:
         managers for the single process-global keepalive thread.
         """
         decoder_kind = str(
-            self._paths.get("decoder_kind", "decode_ft8"),
+            self._paths.get("decoder_kind", "jt9"),
         ).lower()
         decoder_depth = int(self._paths.get("decoder_depth", 3))
         # Decoder path depends on the kind.  jt9 runs via the resident
@@ -543,7 +549,16 @@ class PskRecorder:
             decoder = self._paths.get(
                 "decoder_jt9", "/usr/local/bin/jt9_decode",
             )
-        else:
+            if not _executable(decoder):
+                # jt9 is the default, but a host without sigmond's decoder
+                # build has no jt9_decode.  Decoding with ft8_lib beats
+                # forking a missing binary every slot and decoding nothing.
+                logger.warning(
+                    "decoder_kind=jt9 but %s is not installed/executable; "
+                    "falling back to decode_ft8", decoder,
+                )
+                decoder_kind = "decode_ft8"
+        if decoder_kind != "jt9":
             decoder = self._paths.get(
                 "decoder_decode_ft8", self._paths.get(
                     "decoder", "/usr/local/bin/decode_ft8",

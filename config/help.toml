@@ -80,14 +80,16 @@ title          = "Decoder kind"
 help           = """Which FT8/FT4 decoder psk-recorder invokes per
 slot:
 
-  decode_ft8   ka9q/ft8_lib decoder; streams to stdout, reports an
-               ft8_lib-internal score (not a calibrated dB SNR),
-               costs ~0.05 s CPU and ~4 MB RSS per slot per band.
-  jt9          WSJT-X's jt9 decoder; calibrated dB SNR, slower but
-               more accurate signal-quality reporting.
+  jt9          (default) the UberSDR jt9, run resident over shared
+               memory by the jt9_decode wrapper; calibrated dB SNR,
+               more decodes, compound-call hashes resolve.
+  decode_ft8   ka9q/ft8_lib decoder; near-zero CPU (~0.05 s and
+               ~4 MB RSS per slot per band), reports an ft8_lib-
+               internal score rather than a calibrated dB SNR.  Also
+               the fallback when jt9_decode is not installed.
 
 Rows in psk.spots self-identify via the decoder_kind column."""
-example        = "decode_ft8"
+example        = "jt9"
 validator_hint = '"decode_ft8" or "jt9"'
 required       = false
 

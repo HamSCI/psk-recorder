@@ -337,7 +337,7 @@ collect_paths() {
     spool=$(current_value         paths spool_dir)
     log=$(current_value           paths log_dir)
     decoder_kind=$(current_value  paths decoder_kind)
-    [[ -z "$decoder_kind" ]] && decoder_kind="decode_ft8"
+    [[ -z "$decoder_kind" ]] && decoder_kind="jt9"
     decoder_path=$(current_value  paths decoder_decode_ft8)
     [[ -z "$decoder_path" ]] && decoder_path="/usr/local/bin/decode_ft8"
     pskreporter=$(current_value     paths pskreporter)
