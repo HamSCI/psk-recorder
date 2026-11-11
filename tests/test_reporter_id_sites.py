@@ -40,10 +40,23 @@ class EnvFilePathTests(unittest.TestCase):
     def test_env_file_path_takes_any_spelling(self):
         for typed in ("AC0G\\x3dB4", "AC0G/B4", "AC0G=B4", "ac0g/b4"):
             with self.subTest(typed=typed):
+                # The instance key (rob, 2026-11-11).
                 self.assertEqual(configurator._env_file_path(typed),
-                                 configurator._ENV_DIR / "AC0G=B4.env")
+                                 configurator._ENV_DIR / "AC0G-B4.env")
         self.assertEqual(configurator._env_file_path("bee1-status.local"),
                          configurator._ENV_DIR / "bee1-status.local.env")
+
+    def test_a_not_yet_moved_storage_file_is_still_used(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_dir = Path(tmp)
+            (env_dir / "AC0G=B4.env").write_text("")
+            with mock.patch.object(configurator, "_ENV_DIR", env_dir):
+                self.assertEqual(configurator._env_file_path("AC0G/B4"),
+                                 env_dir / "AC0G=B4.env")
+            (env_dir / "AC0G-B4.env").write_text("")
+            with mock.patch.object(configurator, "_ENV_DIR", env_dir):
+                self.assertEqual(configurator._env_file_path("AC0G/B4"),
+                                 env_dir / "AC0G-B4.env")
 
     def test_env_file_path_falls_back_to_a_legacy_file_with_a_hint(self):
         with tempfile.TemporaryDirectory() as tmp:
