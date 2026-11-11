@@ -168,7 +168,7 @@ _ensure_sibling ka9q-python https://github.com/HamSCI/ka9q-python
 # for dumphfdl (see sigmond/docs/native-binaries.md).
 FT8LIB_DIR="/opt/git/sigmond/ft8_lib"
 FT8LIB_URL="https://github.com/ka9q/ft8_lib"
-FT8LIB_PIN="400e236304bbae63ed3c342e6c36bf860c8c0425"
+FT8LIB_PIN="0dfd14fd8cdd85dab9a9c7b96ccdd61866bdddec"   # 2026.09.04-1 (leak fixes); pinned on purpose: a fallback decoder, moved only by hand (rob, 2026-11-11)
 DECODE_FT8="/usr/local/bin/decode_ft8"
 
 _ensure_decode_ft8() {
