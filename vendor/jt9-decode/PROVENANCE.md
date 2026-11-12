@@ -56,3 +56,14 @@ reference FT8 slots as one stdin stream, triggered mode decoded all three in
 order (1, 5, and 2 decodes), each with a terminal `<DecodeStats watchdog=0>`,
 no wall-clock waiting, clean EOF exit. A live `<...>` unresolved compound-call
 hash appeared in slot 3 — the exact case resident jt9 resolves across a session.
+
+## Local change: shared-memory lifetime (2026-11-12)
+
+On AI6VN-1 every stop or kill of psk-recorder left each slot's 46 MB SysV
+segment behind; 12.75 GB of them OOM-locked the VM. jt9_decode now marks its
+segment IPC_RMID once jt9 has attached (the kernel frees it when both exit,
+by any signal), and SIGTERM/SIGINT/SIGHUP run the normal shutdown, which also
+removes the lock semaphore and the /dev/shm temp folder. Bench-tested with a
+stand-in jt9: before, SIGTERM and SIGKILL each left a segment and a semaphore;
+after, SIGTERM leaves nothing and SIGKILL leaves only the semaphore.
+psk-recorder's `core/shm_sweep.py` clears what older builds left.

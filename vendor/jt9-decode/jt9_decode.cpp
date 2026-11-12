@@ -51,6 +51,11 @@
 #include <QObject>
 #include <cstring>
 #include <ctime>
+#include <cerrno>
+#include <csignal>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include <unistd.h>
 #include <cmath>
 #include <atomic>
 
@@ -181,6 +186,71 @@ const ModeConfig MODE_FT2  = {52, 3750, 105, 21, "FT2"};   // 3.75 seconds, hsym
 const ModeConfig MODE_FT4  = {5,  7500, 105, 21, "FT4"};   // 7.5 seconds, hsymStop=21
 const ModeConfig MODE_FT8  = {8,  15000, 50, 50, "FT8"};   // 15 seconds, hsymStop=50
 
+// ---------------------------------------------------------------------------
+// Shared-memory lifetime (psk-recorder, 2026-11-12).  On AI6VN-1 every stop of
+// psk-recorder left each slot's 46 MB SysV segment behind (nattch 0, creator
+// dead): systemd's SIGTERM killed jt9_decode before QSharedMemory's destructor
+// could remove it, and SIGKILL (memcg OOM, the stop timeout) never lets it.
+// 12.75 GB of leaked segments OOM-locked the VM.  Two guards:
+//   1. Once jt9 has attached, mark the segment IPC_RMID.  Both processes keep
+//      their mapping; the kernel frees the segment when the last one detaches
+//      or dies, by whatever signal.  It cannot be marked earlier: jt9 attaches
+//      by key, and IPC_RMID makes the key private.
+//   2. SIGTERM, SIGINT and SIGHUP end the event loop, so the normal shutdown
+//      runs: jt9 told to stop, the lock semaphore and temp dir removed.
+// ---------------------------------------------------------------------------
+static volatile sig_atomic_t g_stop_signal = 0;
+
+static void on_stop_signal(int sig) { g_stop_signal = sig; }
+
+static void install_stop_handlers() {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_stop_signal;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGTERM, &sa, nullptr);
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGHUP, &sa, nullptr);
+}
+
+// The SysV id behind a QSharedMemory (Qt 5: ftok(nativeKey, 'Q')), or -1.
+static int sysv_id_of(const QSharedMemory &shm) {
+    QByteArray path = QFile::encodeName(shm.nativeKey());
+    key_t key = ftok(path.constData(), 'Q');
+    if (key == -1) return -1;
+    return shmget(key, 0, 0);
+}
+
+// Wait up to timeout_ms for a second process (jt9) to attach, then mark the
+// segment for removal.  Returns true when it was marked.
+static bool release_segment_after_attach(const QSharedMemory &shm, int timeout_ms,
+                                         QTextStream &log) {
+    int id = sysv_id_of(shm);
+    if (id < 0) {
+        log << "Warning: no SysV id for shared memory (" << strerror(errno)
+            << "); it is removed only on a clean exit\n";
+        log.flush();
+        return false;
+    }
+    for (int waited = 0; waited <= timeout_ms; waited += 20) {
+        struct shmid_ds ds;
+        if (shmctl(id, IPC_STAT, &ds) != 0) break;
+        if (ds.shm_nattch >= 2) {
+            if (shmctl(id, IPC_RMID, nullptr) == 0) {
+                log << "Shared memory " << id << " marked for removal (jt9 attached)\n";
+                log.flush();
+                return true;
+            }
+            break;
+        }
+        QThread::msleep(20);
+    }
+    log << "Warning: jt9 did not attach to shared memory " << id << " within "
+        << timeout_ms << " ms; it is removed only on a clean exit\n";
+    log.flush();
+    return false;
+}
+
 // Audio reader thread - continuously reads samples from stdin
 class AudioReaderThread : public QThread {
 public:
@@ -290,7 +360,12 @@ public:
     ~StreamDecoder() {
         if (reader_thread) {
             reader_thread->stop();
-            reader_thread->wait();
+            // After a stop signal the reader may sit in fread() on a stdin the
+            // caller still holds open; fread is a cancellation point.
+            if (!reader_thread->wait(1000)) {
+                reader_thread->terminate();
+                reader_thread->wait();
+            }
             delete reader_thread;
         }
         delete[] circ_buffer;
@@ -645,6 +720,7 @@ int main(int argc, char *argv[]) {
         .arg(QCoreApplication::applicationPid())
         .arg(QDateTime::currentMSecsSinceEpoch());
     app.setApplicationName(unique_app_name);
+    install_stop_handlers();
     
     // Parse command-line arguments
     QString wav_file;
@@ -878,6 +954,9 @@ int main(int argc, char *argv[]) {
         qStdErr.flush();
         return 1;
     }
+
+    // From here the kernel frees the segment however we exit (guard 1 above).
+    release_segment_after_attach(sharedMemory, 10000, qStdErr);
     
     qStdErr << "\nDecoder parameters:\n";
     qStdErr << "  Mode: " << mode->name << " (" << mode->mode_code << ")\n";
@@ -896,6 +975,17 @@ int main(int argc, char *argv[]) {
         // `triggered` selects caller-driven per-slot decode vs wall-clock cycles.
         StreamDecoder decoder(&sharedMemory, dec_data, &jt9, *mode, triggered);
         decoder.start();
+
+        // A stop signal ends the event loop (guard 2 above).
+        QTimer stop_poll;
+        QObject::connect(&stop_poll, &QTimer::timeout, [&]() {
+            if (g_stop_signal) {
+                qStdErr << "Signal " << int(g_stop_signal) << " received; stopping\n";
+                qStdErr.flush();
+                QCoreApplication::quit();
+            }
+        });
+        stop_poll.start(100);
         
         // Run Qt event loop - processes jt9 output asynchronously
         result = app.exec();

@@ -30,6 +30,7 @@ from typing import Callable, Optional
 
 from ka9q import SlotClock, SlotClockDesyncError
 
+from psk_recorder.core import shm_sweep
 from psk_recorder.core.ring import Ring
 from psk_recorder.core.wav import write_wav, _float32_to_int16
 
@@ -600,6 +601,8 @@ class SlotWorker:
         on a daemon reader thread bound to this specific process, so a restart's
         new reader owns the new process and the old one exits on its EOF.
         """
+        # Clear segments older jt9_decode builds left behind when killed.
+        shm_sweep.sweep()
         wrapper = self._decoder_path
         jt9_bin = str(Path(wrapper).with_name("jt9"))
         mode_arg = "FT4" if self._mode == "ft4" else "FT8"
