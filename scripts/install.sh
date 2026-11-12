@@ -300,12 +300,13 @@ mkdir -p "$CONFIG_DIR"
 # matched the one `config init` later wrote.
 if [[ -f "$CONFIG_FILE" ]]; then
     ui_info "Config exists at $CONFIG_FILE — leaving it untouched"
-    # One exception, once per station: decode_ft8 -> jt9 (the UberSDR jt9).
-    bash "$REPO_SOURCE/scripts/migrate-decoder-jt9.sh" "$CONFIG_FILE" \
-        || ui_warn "decoder migration to jt9 failed; config left as it was"
-else
+elif ! compgen -G "$CONFIG_DIR/*.toml" >/dev/null; then
     ui_info "No config yet — run: smd config init psk-recorder  (or: psk-recorder config init)"
 fi
+# One exception, once per station: every config (the single file and each
+# per-instance <instance>.toml) moves from decode_ft8 to jt9 (the UberSDR jt9).
+bash "$REPO_SOURCE/scripts/migrate-decoder-jt9.sh" "$CONFIG_DIR" \
+    || ui_warn "decoder migration to jt9 failed for a config; it was left as it was"
 
 # --- Phase 4: directories ---
 for dir in "$SPOOL_DIR" "$LOG_DIR"; do
