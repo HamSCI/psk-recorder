@@ -80,6 +80,30 @@ def orphan_segments(text: str, uid: int,
     return out
 
 
+def unmarked_attached(text: str, uid: int) -> int:
+    """How many of this user's segments have jt9 attached (nattch >= 2) but
+    are not marked for removal.  A jt9_decode built before the leak fix
+    leaves them so; the fixed build marks each one once jt9 attaches."""
+    lines = text.splitlines()
+    if not lines:
+        return 0
+    cols = lines[0].split()
+    try:
+        ix = {k: cols.index(k) for k in ("perms", "nattch", "uid")}
+    except ValueError:
+        return 0
+    n = 0
+    for ln in lines[1:]:
+        f = ln.split()
+        try:
+            perms = int(f[ix["perms"]], 8)
+            if int(f[ix["uid"]]) == uid and int(f[ix["nattch"]]) >= 2 and not perms & 0o1000:
+                n += 1
+        except (ValueError, IndexError):
+            continue
+    return n
+
+
 def sweep(proc_shm: Path = PROC_SHM, shm_root: Path = SHM_ROOT,
           uid: Optional[int] = None,
           alive: Callable[[int], bool] = _pid_alive,
@@ -100,6 +124,11 @@ def sweep(proc_shm: Path = PROC_SHM, shm_root: Path = SHM_ROOT,
                 freed += size
         except OSError:
             pass
+    stale = unmarked_attached(text, uid)
+    if stale:
+        logger.warning("%d jt9_decode segment(s) are not marked for removal: the "
+                       "installed jt9_decode predates the leak fix (psk-recorder "
+                       "37e31f7); `smd update` rebuilds it", stale)
     if removed:
         logger.warning("removed %d orphaned jt9_decode shared-memory segment(s), "
                        "%.0f MB, left by dead decoders", removed, freed / 1e6)

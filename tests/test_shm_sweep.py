@@ -75,3 +75,17 @@ def test_temp_dirs_of_dead_pids_go(tmp_path):
 def test_an_unreadable_table_removes_nothing(tmp_path):
     assert shm_sweep.sweep(tmp_path / "missing", tmp_path, uid=UID,
                            rmid=lambda i: (_ for _ in ()).throw(AssertionError)) == 0
+
+
+def mrow(shmid, perms, nattch, uid=UID):
+    return (f"         0 {shmid:10d}  {perms} {48275376:21d}   500   500 {nattch:6d} {uid:5d} {uid:5d}"
+            f" {uid:5d} {uid:5d} 1 2 3 0 0")
+
+
+def test_an_old_jt9_decode_build_is_noticed():
+    text = "\n".join([HEADER,
+                      mrow(1, "1600", 2),      # fixed build: marked once jt9 attached
+                      mrow(2, " 600", 2),      # old build: attached, never marked
+                      mrow(3, " 600", 1),      # jt9 not attached yet
+                      mrow(4, " 600", 2, uid=0)])
+    assert shm_sweep.unmarked_attached(text, UID) == 1
