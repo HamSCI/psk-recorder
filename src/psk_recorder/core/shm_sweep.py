@@ -80,16 +80,26 @@ def orphan_segments(text: str, uid: int,
     return out
 
 
-def unmarked_attached(text: str, uid: int) -> int:
+# The fixed jt9_decode marks its segment within ~20 ms of jt9 attaching, but
+# a sweep that runs in that window sees it attached and unmarked (AI6VN-1,
+# 2026-11-12 23:43Z: four false warnings at startup).  Judge only segments
+# whose last attach is older than this.
+SETTLE_SEC = 15
+
+
+def unmarked_attached(text: str, uid: int, now: Optional[float] = None) -> int:
     """How many of this user's segments have jt9 attached (nattch >= 2) but
-    are not marked for removal.  A jt9_decode built before the leak fix
-    leaves them so; the fixed build marks each one once jt9 attaches."""
+    are not marked for removal, counting only those last attached at least
+    SETTLE_SEC ago.  A jt9_decode built before the leak fix leaves them so;
+    the fixed build marks each one once jt9 attaches."""
+    import time
+    now = time.time() if now is None else now
     lines = text.splitlines()
     if not lines:
         return 0
     cols = lines[0].split()
     try:
-        ix = {k: cols.index(k) for k in ("perms", "nattch", "uid")}
+        ix = {k: cols.index(k) for k in ("perms", "nattch", "uid", "atime")}
     except ValueError:
         return 0
     n = 0
@@ -97,7 +107,9 @@ def unmarked_attached(text: str, uid: int) -> int:
         f = ln.split()
         try:
             perms = int(f[ix["perms"]], 8)
-            if int(f[ix["uid"]]) == uid and int(f[ix["nattch"]]) >= 2 and not perms & 0o1000:
+            settled = now - int(f[ix["atime"]]) >= SETTLE_SEC
+            if (int(f[ix["uid"]]) == uid and int(f[ix["nattch"]]) >= 2
+                    and not perms & 0o1000 and settled):
                 n += 1
         except (ValueError, IndexError):
             continue
