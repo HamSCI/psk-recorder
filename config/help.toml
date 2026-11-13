@@ -288,13 +288,9 @@ required       = false
 
 [env.PSK_USE_HS_UPLOADER]
 title          = "Enable the hs-uploader pipeline?"
-help           = """When 1 (the recommended setting on this fleet),
-psk-recorder runs the in-process hs-uploader Pipeline that ships
-spots through the chosen PSK_DELIVERY_PIPELINES.
-
-When 0 / unset, no uploads happen -- psk-recorder records and
-decodes locally but ships nothing to pskreporter.info or wsprdaemon.
-Useful for offline debugging."""
+help           = """The daemon does not read this flag, so it changes nothing.  The
+keys PSK_DELIVERY_PIPELINES and PSK_DIRECT_DEDUP set where spots go.
+The wizard and `env apply` keep the flag only for older env files."""
 example        = "1"
 validator_hint = "0 or 1"
 required       = false

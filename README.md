@@ -65,7 +65,7 @@ psk-recorder's operator-facing config spans **three persistence layers**:
 |---|---|---|---|
 | **TOML config** | `/etc/psk-recorder/psk-recorder-config.toml` | psk-recorder | `[station]`, `[paths]`, `[processing]`, `[timing]`, `[[radiod]]` blocks |
 | **Coordination env** | `/etc/sigmond/coordination.env` | sigmond | `STATION_CALL`, `STATION_GRID`, `SIGMOND_SQLITE_PATH`, host-wide identity |
-| **Per-instance env** | `/etc/psk-recorder/env/<radiod_id>.env` | psk-recorder | `PSK_DELIVERY_PIPELINES`, `PSK_USE_HS_UPLOADER`, `PSK_DIRECT_DEDUP` — the upload destination knobs |
+| **Per-instance env** | `/etc/psk-recorder/env/<radiod_id>.env` | psk-recorder | `PSK_DELIVERY_PIPELINES` and `PSK_DIRECT_DEDUP` — the upload destination knobs (`PSK_USE_HS_UPLOADER` stays in the file but the daemon ignores it) |
 
 The wizard manages layers 1 and 3; it reads from layer 2 (sigmond's
 coordination env) for pre-fills but never writes there.
