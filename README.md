@@ -47,7 +47,6 @@ External binaries must be present first:
   decoder build installs both.
 - `decode_ft8` from [ka9q/ft8_lib][ft8_lib] → `/usr/local/bin/decode_ft8` —
   the fallback decoder.
-- `pskreporter-sender` from [pjsg/ftlib-pskreporter][ftlib] → `/usr/local/bin/pskreporter-sender`
 - A working `radiod@<id>.service` from [ka9q/ka9q-radio][ka9q]
 
 Then:
