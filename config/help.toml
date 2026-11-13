@@ -256,33 +256,33 @@ required       = false
 
 [env.PSK_DELIVERY_PIPELINES]
 title          = "Upload pipelines (where spots go)"
-help           = """Comma-separated list of upload pipelines; order
-doesn't matter.
+help           = """How spots leave the station.  Every HamSCI station uses
+server-merge: each row rides wspr-recorder's per-cycle tar to
+wsprdaemon.org with the forward_to_pskreporter flag set, and the
+server forwards it to pskreporter.info.  This instance runs no
+sender of its own.  server-merge also holds when the key is unset.
 
-  direct         client POSTs spots directly to pskreporter.info
-                 (cross-receiver dedup via HsPskReporterUploader).
-                 No server involvement on the upload side.
+  server-merge   the delivery.  The server's pskreporter_forwarder
+                 posts each flagged row to pskreporter.info.
 
-  server-merge   ship every row to wsprdaemon-server with the
-                 forward_to_pskreporter flag set.  The server's
-                 elected pskreporter_forwarder picks one
-                 representative row per (call, freq, time) tuple
-                 and POSTs that one to pskreporter.info.
+  server-raw     rows ride the tar with the flag cleared, so the
+                 server stores them and forwards none.  Sigmond's
+                 sink switch writes this value when it holds the
+                 station's uploads back; leave it to the switch.
 
-  server-raw    ship every row to wsprdaemon-server with the
-                 forward_to_pskreporter flag CLEARED, so the
-                 server doesn't double-post.  Use when 'direct'
-                 is also enabled (the wizard auto-downgrades
-                 server-merge -> server-raw in that case).
+  direct         retired: this instance would post to
+                 pskreporter.info itself.  The daemon still accepts
+                 the token, but sigmond refuses it
+                 (`smd config upload` rejects --via direct).
 
-Typical settings:
-  Standalone host:                          direct
-  Site contributing to wsprdaemon network:  server-merge
-  Both:                                     direct,server-raw
+The daemon still reads a comma list; with direct and server-merge
+together it downgrades server-merge to server-raw so the server
+does not post a second copy.  The rows reach wsprdaemon.org only
+when wspr-recorder runs on the same host.
 
 Legacy PSK_DELIVERY_MODE (server / direct / both) is still
 honoured for backward compatibility."""
-example        = "direct"
+example        = "server-merge"
 validator_hint = "comma-separated subset of {direct,server-merge,server-raw}"
 required       = false
 

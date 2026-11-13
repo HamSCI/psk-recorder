@@ -1,6 +1,7 @@
 # psk-recorder
 
-FT4/FT8 spot recorder and PSK Reporter uploader for [ka9q-radio][ka9q].
+FT4/FT8 spot recorder for [ka9q-radio][ka9q]; its spots reach PSK Reporter
+through wsprdaemon.org.
 Replaces the native `ft8-record` / `ft8-decode` / `pskreporter@` shell
 pipeline with a coordinated Python client that follows the HamSCI
 sigmond [client contract][contract] (v0.8).
@@ -13,8 +14,10 @@ psk-recorder daemon (one per radiod)
   ├─ per-channel: ring buffer → 15s/7.5s slot → resident jt9_decode (default)
   │                                           or slot WAV → fork decode_ft8
   ├─ per-mode log file
-  ├─ per-mode: pskreporter-sender (UDP or TCP to pskreporter.info)
   └─ per-mode: ChTailer → sigmond.hamsci_sink.Writer → psk.spots
+                 └─ wspr-recorder's per-cycle tar → wsprdaemon.org
+                      → pskreporter.info (the server forwards each row
+                        flagged forward_to_pskreporter)
 ```
 
 psk-recorder decodes with the UberSDR `jt9` that sigmond installs at
@@ -65,7 +68,7 @@ psk-recorder's operator-facing config spans **three persistence layers**:
 |---|---|---|---|
 | **TOML config** | `/etc/psk-recorder/psk-recorder-config.toml` | psk-recorder | `[station]`, `[paths]`, `[processing]`, `[timing]`, `[[radiod]]` blocks |
 | **Coordination env** | `/etc/sigmond/coordination.env` | sigmond | `STATION_CALL`, `STATION_GRID`, `SIGMOND_SQLITE_PATH`, host-wide identity |
-| **Per-instance env** | `/etc/psk-recorder/env/<radiod_id>.env` | psk-recorder | `PSK_DELIVERY_PIPELINES` and `PSK_DIRECT_DEDUP` — the upload destination knobs (`PSK_USE_HS_UPLOADER` stays in the file but the daemon ignores it) |
+| **Per-instance env** | `/etc/psk-recorder/env/<radiod_id>.env` | psk-recorder | `PSK_DELIVERY_PIPELINES` (`server-merge` on every HamSCI station; sigmond writes it) and `PSK_DIRECT_DEDUP`, which only the retired `direct` pipeline reads (`PSK_USE_HS_UPLOADER` stays in the file but the daemon ignores it) |
 
 The wizard manages layers 1 and 3; it reads from layer 2 (sigmond's
 coordination env) for pre-fills but never writes there.
@@ -82,7 +85,7 @@ Paths      spool=/var/lib/psk-recorder  decoder=jt9
 Processing lifetime=6000 frames
 Timing     chain_delay=0 ns (sigmond usually overrides)
 Radiod     blocks: bee1-rx888
-Delivery   pipelines: direct,server-raw (per-instance env)
+Delivery   pipelines: server-merge (per-instance env)
 Edit-TOML  Open raw config in $EDITOR (for freqs_hz lists)
 Apply      Review and write changes
 Cancel     Discard pending changes and exit
@@ -175,11 +178,14 @@ PYTHONPATH=src python3 -m pytest tests/ -v
 **Does:** receive RTP multicast from `radiod`, slot-align audio to FT8
 (15s) or FT4 (7.5s) cadence, hand each slot to a resident `jt9_decode`
 (or write a WAV and fork `decode_ft8`), append spots to per-mode log
-files,
-supervise a long-running
-`pskreporter-sender` per mode that tails those logs and uploads to
-pskreporter.info, and stream parsed rows into `psk.spots` via
+files, and stream parsed rows into `psk.spots` via
 `sigmond.hamsci_sink.Writer` (sigmond's local SQLite sink by default).
+Under the default `server-merge` delivery each row carries
+`forward_to_pskreporter`, rides wspr-recorder's per-cycle tar to
+wsprdaemon.org, and the server forwards it to pskreporter.info.  The
+station posts nothing to pskreporter.info itself; the `direct` pipeline,
+which did, has retired on sigmond stations (`smd config upload` refuses
+it).
 
 **Does not:** reimplement the FT8/FT4 decoder, reimplement the
 pskreporter protocol, or talk to `radiod` over anything but

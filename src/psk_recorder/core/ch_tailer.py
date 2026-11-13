@@ -277,8 +277,9 @@ class ChTailer:
         self._cycle_batcher = cycle_batcher
         # Tags every row written to the local sink so the wsprdaemon
         # server's gw1-elected pskreporter_forwarder knows whether to
-        # POST it to pskreporter.info. Controlled by PSK_DELIVERY_MODE
-        # in recorder.py — True for "server", False for "both".
+        # POST it to pskreporter.info. recorder.py derives it from
+        # PSK_DELIVERY_PIPELINES: True only when server-merge is on and
+        # direct is not (the standard route), False otherwise.
         self._forward_to_pskreporter = bool(forward_to_pskreporter)
 
         # WSJT-X compound-callsign hash table.  Per-radiod (shared
