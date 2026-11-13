@@ -10,25 +10,40 @@ radiod (ka9q-radio)
   │   RTP multicast, one stream per (band, mode) channel
   ▼
 psk-recorder daemon (one per radiod)
-  ├─ per-channel: ring buffer → 15s/7.5s slot WAV → fork decode_ft8
-  ├─ per-mode log file (decode_ft8 native format)
+  ├─ per-channel: ring buffer → 15s/7.5s slot → resident jt9_decode (default)
+  │                                           or slot WAV → fork decode_ft8
+  ├─ per-mode log file
   ├─ per-mode: pskreporter-sender (UDP or TCP to pskreporter.info)
   └─ per-mode: ChTailer → sigmond.hamsci_sink.Writer → psk.spots
 ```
 
-psk-recorder decodes with ka9q/ft8_lib's `decode_ft8`.  Rows tag
-themselves via `decoder_kind` in `psk.spots`, and ChTailer parses the
-decoder output into `psk.spots` rows.
+psk-recorder decodes with the UberSDR `jt9` that sigmond installs at
+`/usr/local/bin/jt9`, by default (`decoder_kind = "jt9"`).  A resident
+`jt9_decode` wrapper per (band, mode) feeds jt9 through shared memory.
+ka9q/ft8_lib's `decode_ft8` remains the near-zero-CPU choice
+(`decoder_kind = "decode_ft8"`), and the recorder falls back to it, with
+a warning, when `jt9_decode` is missing.  On `smd update`, `install.sh`
+moves an existing config from `decode_ft8` to `jt9` once; a later
+deliberate `decode_ft8` stays.  Before it starts `jt9_decode`, the
+recorder sweeps away shared-memory segments that dead decoders left
+behind; `jt9_decode` itself frees its segment however it exits.  Rows
+tag themselves via `decoder_kind` in `psk.spots`, and ChTailer parses
+the decoder output into `psk.spots` rows.
 
-One `psk-recorder@<radiod_id>.service` instance per radiod. Each
+One `psk-recorder@<radiod_id>.service` instance per radiod. Unit and
+per-instance file names carry the instance key, so reporter id
+`AI6VN/1` gives `psk-recorder@AI6VN-1`. Each
 instance handles all configured FT8 and FT4 frequencies on that
 radiod.
 
 ## Quickstart
 
 External binaries must be present first:
+- `jt9` (UberSDR) → `/usr/local/bin/jt9` and its wrapper `jt9_decode` →
+  `/usr/local/bin/jt9_decode` — the default FT4/FT8 decoder; sigmond's
+  decoder build installs both.
 - `decode_ft8` from [ka9q/ft8_lib][ft8_lib] → `/usr/local/bin/decode_ft8` —
-  psk-recorder's FT4/FT8 decoder.
+  the fallback decoder.
 - `pskreporter-sender` from [pjsg/ftlib-pskreporter][ftlib] → `/usr/local/bin/pskreporter-sender`
 - A working `radiod@<id>.service` from [ka9q/ka9q-radio][ka9q]
 
@@ -63,7 +78,7 @@ a menu-driven wizard:
 
 ```
 Station    Call=AC0G  Grid=EM38ww40pk
-Paths      spool=/var/lib/psk-recorder  decoder=decode_ft8
+Paths      spool=/var/lib/psk-recorder  decoder=jt9
 Processing lifetime=6000 frames
 Timing     chain_delay=0 ns (sigmond usually overrides)
 Radiod     blocks: bee1-rx888
@@ -158,8 +173,9 @@ PYTHONPATH=src python3 -m pytest tests/ -v
 ## What it does and does not
 
 **Does:** receive RTP multicast from `radiod`, slot-align audio to FT8
-(15s) or FT4 (7.5s) cadence, write a WAV per slot, fork `decode_ft8`,
-append spots to per-mode log files in decode_ft8's native format,
+(15s) or FT4 (7.5s) cadence, hand each slot to a resident `jt9_decode`
+(or write a WAV and fork `decode_ft8`), append spots to per-mode log
+files,
 supervise a long-running
 `pskreporter-sender` per mode that tails those logs and uploads to
 pskreporter.info, and stream parsed rows into `psk.spots` via

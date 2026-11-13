@@ -17,5 +17,5 @@
 | [OPERATIONS.md](OPERATIONS.md) ★ | operator/contributor | running it day-to-day: starting/stopping, logs, upload health, troubleshooting |
 | [REQUIREMENTS.md](REQUIREMENTS.md) | contributor | formal requirements, reconciled to code |
 | [SIGMOND-CONTRACT.md](SIGMOND-CONTRACT.md) ★ | contributor | conformance map to sigmond's CLIENT-CONTRACT |
-| [jt9-decoder.md](jt9-decoder.md) | contributor | design record for jt9 as a selectable FT8/FT4 decoder option alongside decode_ft8 |
+| [jt9-decoder.md](jt9-decoder.md) | contributor | design record for jt9 as an FT8/FT4 decoder; jt9 has been the default since 2026-11-11, with decode_ft8 the fallback |
 | [archive/](archive/README.md) | — | history |
