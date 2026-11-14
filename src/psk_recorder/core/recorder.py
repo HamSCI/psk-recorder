@@ -282,6 +282,21 @@ def _canonicalise_pipelines(pipes) -> tuple[str, ...]:
 
 
 
+# sigmond's per-instance upload flag (`smd config upload psk-recorder
+# --on/--off`), a bring-up hold: off lets the station confirm delivery
+# from radiod and local decodes before anything goes upstream.  Decoding
+# and sink staging continue; sigmond's sink switch (fill) holds the rows.
+# Same reading as sigmond's sink_carryover: these four words mean off;
+# anything else, unset included, is on.
+_UPLOAD_OFF_WORDS = ("0", "false", "no", "off")
+
+
+def _upload_enabled() -> bool:
+    """False when PSK_USE_HS_UPLOADER holds this instance's uploads."""
+    raw = (os.environ.get("PSK_USE_HS_UPLOADER") or "").strip().lower()
+    return raw not in _UPLOAD_OFF_WORDS
+
+
 def _sqlite_sink_available() -> bool:
     """True when the SQLite sink the hs-uploader reads from is in play.
 
@@ -787,6 +802,12 @@ class PskRecorder:
         # ``server-raw``) are driven from the SQLite sink → wsprdaemon-
         # tar transport in wspr-recorder's upload orchestrator and
         # need no work here.
+        if not _upload_enabled():
+            logger.info(
+                "PSK_USE_HS_UPLOADER is off (bring-up hold) — no uploader started; "
+                "spots still stage to the sink for sigmond to hold",
+            )
+            return
         pipelines = _resolve_delivery_pipelines()
         if "direct" not in pipelines:
             logger.info(

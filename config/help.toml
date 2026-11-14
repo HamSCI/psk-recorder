@@ -288,9 +288,12 @@ required       = false
 
 [env.PSK_USE_HS_UPLOADER]
 title          = "Enable the hs-uploader pipeline?"
-help           = """The daemon does not read this flag, so it changes nothing.  The
-keys PSK_DELIVERY_PIPELINES and PSK_DIRECT_DEDUP set where spots go.
-The wizard and `env apply` keep the flag only for older env files."""
+help           = """Holds uploads during bring-up; decoding and local staging continue.
+Set by `smd config upload psk-recorder --on/--off`.  0, false, no or off:
+the daemon decodes and stages spots to the sink as usual but starts no
+uploader of its own; sigmond's sink switch holds the staged rows until
+uploads are turned on.  Anything else, or unset: on.  Not a resource
+switch: to stop psk entirely, `smd disable psk-recorder`."""
 example        = "1"
 validator_hint = "0 or 1"
 required       = false

@@ -67,7 +67,7 @@ psk-recorder's operator-facing config spans **three persistence layers**:
 |---|---|---|---|
 | **TOML config** | `/etc/psk-recorder/psk-recorder-config.toml` | psk-recorder | `[station]`, `[paths]`, `[processing]`, `[timing]`, `[[radiod]]` blocks |
 | **Coordination env** | `/etc/sigmond/coordination.env` | sigmond | `STATION_CALL`, `STATION_GRID`, `SIGMOND_SQLITE_PATH`, host-wide identity |
-| **Per-instance env** | `/etc/psk-recorder/env/<radiod_id>.env` | psk-recorder | `PSK_DELIVERY_PIPELINES` (`server-merge` on every HamSCI station; sigmond writes it) and `PSK_DIRECT_DEDUP`, which only the retired `direct` pipeline reads (`PSK_USE_HS_UPLOADER` stays in the file but the daemon ignores it) |
+| **Per-instance env** | `/etc/psk-recorder/env/<radiod_id>.env` | psk-recorder | `PSK_DELIVERY_PIPELINES` (`server-merge` on every HamSCI station; sigmond writes it) and `PSK_DIRECT_DEDUP`, which only the retired `direct` pipeline reads (`PSK_USE_HS_UPLOADER` holds uploads during bring-up; decoding and local staging continue. `0`/`false`/`no`/`off` starts no uploader and relies on sigmond's sink switch to hold staged rows; unset means on) |
 
 The wizard manages layers 1 and 3; it reads from layer 2 (sigmond's
 coordination env) for pre-fills but never writes there.
