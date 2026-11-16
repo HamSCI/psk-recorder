@@ -19,9 +19,15 @@ compound-callsign hash table keeps learning the same bands every cycle
 (docs/jt9-decoder.md section 2).  A table shared by several bands also resolves
 a call heard on one of them when it appears on another.
 
-Deadline guard: a group whose oldest unanswered slot ended more than one cycle
-ago skips the new slot and logs it, rather than letting decoding slip further
-behind.  Capture and slot timestamps never depend on when a decode ran.
+Feeding never stops.  jt9_decode reads stdin with fread in 4096-sample blocks,
+so the tail of the last slot fed (an FT8 slot is 43 blocks plus 3872 samples)
+reaches it only with the next slot's audio, or at EOF.  Withholding a slot to
+"catch up" therefore leaves the previous one unanswerable and stalls the group
+for good; the first version did exactly that on B4 (2026-11-16, no decodes for
+5 minutes).  Instead a stall detector restarts a group whose oldest unanswered
+slot ended more than STALL_CYCLES cycles ago (and at least STALL_MIN_SEC, which
+leaves room for jt9's slow first decode after a start); its unanswered slots
+drop, logged.  Capture and slot timestamps never depend on when a decode ran.
 """
 from __future__ import annotations
 
@@ -41,8 +47,10 @@ logger = logging.getLogger(__name__)
 # How long stop() lets jt9_decode drain the slots it was fed before killing it.
 JT9_STOP_DRAIN_SEC = 10.0
 
-# Rate limit for the deadline-guard warning, per decoder.
-_DROP_LOG_INTERVAL_SEC = 60.0
+# A group whose oldest unanswered slot ended more than this many cycles ago
+# (and at least STALL_MIN_SEC ago) is stuck: restart its process.
+STALL_CYCLES = 4
+STALL_MIN_SEC = 60.0
 
 
 def assign_groups(freqs: list[int], group_size: int) -> list[list[int]]:
@@ -105,8 +113,7 @@ class Jt9Decoder:
         self.restarts = 0
         self.dropped = 0
         self.pid_count = 0          # processes started over this object's life
-        self._last_drop_log = 0.0
-        self._drops_since_log = 0
+        self._stall_after = max(STALL_CYCLES * cadence_sec, STALL_MIN_SEC)
 
     @property
     def name(self) -> str:
@@ -156,42 +163,37 @@ class Jt9Decoder:
     # ----- feeding ----------------------------------------------------------
 
     def submit(self, client, pcm: bytes, slot_utc: float) -> bool:
-        """Queue one slot of int16 PCM for decoding.  False when skipped."""
+        """Feed one slot of int16 PCM.  False when it could not be fed.
+
+        Never withholds a slot to catch up: see the module docstring."""
         with self._lock:
-            if self._pending:
-                oldest = self._pending[0][1]
-                behind = self._now() - (oldest + self._cadence_sec)
-                if behind > self._cadence_sec:
-                    self._note_drop_locked(behind)
-                    drop = True
-                else:
-                    drop = False
-            else:
-                drop = False
-            if not drop and self._running:
+            fed = False
+            if self._running:
+                if self._pending:
+                    oldest = self._pending[0][1]
+                    behind = self._now() - (oldest + self._cadence_sec)
+                    if behind > self._stall_after:
+                        self._restart_locked(
+                            f"stalled: oldest unanswered slot ended "
+                            f"{behind:.0f} s ago")
                 proc = self._proc
                 if proc is None or proc.poll() is not None:
                     self._restart_locked("process exited")
                     proc = self._proc
-                if proc is None or proc.poll() is not None:
-                    drop = True
-                else:
+                if proc is not None and proc.poll() is None:
                     self._pending.append((client, slot_utc))
                     try:
                         proc.stdin.write(pcm)
                         proc.stdin.flush()
+                        fed = True
                     except (BrokenPipeError, OSError) as exc:
                         self._pending.pop()
                         self._restart_locked(f"stdin write failed: {exc}")
-                        drop = True
-            elif not self._running:
-                drop = True
-            if drop:
+            if not fed:
                 self.dropped += 1
-        if drop:
+        if not fed:
             client.on_jt9_dropped()
-            return False
-        return True
+        return fed
 
     def pending_for(self, client) -> list[float]:
         """Slot UTCs this client fed that have not been answered yet."""
@@ -199,19 +201,6 @@ class Jt9Decoder:
             return [s for c, s in self._pending if c is client]
 
     # ----- internals --------------------------------------------------------
-
-    def _note_drop_locked(self, behind: float) -> None:
-        self._drops_since_log += 1
-        now = time.monotonic()
-        if now - self._last_drop_log >= _DROP_LOG_INTERVAL_SEC:
-            logger.warning(
-                "jt9 %s: %.1f s behind (more than one %.1f s cycle); skipped "
-                "%d slot(s) rather than let decoding slip — too many bands "
-                "for this group, or the CPU is short",
-                self._name, behind, self._cadence_sec, self._drops_since_log,
-            )
-            self._last_drop_log = now
-            self._drops_since_log = 0
 
     def _spawn_locked(self) -> None:
         # Clear segments older jt9_decode builds left behind when killed.

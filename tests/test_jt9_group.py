@@ -19,29 +19,33 @@ from psk_recorder.core.jt9_group import Jt9Decoder, assign_groups
 
 FT8_SAMPLES = 180000
 
-# Stands in for jt9_decode -T: reads one slot of int16 PCM at a time from stdin,
-# answers in order with one decode line (echoing the slot's first sample, so a
-# test can tell slots apart) and one terminal <DecodeStats>.  FAKE_EXIT_AFTER
-# makes it exit after that many slots.
+# Stands in for jt9_decode -T.  Like the real wrapper (AudioReaderThread:
+# fread of 4096 int16 samples at a time), it takes stdin in whole 8192-byte
+# blocks, so a slot's tail stays unread until more audio arrives: one slot is
+# 43 blocks plus 3872 samples.  It answers each complete slot in order with one
+# decode line (echoing the slot's first sample, so a test can tell slots apart)
+# and one terminal <DecodeStats>.  FAKE_EXIT_AFTER makes it exit after that
+# many slots.
 FAKE = r'''#!{py}
 import os, struct, sys
 n = {n}
 exit_after = int(os.environ.get("FAKE_EXIT_AFTER", "0"))
 k = 0
+ring = b""
 while True:
-    buf = b""
-    while len(buf) < 2 * n:
-        chunk = sys.stdin.buffer.read(2 * n - len(buf))
-        if not chunk:
-            sys.exit(0)
-        buf += chunk
-    first = struct.unpack("<h", buf[:2])[0]
-    sys.stdout.write("000000 -10  0.1 1500 ~  CQ K{{}} FN20\n".format(first))
-    sys.stdout.write("<DecodeStats cycle_num={{}} watchdog=0>\n".format(k))
-    sys.stdout.flush()
-    k += 1
-    if exit_after and k >= exit_after:
+    block = sys.stdin.buffer.read(8192)      # blocks for a full block, as fread does
+    if not block:
         sys.exit(0)
+    ring += block
+    while len(ring) >= 2 * n:
+        slot, ring = ring[:2 * n], ring[2 * n:]
+        first = struct.unpack("<h", slot[:2])[0]
+        sys.stdout.write("000000 -10  0.1 1500 ~  CQ K{{}} FN20\n".format(first))
+        sys.stdout.write("<DecodeStats> cycle_num={{}} watchdog=0 </DecodeStats>\n".format(k))
+        sys.stdout.flush()
+        k += 1
+        if exit_after and k >= exit_after:
+            sys.exit(0)
 '''
 
 
@@ -113,17 +117,35 @@ def test_two_channels_share_one_process_and_results_route_back(fake_wrapper):
                      name="ft8-g0", sweep=lambda: None, now=lambda: 1020.0)
     a, b = Client(7074000), Client(14074000)
     dec.start()
-    try:
-        assert dec.submit(a, pcm(11), 1000.0)
-        assert dec.submit(b, pcm(22), 1000.0)
-        assert dec.submit(a, pcm(33), 1015.0)
-        assert wait_for(lambda: len(a.done) == 2 and len(b.done) == 1)
-    finally:
-        dec.stop()
+    assert dec.submit(a, pcm(11), 1000.0)
+    assert dec.submit(b, pcm(22), 1000.0)
+    assert dec.submit(a, pcm(33), 1015.0)
+    dec.stop()          # closes stdin: the last slot's tail arrives, all decode
     assert [(l.split()[-2], s) for l, s in a.lines] == [("K11", 1000.0), ("K33", 1015.0)]
     assert [(l.split()[-2], s) for l, s in b.lines] == [("K22", 1000.0)]
     assert a.done == [True, True] and b.done == [True]
     assert dec.pid_count == 1
+
+
+def test_last_slot_waits_for_the_next_one(fake_wrapper):
+    """jt9_decode reads stdin in 4096-sample blocks, so the tail of the last
+    slot fed reaches it only with the next slot's audio (or EOF).  Feeding must
+    therefore never stop; the newest slot is answered one feed later."""
+    dec = Jt9Decoder(fake_wrapper, "ft8", depth=3, cadence_sec=15.0,
+                     name="ft8-g0", sweep=lambda: None, now=lambda: 1020.0)
+    a = Client(7074000)
+    dec.start()
+    try:
+        assert dec.submit(a, pcm(1), 1000.0)
+        assert dec.submit(a, pcm(2), 1000.0)
+        assert wait_for(lambda: len(a.done) == 1)
+        time.sleep(0.3)
+        assert len(a.done) == 1                 # slot 2's tail still unread
+        assert dec.submit(a, pcm(3), 1015.0)
+        assert wait_for(lambda: len(a.done) == 2)
+    finally:
+        dec.stop()
+    assert [l.split()[-2] for l, _ in a.lines] == ["K1", "K2", "K3"]
 
 
 def test_pending_for_reports_each_clients_unanswered_slots(fake_wrapper):
@@ -156,25 +178,42 @@ class _FakeProc:
         return None
 
 
-def test_deadline_guard_drops_rather_than_slips(fake_wrapper):
-    """A group more than one cycle behind skips the new slot and says so."""
+def test_behind_but_not_stalled_still_feeds():
+    """Falling behind by more than a cycle must never stop the feed: the
+    previous slot's tail only arrives with new audio (fread blocks), so
+    withholding it would stall the group for good (B4, 2026-11-16)."""
     now = [5000.0]
-    dec = Jt9Decoder(fake_wrapper, "ft8", depth=3, cadence_sec=15.0,
+    dec = Jt9Decoder("/bin/false", "ft8", depth=3, cadence_sec=15.0,
                      name="ft8-g0", sweep=lambda: None, now=lambda: now[0])
     a = Client(7074000)
     dec._running = True
     dec._proc = proc = _FakeProc()
-    # Oldest unanswered slot started at 4960 and ended at 4975: 25 s ago,
-    # more than one 15 s cycle behind.  The new slot must not be fed.
-    dec._pending.append((a, 4960.0))
-    assert dec.submit(a, pcm(1), 4990.0) is False
-    assert proc.stdin.fed == []
-    assert a.dropped == 1 and dec.dropped == 1
-    # Within one cycle (oldest ended 10 s ago): fed normally.
-    now[0] = 4985.0
-    assert dec.submit(a, pcm(2), 4990.0) is True
+    dec._pending.append((a, 4960.0))     # ended 4975: 25 s ago, under the stall limit
+    assert dec.submit(a, pcm(1), 4990.0) is True
     assert proc.stdin.fed == [2 * FT8_SAMPLES]
+    assert dec.restarts == 0 and a.dropped == 0
     assert dec.pending_for(a) == [4960.0, 4990.0]
+
+
+def test_stalled_group_restarts_and_keeps_feeding(fake_wrapper):
+    """An oldest unanswered slot past the stall limit means the process is
+    stuck: restart it (its unanswered slots drop, logged) and feed the new
+    slot to the fresh process."""
+    now = [5000.0]
+    dec = Jt9Decoder(fake_wrapper, "ft8", depth=3, cadence_sec=15.0,
+                     name="ft8-g0", sweep=lambda: None, now=lambda: now[0])
+    a = Client(7074000)
+    dec.start()
+    try:
+        stuck = dec._proc
+        dec._pending.append((a, 4900.0))     # ended 4915: 85 s ago, past the limit
+        assert dec.submit(a, pcm(7), 4985.0) is True
+        assert dec.restarts == 1 and dec._proc is not stuck
+        assert a.dropped == 1
+        assert dec.pending_for(a) == [4985.0]
+    finally:
+        dec.stop()
+    assert [l.split()[-2] for l, _ in a.lines] == ["K7"]
 
 
 def test_dead_process_restarts_and_drops_unanswered_slots(fake_wrapper, monkeypatch):
@@ -185,17 +224,18 @@ def test_dead_process_restarts_and_drops_unanswered_slots(fake_wrapper, monkeypa
     dec.start()
     try:
         assert dec.submit(a, pcm(1), 1000.0)
+        assert dec.submit(a, pcm(2), 1000.0)    # completes slot 1; then it exits
         assert wait_for(lambda: len(a.done) == 1)
         first = dec._proc
         assert wait_for(lambda: first.poll() is not None)
         monkeypatch.delenv("FAKE_EXIT_AFTER")
-        assert dec.submit(a, pcm(2), 1015.0)      # restarts, then feeds
-        assert wait_for(lambda: len(a.done) == 2)
+        assert dec.submit(a, pcm(3), 1015.0)    # restarts (slot 2 lost), feeds 3
         assert dec._proc is not first
-        assert dec.restarts == 1
+        assert dec.restarts == 1 and a.dropped == 1
     finally:
         dec.stop()
-    assert [l.split()[-2] for l, _ in a.lines] == ["K1", "K2"]
+    assert [l.split()[-2] for l, _ in a.lines] == ["K1", "K3"]
+    assert a.done == [True, True]
 
 
 def test_stop_drains_and_is_idempotent(fake_wrapper):

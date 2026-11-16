@@ -85,10 +85,18 @@ deadline.  So now:
 * Affinity stays fixed, so a process keeps learning the same bands' compound
   calls (section 2); a call heard on one band of the group also resolves on
   another.
-* Deadline guard: a group whose oldest unanswered slot ended more than one
-  cycle ago skips the new slot and logs it, rather than slip.  A group's
-  summed decode time must fit the cycle: FT8 measured 1.5-3.2 s per band per
-  15 s cycle on W2NAF (2026-11-16, a quiet hour).
+* Feeding never stops.  `jt9_decode` reads stdin with `fread` in 4096-sample
+  blocks, so the tail of the last slot fed (FT8: 43 blocks + 3872 samples)
+  reaches it only with the next slot's audio, or at EOF.  Each slot is
+  therefore answered one feed later — true of the one-per-band layout too.
+  Withholding a slot to catch up would leave the previous one unanswerable;
+  the first grouped build did that on B4 (2026-11-16) and decoded nothing
+  for 5 minutes.  A stall detector instead restarts a group whose oldest
+  unanswered slot ended more than 4 cycles (and at least 60 s) ago, dropping
+  its unanswered slots with a log line.  Reading stdin with `read()` in the
+  wrapper would remove the one-feed delay.
+* A group's summed decode time must fit the cycle: FT8 measured 1.5-3.2 s per
+  band per 15 s cycle on W2NAF (2026-11-16, a quiet hour).
 * The manager starts the shared decoders before any sink feeds them and stops
   them after every sink, so each finishes what it was fed.
 
