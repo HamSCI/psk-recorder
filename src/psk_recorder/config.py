@@ -92,6 +92,13 @@ DEFAULTS: dict[str, Any] = {
         "decoder_kind": "jt9",
         "decoder_jt9": "/usr/local/bin/jt9_decode",
         "decoder_depth": 3,
+        # Bands per shared resident jt9 (core/jt9_group.py).  A group decodes
+        # its bands' slots one after another, so its total decode time must
+        # fit the cycle: FT8 measured 1.5-3.2 s per band per 15 s cycle on
+        # W2NAF (2026-11-16, quiet hour), FT4 far less.  1 = one process per
+        # band, the behaviour before groups.
+        "decoder_group_size_ft8": 3,
+        "decoder_group_size_ft4": 5,
     },
     "processing": {
         # radiod LIFETIME tag (ka9q-python ≥3.13.0, ka9q-radio ≥0f8b622).

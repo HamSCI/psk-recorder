@@ -58,12 +58,39 @@ This is why the integration is a resident-process model, not the old fork.
 
 ## 3. Process model
 
-One **resident `jt9`** per `(band, mode)`, driven over WSJT-X's `QSharedMemory`
-IPC. We reuse the already-written `jt9_decode` wrapper
-(`jt9-experiment/jt9-decode`, madpsy) which implements exactly that GUI-side
-protocol: it holds one `jt9` via `QProcess`, fills the shmem `dec_data` ring,
-triggers a decode per cycle, and relays jt9's decode lines on its own stdout.
-(~19–20 resident processes for B4's FT8+FT4 band set.)
+**Resident `jt9` processes, each shared by a fixed group of bands of one
+mode** (`core/jt9_group.py`), driven over WSJT-X's `QSharedMemory` IPC. We
+reuse the already-written `jt9_decode` wrapper (`jt9-experiment/jt9-decode`,
+madpsy) which implements exactly that GUI-side protocol: it holds one `jt9` via
+`QProcess`, fills the shmem `dec_data` ring, triggers a decode per slot, and
+relays jt9's decode lines on its own stdout.
+
+Until 2026-11-16 each `(band, mode)` ran its own process (~19-20 for B4's
+FT8+FT4 band set).  All of them got their slot at the same boundary, so a
+station decoded every band at once: a CPU burst each cycle, with stream gaps in
+the recorder, and one ~43 MB System V segment per process (WSJT-X's
+`NTMAX` = 30 min of audio, in `wsjtx/commons.h`) — 1.1 GB on W2NAF, 1.7 GB on
+KFS-SE-NW.  Michael's rule: the recording keeps its precise timing, but when it
+decodes can follow resource allocation, provided each decode meets its
+deadline.  So now:
+
+* `ReceiverManager` splits each mode's bands into groups of
+  `[paths] decoder_group_size_ft8` (default 3) or `decoder_group_size_ft4`
+  (default 5), round-robin over the sorted frequencies so neighbouring bands
+  land apart.  Size 1 restores one process per band.
+* Each group shares one resident `jt9_decode`.  Its channels submit their
+  slots as before; the wrapper decodes them one after another (it already
+  handled one slot at a time, in fed order), so the work spreads over the
+  cycle.  Results map back to `(channel, slot)` by order.
+* Affinity stays fixed, so a process keeps learning the same bands' compound
+  calls (section 2); a call heard on one band of the group also resolves on
+  another.
+* Deadline guard: a group whose oldest unanswered slot ended more than one
+  cycle ago skips the new slot and logs it, rather than slip.  A group's
+  summed decode time must fit the cycle: FT8 measured 1.5-3.2 s per band per
+  15 s cycle on W2NAF (2026-11-16, a quiet hour).
+* The manager starts the shared decoders before any sink feeds them and stops
+  them after every sink, so each finishes what it was fed.
 
 **Timing authority stays with psk-recorder.** We do *not* free-run the
 wrapper off a continuous stdin stream. The stock `jt9_decode` self-times: a

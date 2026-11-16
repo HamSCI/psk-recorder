@@ -151,3 +151,44 @@ class PskRecorderMultiSourceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SharedJt9LifecycleTests(unittest.TestCase):
+    """Band-grouped jt9 (2026-11-16): the manager owns the shared decoders.
+    They start before any sink feeds them and stop after every sink, so a
+    decoder can finish the slots it was fed."""
+
+    class _Dec:
+        def __init__(self, name, log):
+            self.name, self.log = name, log
+
+        def start(self):
+            self.log.append(("start", self.name))
+
+        def stop(self):
+            self.log.append(("stop", self.name))
+
+    class _Sink:
+        mode, frequency_hz = "ft8", 14074000
+
+        def __init__(self, log):
+            self.log = log
+
+        def start(self):
+            self.log.append(("start", "sink"))
+
+        def stop(self):
+            self.log.append(("stop", "sink"))
+
+    def test_decoders_start_before_sinks_and_stop_after(self):
+        log = []
+        rx = _make_rx({"status": "rx.local"})
+        rx._jt9_decoders = [self._Dec("g0", log), self._Dec("g1", log)]
+        rx._sinks = [self._Sink(log)]
+        rx.start_streams()
+        self.assertEqual(log[:3], [("start", "g0"), ("start", "g1"), ("start", "sink")])
+        log.clear()
+        rx.stop()
+        self.assertEqual(log, [("stop", "sink"), ("stop", "g0"), ("stop", "g1")])
+        self.assertEqual(rx._jt9_decoders, [])
+        rx.stop()                   # idempotent: decoders already gone

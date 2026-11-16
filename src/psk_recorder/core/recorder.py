@@ -555,6 +555,10 @@ class PskRecorder:
             self._paths.get("decoder_kind", "jt9"),
         ).lower()
         decoder_depth = int(self._paths.get("decoder_depth", 3))
+        decoder_group_sizes = {
+            "ft8": int(self._paths.get("decoder_group_size_ft8", 3)),
+            "ft4": int(self._paths.get("decoder_group_size_ft4", 5)),
+        }
         # Decoder path depends on the kind.  jt9 runs via the resident
         # jt9_decode wrapper (which needs its sibling jt9 binary alongside it);
         # decode_ft8 is ka9q/ft8_lib's one-shot binary.  jt9 keeps a resident
@@ -597,6 +601,7 @@ class PskRecorder:
                 keep_wav=keep_wav,
                 spool_spots=spool_spots,
                 decoder_depth=decoder_depth,
+                decoder_group_sizes=decoder_group_sizes,
             )
             self._provision_with_backoff(rx)
             # Gather this manager's lifetime entries for the global

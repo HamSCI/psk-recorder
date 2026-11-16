@@ -29,12 +29,15 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 from psk_recorder.config import (
+    FT4_CADENCE_SEC,
+    FT8_CADENCE_SEC,
     derive_source_key,
     get_freqs,
     get_mode_params,
     resolve_radiod_status,
 )
 from psk_recorder.core.ch_tailer import ChTailer
+from psk_recorder.core.jt9_group import Jt9Decoder, assign_groups
 
 # ChannelSink imports numpy via psk_recorder.core.stream; defer the
 # import so this module stays importable in lightweight test
@@ -134,6 +137,8 @@ class ReceiverManager:
         # anchor read lands on a current snapshot.  Wired in provision_channels().
         self._status_listener = None
         self._sinks: list[ChannelSink] = []
+        # Shared resident jt9 decoders, one per band group (core/jt9_group.py).
+        self._jt9_decoders: list[Jt9Decoder] = []
         self._multi_streams: list = []
         # (MultiStream, ssrc) pairs the process-global keepalive
         # thread refreshes.  PskRecorder.start_lifetime_keepalive
@@ -174,6 +179,7 @@ class ReceiverManager:
         keep_wav: bool,
         spool_spots: bool,
         decoder_depth: int = 3,
+        decoder_group_sizes: Optional[dict] = None,
     ) -> None:
         """Create ChannelSinks and register them with MultiStream(s).
 
@@ -281,6 +287,31 @@ class ReceiverManager:
                 # Text mode (not binary) — Python str flows through.
                 self._log_fds[mode] = open(log_path, "a", encoding="utf-8")
 
+            # jt9: the mode's bands share a few resident decoders, one per
+            # group, so decodes run one after another instead of all at the
+            # boundary (Michael, 2026-11-16).  group size 1 = one per band.
+            jt9_by_freq: dict[int, Jt9Decoder] = {}
+            if decoder_kind == "jt9":
+                size = int((decoder_group_sizes or {}).get(mode, 1))
+                cadence = FT4_CADENCE_SEC if mode == "ft4" else FT8_CADENCE_SEC
+                groups = assign_groups(freqs, size)
+                for i, group in enumerate(groups):
+                    dec = Jt9Decoder(
+                        decoder, mode, depth=decoder_depth,
+                        cadence_sec=cadence,
+                        name=f"{self._radiod_id}-{mode}-g{i}",
+                    )
+                    self._jt9_decoders.append(dec)
+                    for f in group:
+                        jt9_by_freq[f] = dec
+                logger.info(
+                    "ReceiverManager %s: %s %d band(s) share %d resident jt9 "
+                    "(group size %d): %s",
+                    self._radiod_id, mode.upper(), len(freqs), len(groups),
+                    size, "; ".join(
+                        ",".join(str(f) for f in g) for g in groups),
+                )
+
             for freq_hz in freqs:
                 logger.info(
                     "ReceiverManager %s: provisioning %s %d Hz "
@@ -301,6 +332,7 @@ class ReceiverManager:
                     keep_wav=keep_wav,
                     spool_spots=spool_spots,
                     decoder_depth=decoder_depth,
+                    jt9_decoder=jt9_by_freq.get(freq_hz),
                 )
                 if self._provision_one_with_retry(
                         sink, multi_by_group, deadline):
@@ -456,6 +488,14 @@ class ReceiverManager:
             self._lifetime_entries.append((multi, ch_info.ssrc))
 
     def start_streams(self) -> None:
+        for dec in self._jt9_decoders:
+            try:
+                dec.start()
+            except Exception:
+                logger.exception(
+                    "ReceiverManager %s: failed to start jt9 %s",
+                    self._radiod_id, dec.name,
+                )
         for sink in self._sinks:
             try:
                 sink.start()
@@ -605,6 +645,17 @@ class ReceiverManager:
                     "ReceiverManager %s: error stopping sink",
                     self._radiod_id,
                 )
+        # Shared decoders stop after their sinks: closing stdin lets each
+        # decode what it was already fed.
+        for dec in self._jt9_decoders:
+            try:
+                dec.stop()
+            except Exception:
+                logger.exception(
+                    "ReceiverManager %s: error stopping jt9 %s",
+                    self._radiod_id, dec.name,
+                )
+        self._jt9_decoders.clear()
         # Sinks intentionally kept in self._sinks so a final
         # stats_snapshot in PskRecorder's stats thread can still
         # read them.

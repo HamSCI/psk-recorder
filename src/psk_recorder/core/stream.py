@@ -79,6 +79,7 @@ class ChannelSink:
         decoder_kind: str = "decode_ft8",
         spool_spots: bool = False,
         decoder_depth: int = 3,
+        jt9_decoder=None,
     ):
         self._mode = mode
         self._frequency_hz = frequency_hz
@@ -122,6 +123,7 @@ class ChannelSink:
             decoder_depth=decoder_depth,
             on_timing_fault=self._on_wallclock_timing_fault,
             on_desync=self._reset_timing,
+            jt9_decoder=jt9_decoder,
         )
 
         self._total_delivered: int = 0
