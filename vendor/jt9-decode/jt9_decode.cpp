@@ -252,6 +252,9 @@ static bool release_segment_after_attach(const QSharedMemory &shm, int timeout_m
 }
 
 // Audio reader thread - continuously reads samples from stdin
+// Triggered-mode input ring, seconds of audio (see StreamDecoder).
+static const int TRIGGERED_RING_SEC = 600;
+
 class AudioReaderThread : public QThread {
 public:
     AudioReaderThread(short *buffer, int buffer_size, QMutex *mutex)
@@ -264,28 +267,42 @@ public:
         _setmode(_fileno(stdin), _O_BINARY);
         #endif
         
-        short sample_buf[4096];
-        
-        while (!should_stop) {
-            size_t samples_read = fread(sample_buf, sizeof(short), 4096, stdin_file);
+        (void)stdin_file;
+        // read(2), not fread: fread blocks until it has a whole 4096-sample
+        // block, so the tail of each fed slot (FT8 = 43 blocks + 3872
+        // samples) sat unread until the next slot's audio arrived, and every
+        // slot decoded one cycle late (psk-recorder, 2026-11-16).  read()
+        // returns what has arrived; an odd trailing byte carries over.
+        unsigned char raw[8192 + 1];
+        size_t carry = 0;
 
-            if (samples_read == 0) {
-                if (feof(stdin_file) || ferror(stdin_file)) {
-                    eof_reached = true;   // stdin closed — no more slots coming
-                    break;
-                }
-                QThread::msleep(10);
-                continue;
+        while (!should_stop) {
+            ssize_t n = ::read(STDIN_FILENO, raw + carry, 8192);
+            if (n == 0) {
+                eof_reached = true;   // stdin closed — no more slots coming
+                break;
             }
-            
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                eof_reached = true;
+                break;
+            }
+            size_t total = carry + (size_t)n;
+            size_t samples_read = total / sizeof(short);
+
             // Lock and copy samples to circular buffer
             buffer_mutex->lock();
             for (size_t i = 0; i < samples_read; i++) {
-                circ_buffer[write_pos] = sample_buf[i];
+                short v;
+                memcpy(&v, raw + i * sizeof(short), sizeof(short));
+                circ_buffer[write_pos] = v;
                 write_pos = (write_pos + 1) % buffer_size;
                 total_samples++;
             }
             buffer_mutex->unlock();
+
+            carry = total % sizeof(short);
+            if (carry) raw[0] = raw[total - 1];
         }
     }
     
@@ -321,7 +338,12 @@ public:
           skipped_cycles(0), jt9_decode_count(0), watchdog_fires(0)
     {
         SAMPLES_PER_CYCLE = (RX_SAMPLE_RATE * mode.cycle_ms) / 1000;
-        BUFFER_SIZE = NTMAX * RX_SAMPLE_RATE;
+        // Stream mode grabs "the last N samples" and keeps WSJT-X's NTMAX
+        // (30 min).  Triggered mode only queues the slots its caller has fed
+        // and not yet decoded — a few cycles for a band group — so 10 min is
+        // ample and saves ~29 MB per process (psk-recorder, 2026-11-16).
+        BUFFER_SIZE = triggered_ ? TRIGGERED_RING_SEC * RX_SAMPLE_RATE
+                                 : NTMAX * RX_SAMPLE_RATE;
         
         // Allocate circular buffer
         circ_buffer = new short[BUFFER_SIZE];
@@ -464,6 +486,25 @@ private slots:
         if (ipc1 != 0 || ipc2 != 0) return;   // jt9 not idle yet — retry next poll
 
         qint64 avail = reader_thread->getTotalSamples() - consumed_;
+        // Overrun: the ring overwrote slots not yet decoded (the caller fell
+        // more than TRIGGERED_RING_SEC behind).  Skip them, but answer each
+        // with its own terminal <DecodeStats … watchdog=1> so the caller's
+        // order-based slot mapping stays 1:1.
+        while (avail > (qint64)BUFFER_SIZE - SAMPLES_PER_CYCLE) {
+            total_decodes++;
+            skipped_cycles++;
+            qStdErr << "Warning: ring overrun, slot " << total_decodes
+                    << " overwritten before decoding; skipped\n";
+            qStdErr.flush();
+            qStdOut << "<DecodeStats>"
+                    << " cycle_num=" << total_decodes
+                    << " duration_s=0.000 num_decodes=0"
+                    << " skipped_cycles=" << skipped_cycles
+                    << " watchdog=1 </DecodeStats>\n";
+            qStdOut.flush();
+            consumed_ += SAMPLES_PER_CYCLE;
+            avail -= SAMPLES_PER_CYCLE;
+        }
         if (avail < SAMPLES_PER_CYCLE) {
             // No full slot yet.  If stdin has closed and no full slot remains,
             // we've drained everything the caller sent — exit cleanly.
