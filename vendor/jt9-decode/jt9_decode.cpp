@@ -899,7 +899,10 @@ int main(int argc, char *argv[]) {
     // Lock and initialize
     sharedMemory.lock();
     dec_data_t *dec_data = static_cast<dec_data_t*>(sharedMemory.data());
-    memset(dec_data, 0, sizeof(dec_data_t));
+    // create() above made a new segment (IPC_EXCL), which the kernel hands
+    // over zero-filled.  Clearing it again would touch every page of the
+    // 43 MB d2 array, though a decode copies only one slot (FT8 15 s) to its
+    // start; untouched pages cost no memory.
     
     // Set up common parameters for decoding (matching WSJT-X lines 5430-5490)
     dec_data->params.nmode = mode->mode_code;  // Mode code (52=FT2, 5=FT4, 8=FT8)
