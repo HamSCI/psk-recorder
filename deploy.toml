@@ -133,7 +133,7 @@ select_columns = ["time", "frequency", "mode", "snr_db", "tx_call", "grid", "sco
 extra_where = [["tx_call", "!=", ""], ["mode", "IN", ["ft8", "ft4", "msk144"]], ["forward_to_pskreporter", "=", 0]]
 [hs_uploader.pipeline.transport]
 type = "pskreporter"
-decoding_software = "psk-recorder/0.1 (radiod={radiod_status})"
+decoding_software = "WD_4.0"
 [hs_uploader.pipeline.retry]
 base = 2.0
 cap_sec = 300.0

@@ -174,7 +174,7 @@ class HsPskReporterUploader:
 
         try:
             self._transport = PskReporterTcp(
-                decoding_software=f"psk-recorder/0.1 (radiod={self._radiod_id})",
+                decoding_software="WD_4.0",
                 antenna=self._antenna,
             )
         except Exception as exc:  # noqa: BLE001
